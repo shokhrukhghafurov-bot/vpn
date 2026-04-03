@@ -243,7 +243,10 @@ def upsert_telegram_user(payload: Dict[str, Any]) -> Dict[str, Any]:
                     username = COALESCE(EXCLUDED.username, users.username),
                     first_name = COALESCE(EXCLUDED.first_name, users.first_name),
                     last_name = COALESCE(EXCLUDED.last_name, users.last_name),
-                    language = COALESCE(EXCLUDED.language, users.language),
+                    language = CASE
+                        WHEN users.language IS NULL OR users.language = '' THEN COALESCE(EXCLUDED.language, 'ru')
+                        ELSE users.language
+                    END,
                     updated_at = NOW()
                 RETURNING *
                 """,
@@ -309,7 +312,15 @@ def get_plan_by_code(code: str) -> Optional[Dict[str, Any]]:
 
 
 def refresh_subscription_statuses(user_id: Optional[int] = None) -> None:
-    query = "UPDATE subscriptions SET status = CASE WHEN expires_at >= NOW() THEN 'active' ELSE 'expired' END, updated_at = NOW()"
+    query = """
+        UPDATE subscriptions
+        SET status = CASE
+            WHEN starts_at <= NOW() AND expires_at >= NOW() THEN 'active'
+            WHEN starts_at > NOW() THEN 'pending'
+            ELSE 'expired'
+        END,
+        updated_at = NOW()
+    """
     args: Tuple[Any, ...] = tuple()
     if user_id is not None:
         query += " WHERE user_id = %s"
@@ -894,11 +905,18 @@ def enqueue_subscription_notifications() -> None:
             expiring = [dict(row) for row in cur.fetchall()]
             cur.execute(
                 """
-                SELECT s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
+                SELECT DISTINCT ON (s.user_id)
+                    s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
                 FROM subscriptions s
                 JOIN plans p ON p.id = s.plan_id
                 WHERE s.status = 'expired'
-                ORDER BY s.expires_at DESC
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM subscriptions s2
+                      WHERE s2.user_id = s.user_id
+                        AND s2.status = 'active'
+                  )
+                ORDER BY s.user_id, s.expires_at DESC
                 LIMIT 500
                 """
             )
