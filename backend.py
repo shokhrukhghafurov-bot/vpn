@@ -146,6 +146,11 @@ app.add_middleware(
 )
 
 
+def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
+    left_bytes = (left or "").encode("utf-8")
+    right_bytes = (right or "").encode("utf-8")
+    return secrets.compare_digest(left_bytes, right_bytes)
+
 
 def issue_token(user_id: int) -> str:
     payload = {
@@ -172,8 +177,8 @@ def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(securit
 
 
 def require_admin(credentials: HTTPBasicCredentials = Depends(basic_security)) -> str:
-    valid_user = secrets.compare_digest(credentials.username or "", settings.ADMIN_BASIC_USER)
-    valid_pass = secrets.compare_digest(credentials.password or "", settings.ADMIN_BASIC_PASS)
+    valid_user = _safe_compare_secret(credentials.username, settings.ADMIN_BASIC_USER)
+    valid_pass = _safe_compare_secret(credentials.password, settings.ADMIN_BASIC_PASS)
     if not (valid_user and valid_pass):
         raise HTTPException(status_code=401, detail="Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
     return credentials.username
