@@ -89,6 +89,9 @@ TEXT: Dict[str, Dict[str, str]] = {
         "status_label": "Статус",
         "remove": "Удалить",
         "device_slot": "Слот",
+        "device_active": "активен",
+        "device_inactive": "неактивен",
+        "available_devices": "Доступно устройств",
     },
     "en": {
         "welcome": "Welcome to INET\nChoose an action below",
@@ -148,12 +151,21 @@ TEXT: Dict[str, Dict[str, str]] = {
         "status_label": "Status",
         "remove": "Remove",
         "device_slot": "Slot",
+        "device_active": "active",
+        "device_inactive": "inactive",
+        "available_devices": "Devices available",
     },
 }
 
 
-bot = Bot(token=settings.BOT_TOKEN)
+bot: Optional[Bot] = None
 dp = Dispatcher()
+
+
+def require_bot() -> Bot:
+    if bot is None:
+        raise RuntimeError("Bot is not initialized")
+    return bot
 
 
 class BackendUnavailable(RuntimeError):
@@ -407,9 +419,12 @@ async def send_menu(message: Message, lang: str, welcome: bool = False) -> None:
 
 
 async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
-    await safe_edit(callback, TEXT[lang]["menu"], None)
     if callback.message:
+        with contextlib.suppress(Exception):
+            await callback.message.edit_reply_markup(reply_markup=None)
         await callback.message.answer(TEXT[lang]["menu"], reply_markup=main_menu_keyboard(lang))
+        return
+    await callback.answer(TEXT[lang]["menu"])
 
 
 async def render_subscription_message(lang: str, token: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -455,7 +470,8 @@ async def render_devices_message(lang: str, token: str) -> Tuple[str, InlineKeyb
     for row in items:
         device_name = row.get("device_name") or "—"
         platform = _platform_label(str(row.get("platform") or ""))
-        lines.append(f"• {platform} — {device_name} — {_fmt_dt(row.get('last_seen_at'))}")
+        status_text = t["device_active"] if row.get("is_active", True) else t["device_inactive"]
+        lines.append(f"• {platform} — {device_name} — {status_text} — {_fmt_dt(row.get('last_seen_at'))}")
         rows.append([InlineKeyboardButton(text=f"{t['remove']} {platform}", callback_data=f"device:remove:{row['id']}")])
     lines.append("")
     lines.append(f"{t['connected_now']}: {used} / {limit}")
@@ -479,12 +495,14 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
     if not sub:
         return t["payment_received"], activated_inline(lang)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
+    device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
     text = "\n".join(
         [
+            t["payment_received"],
             t["subscription_activated"],
             f"{t['plan']}: {plan_name}",
             f"{t['active_until']}: {_fmt_dt(sub.get('expires_at'))}",
-            f"{t['devices_used']}: {data.get('devices_used', 0)} / {data.get('device_limit', sub.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT))}",
+            f"{t['available_devices']}: {device_limit} / {device_limit}",
         ]
     )
     return text, activated_inline(lang)
@@ -494,7 +512,12 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
 async def start(message: Message) -> None:
     async def _handler(_lang: str, ctx: Dict[str, Any]) -> None:
         current_lang = "en" if (ctx.get("lang") == "en") else "ru"
-        await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_reply_keyboard())
+        is_new = bool((ctx.get("auth") or {}).get("is_new"))
+        user_language = (ctx.get("user") or {}).get("language")
+        if is_new or user_language not in {"ru", "en"}:
+            await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_reply_keyboard())
+            return
+        await send_menu(message, current_lang, welcome=True)
 
     await with_user_guard(message, _handler)
 
@@ -569,6 +592,35 @@ async def language_from_text(message: Message) -> None:
 
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
         await message.answer(TEXT[lang]["choose_language"], reply_markup=language_reply_keyboard())
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["renew"], TEXT["en"]["renew"]}))
+async def renew_from_text(message: Message) -> None:
+    await buy_from_text(message)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["back"], TEXT["en"]["back"], TEXT["ru"]["main_menu"], TEXT["en"]["main_menu"]}))
+async def menu_from_text_alias(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        await send_menu(message, lang)
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
+async def download_android_from_text(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android"))
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
+async def download_ios_from_text(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios"))
 
     await with_user_guard(message, _handler)
 
@@ -759,13 +811,14 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     event_type = item.get("event_type")
     if event_type == "payment_paid":
         plan_name = payload.get("plan_name_en") if lang == "en" else payload.get("plan_name_ru")
+        device_limit = payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT)
         text = "\n".join(
             [
                 t["payment_received"],
                 t["subscription_activated"],
                 f"{t['plan']}: {plan_name}",
                 f"{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}",
-                f"{t['devices_used']}: {payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT)} / {payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT)}",
+                f"{t['available_devices']}: {device_limit} / {device_limit}",
             ]
         )
         return text, activated_inline(lang)
@@ -804,7 +857,7 @@ async def notification_loop() -> None:
             for item in items:
                 try:
                     text, markup = await build_notification_message(item)
-                    await bot.send_message(int(item["telegram_id"]), text, reply_markup=markup)
+                    await require_bot().send_message(int(item["telegram_id"]), text, reply_markup=markup)
                     mark_notification_sent(int(item["id"]))
                 except Exception as exc:
                     record_bot_error("bot-notification", str(item.get("unique_key") or item.get("id")), str(exc))
@@ -818,8 +871,9 @@ async def notification_loop() -> None:
 
 
 async def configure_bot() -> None:
-    await bot.delete_webhook(drop_pending_updates=False)
-    await bot.set_my_commands(
+    app_bot = require_bot()
+    await app_bot.delete_webhook(drop_pending_updates=False)
+    await app_bot.set_my_commands(
         [
             BotCommand(command="start", description="Open INET menu"),
             BotCommand(command="menu", description="Open INET menu"),
@@ -834,10 +888,13 @@ async def verify_backend() -> None:
 
 
 async def main() -> None:
+    global bot
     if not settings.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is required")
     if not settings.BACKEND_BASE_URL:
         raise RuntimeError("BACKEND_BASE_URL is required")
+
+    bot = Bot(token=settings.BOT_TOKEN)
 
     logger.info("Starting bot for %s", settings.BOT_USERNAME or settings.BOT_NAME)
     logger.info("Backend base URL: %s", settings.BACKEND_BASE_URL)
