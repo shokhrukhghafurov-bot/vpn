@@ -135,144 +135,91 @@ CREATE TABLE IF NOT EXISTS bot_error_log (
 );
 """
 
-
-MIGRATION_STATEMENTS = [
+MIGRATION_SQL = [
     # users
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS telegram_id BIGINT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-    "UPDATE users SET language = COALESCE(NULLIF(language, ''), 'ru') WHERE language IS NULL OR language = ''",
-    "UPDATE users SET status = COALESCE(NULLIF(status, ''), 'active') WHERE status IS NULL OR status = ''",
-    "UPDATE users SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "UPDATE users SET updated_at = COALESCE(updated_at, NOW()) WHERE updated_at IS NULL",
-    "ALTER TABLE users ALTER COLUMN language SET DEFAULT 'ru'",
-    "ALTER TABLE users ALTER COLUMN status SET DEFAULT 'active'",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_telegram_id_unique ON users (telegram_id)",
-    "CREATE INDEX IF NOT EXISTS idx_users_status ON users (status)",
 
     # plans
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS code TEXT",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS name_ru TEXT",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS name_en TEXT",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS price_rub NUMERIC(10,2)",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS duration_days INTEGER",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS device_limit INTEGER",
+    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS device_limit INTEGER DEFAULT 2",
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS source_env_key TEXT",
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE plans ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-    "UPDATE plans SET is_active = COALESCE(is_active, TRUE) WHERE is_active IS NULL",
-    "UPDATE plans SET device_limit = COALESCE(device_limit, 2) WHERE device_limit IS NULL",
-    "UPDATE plans SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "UPDATE plans SET updated_at = COALESCE(updated_at, NOW()) WHERE updated_at IS NULL",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_plans_code_unique ON plans (code)",
 
     # subscriptions
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS plan_id INTEGER",
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS starts_at TIMESTAMPTZ",
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-    "UPDATE subscriptions SET status = COALESCE(NULLIF(status, ''), 'active') WHERE status IS NULL OR status = ''",
-    "UPDATE subscriptions SET starts_at = COALESCE(starts_at, created_at, NOW()) WHERE starts_at IS NULL",
-    "UPDATE subscriptions SET expires_at = COALESCE(expires_at, starts_at, created_at, NOW()) WHERE expires_at IS NULL",
-    "UPDATE subscriptions SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "UPDATE subscriptions SET updated_at = COALESCE(updated_at, NOW()) WHERE updated_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions (user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions (status)",
 
     # devices
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS platform TEXT",
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_fingerprint TEXT",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_name TEXT",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "UPDATE devices SET is_active = COALESCE(is_active, TRUE) WHERE is_active IS NULL",
-    "UPDATE devices SET last_seen_at = COALESCE(last_seen_at, created_at, NOW()) WHERE last_seen_at IS NULL",
-    "UPDATE devices SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices (user_id)",
 
     # locations
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS code TEXT",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS name_ru TEXT",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS name_en TEXT",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS country_code TEXT",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_recommended BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_reserve BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'online'",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 100",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-    "UPDATE locations SET is_active = COALESCE(is_active, TRUE) WHERE is_active IS NULL",
-    "UPDATE locations SET is_recommended = COALESCE(is_recommended, FALSE) WHERE is_recommended IS NULL",
-    "UPDATE locations SET is_reserve = COALESCE(is_reserve, FALSE) WHERE is_reserve IS NULL",
-    "UPDATE locations SET status = COALESCE(NULLIF(status, ''), 'online') WHERE status IS NULL OR status = ''",
-    "UPDATE locations SET sort_order = COALESCE(sort_order, 100) WHERE sort_order IS NULL",
-    "UPDATE locations SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "UPDATE locations SET updated_at = COALESCE(updated_at, NOW()) WHERE updated_at IS NULL",
 
     # payments
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS plan_id INTEGER",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS provider TEXT",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS amount NUMERIC(10,2)",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'created'",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'RUB'",
+    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'created'",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_payment_id TEXT",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS checkout_url TEXT",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
-    "UPDATE payments SET currency = COALESCE(NULLIF(currency, ''), 'RUB') WHERE currency IS NULL OR currency = ''",
-    "UPDATE payments SET created_at = COALESCE(created_at, NOW()) WHERE created_at IS NULL",
-    "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments (user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments (status)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_payments_external_payment_id_unique ON payments (external_payment_id) WHERE external_payment_id IS NOT NULL",
 
-    # notes and extensions
-    "ALTER TABLE admin_notes ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE admin_notes ADD COLUMN IF NOT EXISTS admin_name TEXT",
-    "ALTER TABLE admin_notes ADD COLUMN IF NOT EXISTS note TEXT",
-    "ALTER TABLE admin_notes ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE manual_extensions ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE manual_extensions ADD COLUMN IF NOT EXISTS days_added INTEGER",
-    "ALTER TABLE manual_extensions ADD COLUMN IF NOT EXISTS admin_name TEXT",
-    "ALTER TABLE manual_extensions ADD COLUMN IF NOT EXISTS reason TEXT",
-    "ALTER TABLE manual_extensions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # bot tables
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS unique_key TEXT",
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS user_id INTEGER",
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS event_type TEXT",
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS payload JSONB DEFAULT '{}'::jsonb",
+    # notifications/errors
+    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ",
-    "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS source TEXT",
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS context TEXT",
-    "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS error_message TEXT",
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_bot_notifications_unique_key_unique ON bot_notifications (unique_key)",
-    "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications (sent_at, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_bot_error_log_created_at ON bot_error_log (created_at DESC)",
+
+    # indexes compatible with old databases
+    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status)",
+    "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
+    "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
+]
+
+POST_MIGRATION_SQL = [
+    "UPDATE users SET language = 'ru' WHERE language IS NULL OR language = ''",
+    "UPDATE users SET status = 'active' WHERE status IS NULL OR status = ''",
+    f"UPDATE plans SET device_limit = {int(settings.VPN_DEFAULT_DEVICE_LIMIT)} WHERE device_limit IS NULL OR device_limit <= 0",
+    "UPDATE plans SET is_active = TRUE WHERE is_active IS NULL",
+    "UPDATE plans SET source_env_key = code WHERE source_env_key IS NULL OR source_env_key = ''",
+    "UPDATE subscriptions SET status = 'active' WHERE status IS NULL OR status = ''",
+    "UPDATE locations SET status = 'online' WHERE status IS NULL OR status = ''",
+    "UPDATE locations SET sort_order = 100 WHERE sort_order IS NULL",
+    "UPDATE locations SET is_recommended = FALSE WHERE is_recommended IS NULL",
+    "UPDATE locations SET is_reserve = FALSE WHERE is_reserve IS NULL",
+    "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL OR currency = ''",
+    "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
+    "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
 ]
 
 
-def apply_schema_migrations() -> None:
-    with db() as conn:
-        with conn.cursor() as cur:
-            for statement in MIGRATION_STATEMENTS:
-                cur.execute(statement)
-        conn.commit()
+def _run_schema_migrations(cur: psycopg.Cursor) -> None:
+    for statement in MIGRATION_SQL:
+        cur.execute(statement)
+    for statement in POST_MIGRATION_SQL:
+        cur.execute(statement)
 
 
 def now_utc() -> datetime:
@@ -287,8 +234,8 @@ def bootstrap() -> None:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
+            _run_schema_migrations(cur)
         conn.commit()
-    apply_schema_migrations()
     sync_plans_from_env()
     seed_locations_from_env()
 
