@@ -772,9 +772,17 @@ def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, 
                 tuple(values),
             )
             items = []
+            now = now_utc()
             for row in cur.fetchall():
                 item = dict(row)
                 item["device_limit"] = min(int(item.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+                expires_at = item.get("expires_at")
+                if item.get("status") == "blocked":
+                    item["access_status"] = "blocked"
+                elif expires_at and expires_at >= now:
+                    item["access_status"] = "active"
+                else:
+                    item["access_status"] = "expired"
                 items.append(item)
             cur.execute("SELECT COUNT(*) AS total FROM users")
             total = cur.fetchone()["total"]
