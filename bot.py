@@ -293,6 +293,17 @@ def language_inline() -> InlineKeyboardMarkup:
 
 
 
+def language_reply_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text="Русский"), KeyboardButton(text="English")],
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=True,
+    )
+
+
+
 def back_inline(lang: str) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=TEXT[lang]["back"], callback_data="menu:root")]])
 
@@ -482,10 +493,8 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
 @dp.message(Command("start"))
 async def start(message: Message) -> None:
     async def _handler(_lang: str, ctx: Dict[str, Any]) -> None:
-        if ctx["auth"].get("is_new"):
-            await message.answer(TEXT["ru"]["choose_language"], reply_markup=language_inline())
-            return
-        await send_menu(message, ctx["lang"], welcome=True)
+        current_lang = "en" if (ctx.get("lang") == "en") else "ru"
+        await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_reply_keyboard())
 
     await with_user_guard(message, _handler)
 
@@ -559,7 +568,7 @@ async def language_from_text(message: Message) -> None:
         return
 
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["choose_language"], reply_markup=language_inline())
+        await message.answer(TEXT[lang]["choose_language"], reply_markup=language_reply_keyboard())
 
     await with_user_guard(message, _handler)
 
