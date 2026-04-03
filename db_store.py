@@ -7,6 +7,7 @@ from uuid import uuid4
 
 import psycopg
 from psycopg.rows import dict_row
+from psycopg.types.json import Jsonb
 
 from config import settings
 
@@ -14,22 +15,23 @@ from config import settings
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
-    telegram_id BIGINT UNIQUE,
+    telegram_id BIGINT NOT NULL UNIQUE,
     username TEXT,
     first_name TEXT,
     last_name TEXT,
-    language TEXT DEFAULT 'ru',
+    language TEXT NOT NULL DEFAULT 'ru',
     status TEXT NOT NULL DEFAULT 'active',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
 
 CREATE TABLE IF NOT EXISTS plans (
     id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
     name_ru TEXT NOT NULL,
     name_en TEXT NOT NULL,
-    price_rub INTEGER NOT NULL,
+    price_rub NUMERIC(10,2) NOT NULL,
     duration_days INTEGER NOT NULL,
     device_limit INTEGER NOT NULL,
     is_active BOOLEAN NOT NULL DEFAULT TRUE,
@@ -49,6 +51,7 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
+CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
 
 CREATE TABLE IF NOT EXISTS devices (
     id SERIAL PRIMARY KEY,
@@ -93,6 +96,7 @@ CREATE TABLE IF NOT EXISTS payments (
     paid_at TIMESTAMPTZ
 );
 CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
+CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 
 CREATE TABLE IF NOT EXISTS admin_notes (
     id SERIAL PRIMARY KEY,
@@ -108,6 +112,25 @@ CREATE TABLE IF NOT EXISTS manual_extensions (
     days_added INTEGER NOT NULL,
     reason TEXT,
     admin_name TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS bot_notifications (
+    id BIGSERIAL PRIMARY KEY,
+    unique_key TEXT NOT NULL UNIQUE,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    event_type TEXT NOT NULL,
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    sent_at TIMESTAMPTZ
+);
+CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at);
+
+CREATE TABLE IF NOT EXISTS bot_error_log (
+    id BIGSERIAL PRIMARY KEY,
+    source TEXT NOT NULL,
+    context TEXT,
+    error_message TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 """
@@ -217,10 +240,10 @@ def upsert_telegram_user(payload: Dict[str, Any]) -> Dict[str, Any]:
                 INSERT INTO users (telegram_id, username, first_name, last_name, language, status)
                 VALUES (%s, %s, %s, %s, %s, COALESCE(%s, 'active'))
                 ON CONFLICT (telegram_id) DO UPDATE SET
-                    username = EXCLUDED.username,
-                    first_name = EXCLUDED.first_name,
-                    last_name = EXCLUDED.last_name,
-                    language = EXCLUDED.language,
+                    username = COALESCE(EXCLUDED.username, users.username),
+                    first_name = COALESCE(EXCLUDED.first_name, users.first_name),
+                    last_name = COALESCE(EXCLUDED.last_name, users.last_name),
+                    language = COALESCE(EXCLUDED.language, users.language),
                     updated_at = NOW()
                 RETURNING *
                 """,
@@ -238,11 +261,14 @@ def upsert_telegram_user(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _normalize_user(row)
 
 
-def set_user_language(user_id: int, language: str) -> None:
+def set_user_language(user_id: int, language: str) -> Dict[str, Any]:
+    language = "en" if language == "en" else "ru"
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE users SET language = %s, updated_at = NOW() WHERE id = %s", (language, user_id))
+            cur.execute("UPDATE users SET language = %s, updated_at = NOW() WHERE id = %s RETURNING *", (language, user_id))
+            row = cur.fetchone()
         conn.commit()
+    return _normalize_user(row)
 
 
 def set_user_status_by_telegram(telegram_id: int, status: str, admin_name: str, note: str) -> Dict[str, Any]:
@@ -294,21 +320,33 @@ def refresh_subscription_statuses(user_id: Optional[int] = None) -> None:
         conn.commit()
 
 
+def _subscription_select(where_sql: str) -> str:
+    return f"""
+        SELECT s.*, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en,
+               p.name_ru, p.name_en, p.price_rub, p.duration_days, p.device_limit
+        FROM subscriptions s
+        JOIN plans p ON p.id = s.plan_id
+        {where_sql}
+        ORDER BY s.expires_at DESC
+        LIMIT 1
+    """
+
+
+
 def get_current_subscription(user_id: int) -> Optional[Dict[str, Any]]:
     refresh_subscription_statuses(user_id)
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT s.*, p.code AS plan_code, p.name_ru, p.name_en, p.price_rub, p.duration_days, p.device_limit
-                FROM subscriptions s
-                JOIN plans p ON p.id = s.plan_id
-                WHERE s.user_id = %s AND s.status = 'active'
-                ORDER BY s.expires_at DESC
-                LIMIT 1
-                """,
-                (user_id,),
-            )
+            cur.execute(_subscription_select("WHERE s.user_id = %s AND s.status = 'active'"), (user_id,))
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def get_latest_subscription(user_id: int) -> Optional[Dict[str, Any]]:
+    refresh_subscription_statuses(user_id)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(_subscription_select("WHERE s.user_id = %s"), (user_id,))
             row = cur.fetchone()
             return dict(row) if row else None
 
@@ -317,10 +355,27 @@ def get_user_devices(user_id: int) -> List[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY created_at DESC",
+                "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
                 (user_id,),
             )
             return [dict(row) for row in cur.fetchall()]
+
+
+def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
+    subscription = get_current_subscription(user_id)
+    latest = subscription or get_latest_subscription(user_id)
+    devices = get_user_devices(user_id)
+    if latest:
+        allowed_limit = min(int(latest["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    else:
+        allowed_limit = settings.VPN_DEFAULT_DEVICE_LIMIT
+    return {
+        "subscription": latest,
+        "is_active": bool(subscription),
+        "devices": devices,
+        "devices_used": len(devices),
+        "device_limit": allowed_limit,
+    }
 
 
 def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
@@ -334,7 +389,7 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
         raise PermissionError("Active subscription required")
     if not settings.VPN_NEW_ACTIVATIONS_ENABLED:
         raise PermissionError("New activations are disabled")
-    allowed_limit = min(subscription["device_limit"], settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    allowed_limit = min(int(subscription["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
     existing = get_user_devices(user_id)
     for item in existing:
         if item["device_fingerprint"] == device_fingerprint:
@@ -369,14 +424,24 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
     return dict(row)
 
 
-def delete_device(user_id: int, device_id: int) -> None:
+def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "DELETE FROM devices WHERE user_id = %s AND id = %s",
-                (user_id, device_id),
-            )
+            cur.execute("DELETE FROM devices WHERE user_id = %s AND id = %s RETURNING *", (user_id, device_id))
+            row = cur.fetchone()
         conn.commit()
+    if row:
+        enqueue_notification(
+            user_id=user_id,
+            event_type="device_removed",
+            unique_key=f"device_removed:{row['id']}:{int(datetime.now(timezone.utc).timestamp())}",
+            payload={
+                "platform": row.get("platform"),
+                "device_name": row.get("device_name"),
+            },
+        )
+        return dict(row)
+    return None
 
 
 def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
@@ -428,7 +493,17 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     return dict(row)
 
 
-def create_payment_record(user_id: int, plan_id: int, provider: str, method: str, amount: float, currency: str, status: str, external_payment_id: Optional[str] = None, checkout_url: Optional[str] = None) -> Dict[str, Any]:
+def create_payment_record(
+    user_id: int,
+    plan_id: int,
+    provider: str,
+    method: str,
+    amount: float,
+    currency: str,
+    status: str,
+    external_payment_id: Optional[str] = None,
+    checkout_url: Optional[str] = None,
+) -> Dict[str, Any]:
     payment_id = str(uuid4())
     with db() as conn:
         with conn.cursor() as cur:
@@ -453,7 +528,7 @@ def update_payment(payment_id: str, **fields: Any) -> Dict[str, Any]:
     for key, value in fields.items():
         updates.append(f"{key} = %s")
         values.append(value)
-    if "status" in fields and fields["status"] == "paid":
+    if fields.get("status") == "paid":
         updates.append("paid_at = COALESCE(paid_at, NOW())")
     values.append(payment_id)
     query = f"UPDATE payments SET {', '.join(updates)} WHERE id = %s RETURNING *"
@@ -472,7 +547,8 @@ def get_payment_for_user(payment_id: str, user_id: int) -> Optional[Dict[str, An
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT pay.*, p.code AS plan_code
+                SELECT pay.*, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en,
+                       p.duration_days, p.device_limit
                 FROM payments pay
                 JOIN plans p ON p.id = pay.plan_id
                 WHERE pay.id = %s AND pay.user_id = %s
@@ -498,9 +574,6 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
     payment = get_payment_by_internal_or_external(payment_id)
     if not payment:
         raise ValueError("Payment not found")
-    if payment["status"] == "paid":
-        return payment
-    payment = update_payment(payment["id"], status="paid")
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM plans WHERE id = %s", (payment["plan_id"],))
@@ -511,13 +584,14 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
                 raise ValueError("Plan or user not found")
             if user["status"] == "blocked":
                 raise PermissionError("Blocked user cannot be activated")
+            if payment["status"] != "paid":
+                cur.execute(
+                    "UPDATE payments SET status = 'paid', paid_at = COALESCE(paid_at, NOW()) WHERE id = %s RETURNING *",
+                    (payment["id"],),
+                )
+                payment = dict(cur.fetchone())
             cur.execute(
-                """
-                SELECT * FROM subscriptions
-                WHERE user_id = %s
-                ORDER BY expires_at DESC
-                LIMIT 1
-                """,
+                "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1",
                 (payment["user_id"],),
             )
             latest = cur.fetchone()
@@ -529,12 +603,28 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
                 """
                 INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status)
                 VALUES (%s, %s, %s, %s, 'active')
+                RETURNING *
                 """,
                 (payment["user_id"], plan["id"], start_at, expires_at),
             )
+            subscription = cur.fetchone()
         conn.commit()
     refresh_subscription_statuses(payment["user_id"])
-    return update_payment(payment["id"], status="paid")
+    enqueue_notification(
+        user_id=payment["user_id"],
+        event_type="payment_paid",
+        unique_key=f"payment_paid:{payment['id']}",
+        payload={
+            "payment_id": payment["id"],
+            "plan_code": plan["code"],
+            "plan_name_ru": plan["name_ru"],
+            "plan_name_en": plan["name_en"],
+            "duration_days": int(plan["duration_days"]),
+            "device_limit": min(int(plan["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+            "expires_at": subscription["expires_at"].isoformat(),
+        },
+    )
+    return payment
 
 
 def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, Any]:
@@ -556,15 +646,24 @@ def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, 
             cur.execute(
                 f"""
                 SELECT
-                    u.*,
-                    p.code AS plan_code,
+                    u.id AS user_id,
+                    u.telegram_id,
+                    u.username,
+                    u.first_name,
+                    u.last_name,
+                    u.language,
+                    u.status,
+                    s.id AS subscription_id,
                     s.expires_at,
-                    COALESCE((SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.is_active = TRUE), 0) AS devices_used,
-                    COALESCE(p.device_limit, %s) AS device_limit
+                    p.code AS plan_code,
+                    p.name_ru AS plan_name_ru,
+                    p.name_en AS plan_name_en,
+                    p.device_limit,
+                    COALESCE((SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.is_active = TRUE), 0) AS devices_used
                 FROM users u
                 LEFT JOIN LATERAL (
                     SELECT * FROM subscriptions s1
-                    WHERE s1.user_id = u.id AND s1.status = 'active'
+                    WHERE s1.user_id = u.id
                     ORDER BY s1.expires_at DESC
                     LIMIT 1
                 ) s ON TRUE
@@ -572,9 +671,13 @@ def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, 
                 {where_sql}
                 ORDER BY u.created_at DESC
                 """,
-                tuple([settings.VPN_DEFAULT_DEVICE_LIMIT] + values),
+                tuple(values),
             )
-            items = [dict(row) for row in cur.fetchall()]
+            items = []
+            for row in cur.fetchall():
+                item = dict(row)
+                item["device_limit"] = min(int(item.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+                items.append(item)
             cur.execute("SELECT COUNT(*) AS total FROM users")
             total = cur.fetchone()["total"]
             cur.execute("SELECT COUNT(*) AS total FROM users WHERE status = 'blocked'")
@@ -626,12 +729,13 @@ def get_user_snapshot_by_telegram(telegram_id: int) -> Dict[str, Any]:
     user = get_user_by_telegram_id(telegram_id)
     if not user:
         raise ValueError("User not found")
-    subscription = get_current_subscription(user["id"])
-    devices = get_user_devices(user["id"])
+    view = get_user_subscription_view(user["id"])
     return {
         "user": user,
-        "subscription": subscription,
-        "devices": devices,
+        "subscription": view["subscription"],
+        "devices": view["devices"],
+        "devices_used": view["devices_used"],
+        "device_limit": view["device_limit"],
     }
 
 
@@ -643,10 +747,7 @@ def extend_user_subscription_by_telegram(telegram_id: int, days_added: int, reas
         raise ValueError("days_added must be positive")
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1",
-                (user["id"],),
-            )
+            cur.execute("SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1", (user["id"],))
             sub = cur.fetchone()
             if not sub:
                 plan = get_plan_by_code(settings.PLAN_MONTHLY_CODE) or get_all_plans()[0]
@@ -678,18 +779,27 @@ def reset_user_devices_by_telegram(telegram_id: int, admin_name: str) -> Dict[st
         raise ValueError("User not found")
     with db() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE", (user["id"],))
+            devices = [dict(row) for row in cur.fetchall()]
             cur.execute("DELETE FROM devices WHERE user_id = %s", (user["id"],))
             cur.execute(
                 "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
                 (user["id"], admin_name, "Devices reset from admin panel"),
             )
         conn.commit()
+    if devices:
+        enqueue_notification(
+            user_id=user["id"],
+            event_type="device_removed",
+            unique_key=f"device_reset:{user['id']}:{int(now_utc().timestamp())}",
+            payload={"count": len(devices), "device_name": "all", "platform": "all"},
+        )
     return get_user_snapshot_by_telegram(telegram_id)
 
 
 def list_payments(status_filter: str = "all") -> List[Dict[str, Any]]:
     query = """
-        SELECT pay.*, u.telegram_id, u.username, p.code AS plan_code
+        SELECT pay.*, u.telegram_id, u.username, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en
         FROM payments pay
         JOIN users u ON u.id = pay.user_id
         JOIN plans p ON p.id = pay.plan_id
@@ -730,7 +840,7 @@ def settings_snapshot() -> Dict[str, Any]:
     return {
         "app_name": settings.APP_NAME,
         "app_env": settings.APP_ENV,
-        "langs": settings.APP_LANGS,
+        "languages": settings.APP_LANGS,
         "device_limit": settings.VPN_DEFAULT_DEVICE_LIMIT,
         "max_devices_per_account": settings.VPN_MAX_DEVICES_PER_ACCOUNT,
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
@@ -738,10 +848,164 @@ def settings_snapshot() -> Dict[str, Any]:
         "payments_enabled": settings.PAYMENTS_ENABLED,
         "payments_provider": settings.PAYMENTS_PROVIDER,
         "support_telegram_url": settings.SUPPORT_TELEGRAM_URL,
+        "support_faq_ru": settings.SUPPORT_FAQ_RU,
+        "support_faq_en": settings.SUPPORT_FAQ_EN,
         "bot_name": settings.BOT_NAME,
         "bot_username": settings.BOT_USERNAME,
+        "open_app_url": settings.OPEN_APP_URL,
         "android_app_url": settings.ANDROID_APP_URL,
         "ios_app_url": settings.IOS_APP_URL,
         "settings_editable": settings.VPN_SETTINGS_EDITABLE,
         "plans": get_all_plans(),
     }
+
+
+def enqueue_notification(user_id: int, event_type: str, unique_key: str, payload: Dict[str, Any]) -> bool:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO bot_notifications (unique_key, user_id, event_type, payload)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (unique_key) DO NOTHING
+                RETURNING id
+                """,
+                (unique_key, user_id, event_type, Jsonb(payload or {})),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return bool(row)
+
+
+def enqueue_subscription_notifications() -> None:
+    refresh_subscription_statuses()
+    now = now_utc()
+    soon = now + timedelta(days=1)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
+                FROM subscriptions s
+                JOIN plans p ON p.id = s.plan_id
+                WHERE s.status = 'active' AND s.expires_at > NOW() AND s.expires_at <= NOW() + INTERVAL '1 day'
+                """
+            )
+            expiring = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                """
+                SELECT s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
+                FROM subscriptions s
+                JOIN plans p ON p.id = s.plan_id
+                WHERE s.status = 'expired'
+                ORDER BY s.expires_at DESC
+                LIMIT 500
+                """
+            )
+            expired = [dict(row) for row in cur.fetchall()]
+    for row in expiring:
+        enqueue_notification(
+            user_id=row["user_id"],
+            event_type="subscription_expiring",
+            unique_key=f"subscription_expiring:{row['id']}",
+            payload={
+                "subscription_id": row["id"],
+                "expires_at": row["expires_at"].isoformat(),
+                "plan_code": row["plan_code"],
+                "plan_name_ru": row["name_ru"],
+                "plan_name_en": row["name_en"],
+                "duration_days": int(row["duration_days"]),
+                "device_limit": min(int(row["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+            },
+        )
+    for row in expired:
+        enqueue_notification(
+            user_id=row["user_id"],
+            event_type="subscription_expired",
+            unique_key=f"subscription_expired:{row['id']}",
+            payload={
+                "subscription_id": row["id"],
+                "expires_at": row["expires_at"].isoformat(),
+                "plan_code": row["plan_code"],
+                "plan_name_ru": row["name_ru"],
+                "plan_name_en": row["name_en"],
+                "duration_days": int(row["duration_days"]),
+                "device_limit": min(int(row["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+            },
+        )
+
+
+def list_pending_notifications(limit: int = 100) -> List[Dict[str, Any]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT n.*, u.telegram_id, u.language, u.status AS user_status
+                FROM bot_notifications n
+                JOIN users u ON u.id = n.user_id
+                WHERE n.sent_at IS NULL
+                ORDER BY n.created_at ASC
+                LIMIT %s
+                """,
+                (limit,),
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+    return rows
+
+
+def mark_notification_sent(notification_id: int) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("UPDATE bot_notifications SET sent_at = NOW() WHERE id = %s", (notification_id,))
+        conn.commit()
+
+
+def record_bot_error(source: str, context: str, error_message: str) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO bot_error_log (source, context, error_message) VALUES (%s, %s, %s)",
+                (source, context, error_message[:4000]),
+            )
+        conn.commit()
+
+
+def list_bot_errors(limit: int = 50) -> List[Dict[str, Any]]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT * FROM bot_error_log ORDER BY created_at DESC LIMIT %s", (limit,))
+            return [dict(row) for row in cur.fetchall()]
+
+
+def list_broadcast_targets(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
+    statuses = statuses or ["active"]
+    statuses = [item.strip().lower() for item in statuses if item]
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT u.id, u.telegram_id, u.language, u.status,
+                       s.expires_at
+                FROM users u
+                LEFT JOIN LATERAL (
+                    SELECT * FROM subscriptions s1
+                    WHERE s1.user_id = u.id
+                    ORDER BY s1.expires_at DESC
+                    LIMIT 1
+                ) s ON TRUE
+                ORDER BY u.created_at DESC
+                """
+            )
+            rows = [dict(row) for row in cur.fetchall()]
+    result = []
+    now = now_utc()
+    for row in rows:
+        if row["status"] == "blocked":
+            user_bucket = "blocked"
+        elif row.get("expires_at") and row["expires_at"] >= now:
+            user_bucket = "active"
+        else:
+            user_bucket = "expired"
+        if user_bucket in statuses:
+            result.append(row)
+    return result
