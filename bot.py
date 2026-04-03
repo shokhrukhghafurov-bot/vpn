@@ -11,9 +11,8 @@ from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
+    ReplyKeyboardRemove,
 )
 
 from config import settings
@@ -241,7 +240,7 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineK
 async def show_backend_error(target: Message | CallbackQuery, lang: str) -> None:
     text = TEXT[lang]["service_unavailable"]
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=main_menu_keyboard(lang))
+        await target.answer(text, reply_markup=main_menu_inline(lang))
     else:
         await safe_edit(target, text, back_inline(lang))
         await target.answer()
@@ -250,7 +249,7 @@ async def show_backend_error(target: Message | CallbackQuery, lang: str) -> None
 async def show_unexpected_error(target: Message | CallbackQuery, lang: str) -> None:
     text = TEXT[lang]["unexpected_error"]
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=main_menu_keyboard(lang))
+        await target.answer(text, reply_markup=main_menu_inline(lang))
     else:
         await safe_edit(target, text, back_inline(lang))
         await target.answer()
@@ -271,7 +270,7 @@ async def with_user_guard(target: Message | CallbackQuery, handler, preferred_la
         logger.warning("Backend returned error %s: %s", exc.status_code, exc.detail)
         message = f"Error {exc.status_code}: {exc.detail}"
         if isinstance(target, Message):
-            await target.answer(message, reply_markup=main_menu_keyboard(lang))
+            await target.answer(message, reply_markup=main_menu_inline(lang))
         else:
             await safe_edit(target, message, back_inline(lang))
             await target.answer()
@@ -281,17 +280,23 @@ async def with_user_guard(target: Message | CallbackQuery, handler, preferred_la
 
 
 
-def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
+def main_menu_inline(lang: str) -> InlineKeyboardMarkup:
     t = TEXT[lang]
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=t["buy"]), KeyboardButton(text=t["sub"])],
-            [KeyboardButton(text=t["devices"]), KeyboardButton(text=t["download"])],
-            [KeyboardButton(text=t["support"]), KeyboardButton(text=t["language"])],
-        ],
-        resize_keyboard=True,
-        is_persistent=True,
-        input_field_placeholder=t["menu"],
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=t["buy"], callback_data="menu:buy"),
+                InlineKeyboardButton(text=t["sub"], callback_data="menu:sub"),
+            ],
+            [
+                InlineKeyboardButton(text=t["devices"], callback_data="menu:devices"),
+                InlineKeyboardButton(text=t["download"], callback_data="menu:download"),
+            ],
+            [
+                InlineKeyboardButton(text=t["support"], callback_data="menu:support"),
+                InlineKeyboardButton(text=t["language"], callback_data="menu:language"),
+            ],
+        ]
     )
 
 
@@ -306,15 +311,8 @@ def language_inline() -> InlineKeyboardMarkup:
 
 
 
-def language_reply_keyboard() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="Русский"), KeyboardButton(text="English")],
-        ],
-        resize_keyboard=True,
-        one_time_keyboard=True,
-        input_field_placeholder="Русский / English",
-    )
+def remove_keyboard_markup() -> ReplyKeyboardRemove:
+    return ReplyKeyboardRemove()
 
 
 
@@ -415,16 +413,23 @@ def _platform_label(platform: str) -> str:
     return platform or "Device"
 
 
-async def send_menu(message: Message, lang: str, welcome: bool = False) -> None:
+async def remove_legacy_reply_keyboard(message: Message) -> None:
+    with contextlib.suppress(Exception):
+        cleanup = await message.answer("⁠", reply_markup=remove_keyboard_markup())
+        with contextlib.suppress(Exception):
+            await cleanup.delete()
+
+
+async def send_menu(message: Message, lang: str, welcome: bool = False, cleanup_keyboard: bool = False) -> None:
+    if cleanup_keyboard:
+        await remove_legacy_reply_keyboard(message)
     text = TEXT[lang]["welcome"] if welcome else TEXT[lang]["welcome_back"]
-    await message.answer(text, reply_markup=main_menu_keyboard(lang))
+    await message.answer(text, reply_markup=main_menu_inline(lang))
 
 
 async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
     if callback.message:
-        with contextlib.suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.message.answer(TEXT[lang]["menu"], reply_markup=main_menu_keyboard(lang))
+        await safe_edit(callback, TEXT[lang]["menu"], main_menu_inline(lang))
         return
     await callback.answer(TEXT[lang]["menu"])
 
@@ -517,9 +522,10 @@ async def start(message: Message) -> None:
         is_new = bool((ctx.get("auth") or {}).get("is_new"))
         user_language = (ctx.get("user") or {}).get("language")
         if is_new or user_language not in {"ru", "en"}:
-            await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_reply_keyboard())
+            await remove_legacy_reply_keyboard(message)
+            await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_inline())
             return
-        await send_menu(message, current_lang, welcome=True)
+        await send_menu(message, current_lang, welcome=True, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -527,7 +533,7 @@ async def start(message: Message) -> None:
 @dp.message(Command("menu"))
 async def menu_command(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang)
+        await send_menu(message, lang, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -589,13 +595,14 @@ async def language_from_text(message: Message) -> None:
             await api_request("PATCH", "/users/me/language", token=ctx["token"], json_body={"language": lang})
             await message.answer(
                 f"{TEXT[lang]['language_saved']}\n\n{TEXT[lang]['welcome']}",
-                reply_markup=main_menu_keyboard(lang),
+                reply_markup=main_menu_inline(lang),
             )
         await with_user_guard(message, _handler, preferred_lang=lang)
         return
 
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["choose_language"], reply_markup=language_reply_keyboard())
+        await remove_legacy_reply_keyboard(message)
+        await message.answer(TEXT[lang]["choose_language"], reply_markup=language_inline())
 
     await with_user_guard(message, _handler)
 
@@ -608,7 +615,7 @@ async def renew_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["back"], TEXT["en"]["back"], TEXT["ru"]["main_menu"], TEXT["en"]["main_menu"]}))
 async def menu_from_text_alias(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang)
+        await send_menu(message, lang, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -632,7 +639,7 @@ async def download_ios_from_text(message: Message) -> None:
 @dp.message()
 async def fallback_message(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang)
+        await send_menu(message, lang, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -803,10 +810,8 @@ async def cb_set_language(callback: CallbackQuery) -> None:
         await safe_edit(
             callback,
             f"{TEXT[norm]['language_saved']}\n\n{TEXT[norm]['welcome']}",
-            back_inline(norm),
+            main_menu_inline(norm),
         )
-        if callback.message:
-            await callback.message.answer(TEXT[norm]["menu"], reply_markup=main_menu_keyboard(norm))
         await callback.answer()
 
     await with_user_guard(callback, _handler, preferred_lang=norm)
