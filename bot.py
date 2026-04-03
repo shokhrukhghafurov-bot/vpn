@@ -8,7 +8,6 @@ import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
-    BotCommand,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -291,6 +290,8 @@ def main_menu_keyboard(lang: str) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=t["support"]), KeyboardButton(text=t["language"])],
         ],
         resize_keyboard=True,
+        is_persistent=True,
+        input_field_placeholder=t["menu"],
     )
 
 
@@ -312,6 +313,7 @@ def language_reply_keyboard() -> ReplyKeyboardMarkup:
         ],
         resize_keyboard=True,
         one_time_keyboard=True,
+        input_field_placeholder="Русский / English",
     )
 
 
@@ -585,8 +587,10 @@ async def language_from_text(message: Message) -> None:
         lang = "ru" if message.text == "Русский" else "en"
         async def _handler(_lang: str, ctx: Dict[str, Any]) -> None:
             await api_request("PATCH", "/users/me/language", token=ctx["token"], json_body={"language": lang})
-            await message.answer(TEXT[lang]["language_saved"], reply_markup=main_menu_keyboard(lang))
-            await message.answer(TEXT[lang]["welcome"], reply_markup=main_menu_keyboard(lang))
+            await message.answer(
+                f"{TEXT[lang]['language_saved']}\n\n{TEXT[lang]['welcome']}",
+                reply_markup=main_menu_keyboard(lang),
+            )
         await with_user_guard(message, _handler, preferred_lang=lang)
         return
 
@@ -796,9 +800,13 @@ async def cb_set_language(callback: CallbackQuery) -> None:
 
     async def _handler(_lang: str, ctx: Dict[str, Any]) -> None:
         await api_request("PATCH", "/users/me/language", token=ctx["token"], json_body={"language": norm})
-        await safe_edit(callback, TEXT[norm]["language_saved"], back_inline(norm))
+        await safe_edit(
+            callback,
+            f"{TEXT[norm]['language_saved']}\n\n{TEXT[norm]['welcome']}",
+            back_inline(norm),
+        )
         if callback.message:
-            await callback.message.answer(TEXT[norm]["welcome"], reply_markup=main_menu_keyboard(norm))
+            await callback.message.answer(TEXT[norm]["menu"], reply_markup=main_menu_keyboard(norm))
         await callback.answer()
 
     await with_user_guard(callback, _handler, preferred_lang=norm)
@@ -873,13 +881,9 @@ async def notification_loop() -> None:
 async def configure_bot() -> None:
     app_bot = require_bot()
     await app_bot.delete_webhook(drop_pending_updates=False)
-    await app_bot.set_my_commands(
-        [
-            BotCommand(command="start", description="Open INET menu"),
-            BotCommand(command="menu", description="Open INET menu"),
-        ]
-    )
-    logger.info("Bot configured, webhook removed, commands registered")
+    with contextlib.suppress(Exception):
+        await app_bot.delete_my_commands()
+    logger.info("Bot configured, webhook removed, command menu cleared")
 
 
 async def verify_backend() -> None:
