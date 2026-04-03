@@ -1,6 +1,6 @@
 import os
 from dataclasses import dataclass
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 
 def _env_bool(name: str, default: bool = False) -> bool:
@@ -40,14 +40,24 @@ class Settings:
     APP_LANGS: List[str] = None
     APP_BASE_URL: str = os.getenv("APP_BASE_URL", "https://your-domain.com")
     ADMIN_PANEL_BASE_URL: str = os.getenv("ADMIN_PANEL_BASE_URL", "https://your-admin-domain.com")
+    OPEN_APP_URL: str = os.getenv("OPEN_APP_URL", os.getenv("APP_BASE_URL", "https://your-domain.com"))
     ANDROID_APP_URL: str = os.getenv("ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.example.inet")
     IOS_APP_URL: str = os.getenv("IOS_APP_URL", "https://apps.apple.com/app/id000000000")
     SUPPORT_TELEGRAM_URL: str = os.getenv("SUPPORT_TELEGRAM_URL", "https://t.me/your_admin")
+    SUPPORT_FAQ_RU: str = os.getenv(
+        "SUPPORT_FAQ_RU",
+        "FAQ:\n1. Оплатите тариф в боте.\n2. Скачайте приложение.\n3. Подключите устройство.\n4. Если не получается — напишите в поддержку.",
+    )
+    SUPPORT_FAQ_EN: str = os.getenv(
+        "SUPPORT_FAQ_EN",
+        "FAQ:\n1. Buy a plan in the bot.\n2. Download the app.\n3. Connect your device.\n4. If something fails, contact support.",
+    )
 
     BOT_NAME: str = os.getenv("BOT_NAME", "INET Bot")
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "inet_bot")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", os.getenv("APP_BASE_URL", "http://127.0.0.1:3000"))
+    BOT_NOTIFICATION_POLL_SEC: int = _env_int("BOT_NOTIFICATION_POLL_SEC", 45)
 
     AUTH_DEV_LOGIN_CODE: str = os.getenv("AUTH_DEV_LOGIN_CODE", "111111")
     AUTH_ALLOW_DEV_CODE: bool = _env_bool("AUTH_ALLOW_DEV_CODE", True)
@@ -81,13 +91,13 @@ class Settings:
     YOOKASSA_SHOP_ID: str = os.getenv("YOOKASSA_SHOP_ID", "")
     YOOKASSA_SECRET_KEY: str = os.getenv("YOOKASSA_SECRET_KEY", "")
     YOOKASSA_RETURN_URL: str = os.getenv("YOOKASSA_RETURN_URL", "https://your-domain.com/payment/return")
-    YOOKASSA_WEBHOOK_URL: str = os.getenv("YOOKASSA_WEBHOOK_URL", "https://your-domain.com/api/payments/webhook/yookassa")
+    YOOKASSA_WEBHOOK_URL: str = os.getenv("YOOKASSA_WEBHOOK_URL", "https://your-domain.com/payments/webhook/yookassa")
 
     DEFAULT_LOCATIONS_JSON: str = os.getenv(
         "DEFAULT_LOCATIONS_JSON",
         '[{"code":"de-frankfurt","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":10},'
         '{"code":"nl-amsterdam","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":20},'
-        '{"code":"us-newyork","name_ru":"США","name_en":"USA","country_code":"US","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":30}]'
+        '{"code":"us-newyork","name_ru":"США","name_en":"USA","country_code":"US","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":30}]',
     )
 
     def __post_init__(self) -> None:
@@ -97,14 +107,14 @@ class Settings:
             self.APP_LANGS = _env_list("APP_LANGS", "ru,en")
 
     def plan_definitions(self) -> List[Dict[str, Any]]:
-        plans = [
+        return [
             {
                 "code": self.PLAN_DAILY_CODE,
                 "name_ru": self.PLAN_DAILY_NAME_RU,
                 "name_en": self.PLAN_DAILY_NAME_EN,
                 "price_rub": self.PLAN_DAILY_PRICE_RUB,
                 "duration_days": self.PLAN_DAILY_DURATION_DAYS,
-                "device_limit": self.PLAN_DAILY_DEVICE_LIMIT,
+                "device_limit": min(self.PLAN_DAILY_DEVICE_LIMIT, self.VPN_MAX_DEVICES_PER_ACCOUNT),
                 "is_active": self.PLAN_DAILY_ENABLED and self.VPN_SHOW_DAILY_PLAN,
                 "source_env_key": "PLAN_DAILY",
             },
@@ -114,12 +124,11 @@ class Settings:
                 "name_en": self.PLAN_MONTHLY_NAME_EN,
                 "price_rub": self.PLAN_MONTHLY_PRICE_RUB,
                 "duration_days": self.PLAN_MONTHLY_DURATION_DAYS,
-                "device_limit": self.PLAN_MONTHLY_DEVICE_LIMIT,
+                "device_limit": min(self.PLAN_MONTHLY_DEVICE_LIMIT, self.VPN_MAX_DEVICES_PER_ACCOUNT),
                 "is_active": self.PLAN_MONTHLY_ENABLED and self.VPN_SHOW_MONTHLY_PLAN,
                 "source_env_key": "PLAN_MONTHLY",
             },
         ]
-        return plans
 
 
 settings = Settings()
