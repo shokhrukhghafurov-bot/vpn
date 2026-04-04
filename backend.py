@@ -37,6 +37,7 @@ from db_store import (
     refresh_subscription_statuses,
     register_device,
     reset_user_devices_by_telegram,
+    set_user_device_limit_override_by_telegram,
     set_user_language,
     set_user_status_by_telegram,
     settings_snapshot,
@@ -88,6 +89,11 @@ class AdminUserUpsertIn(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     language: str = "ru"
+    device_limit_override: Optional[int] = Field(default=None, ge=1)
+
+
+class AdminUserPatchIn(BaseModel):
+    device_limit_override: Optional[int] = None
 
 
 class ExtendIn(BaseModel):
@@ -393,10 +399,22 @@ def admin_users(
 @app.post("/api/infra/admin/vpn/users")
 def admin_users_create(payload: AdminUserUpsertIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     try:
-        item = admin_create_or_update_user(payload.model_dump(), admin_name)
+        item = admin_create_or_update_user(payload.model_dump(exclude_none=True), admin_name)
         return {"ok": True, "item": item}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/infra/admin/vpn/users/{telegram_id}")
+def admin_user_patch(telegram_id: int, payload: AdminUserPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    data = payload.model_dump(exclude_unset=True)
+    if "device_limit_override" not in data:
+        raise HTTPException(status_code=400, detail="No changes provided")
+    try:
+        item = set_user_device_limit_override_by_telegram(telegram_id, data.get("device_limit_override"), admin_name)
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.patch("/api/infra/admin/vpn/users/{telegram_id}/block")
@@ -507,36 +525,12 @@ def telegram_send_message(telegram_id: int, text: str, reply_markup: Optional[Di
     return response.json()
 
 
-def enqueue_admin_message(telegram_id: int, text: str, unique_prefix: str) -> Dict[str, Any]:
-    user = get_user_by_telegram_id(int(telegram_id))
-    if not user:
-        raise ValueError("User not found in DB. Open the bot with this Telegram account first.")
-    queued = enqueue_notification(
-        user_id=int(user["id"]),
-        event_type="admin_message",
-        unique_key=f"{unique_prefix}:{telegram_id}:{uuid4().hex}",
-        payload={"text": text},
-    )
-    if not queued:
-        raise RuntimeError("Failed to queue admin message")
-    return {"ok": True, "queued": True, "user_id": int(user["id"])}
-
-
 @app.post("/api/infra/admin/vpn/test-send")
 def admin_test_send(payload: TestSendIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    text = payload.text.strip()
-    if not text:
-        raise HTTPException(status_code=400, detail="Text is required")
     try:
-        if settings.BOT_TOKEN:
-            telegram_send_message(payload.telegram_id, text)
-            return {"ok": True, "mode": "direct", "sent": 1}
-        queued = enqueue_admin_message(payload.telegram_id, text, "vpn-admin-test")
-        return {"ok": True, "mode": "queue", "queued": 1, **queued}
-    except ValueError as exc:
-        record_bot_error("vpn-admin-test", str(payload.telegram_id), str(exc))
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
+        telegram_send_message(payload.telegram_id, payload.text)
+        return {"ok": True}
     except Exception as exc:
         record_bot_error("vpn-admin-test", str(payload.telegram_id), str(exc))
         raise HTTPException(status_code=502, detail=f"Telegram send failed: {exc}") from exc
@@ -550,20 +544,14 @@ def admin_broadcast(payload: BroadcastIn, admin_name: str = Depends(require_admi
         raise HTTPException(status_code=400, detail="Text is required")
     sent = 0
     failed = 0
-    targets = list_broadcast_targets(payload.statuses or ["active"])
-    mode = "direct" if settings.BOT_TOKEN else "queue"
-    for target in targets:
+    for target in list_broadcast_targets(payload.statuses or ["active"]):
         try:
-            telegram_id = int(target["telegram_id"])
-            if settings.BOT_TOKEN:
-                telegram_send_message(telegram_id, text)
-            else:
-                enqueue_admin_message(telegram_id, text, "vpn-broadcast")
+            telegram_send_message(int(target["telegram_id"]), text)
             sent += 1
         except Exception as exc:
             failed += 1
             record_bot_error("vpn-broadcast", str(target.get("telegram_id")), str(exc))
-    return {"ok": True, "mode": mode, "sent": sent, "failed": failed, "total": len(targets)}
+    return {"ok": True, "sent": sent, "failed": failed, "total": sent + failed}
 
 
 @app.get("/api/infra/admin/vpn/errors")
