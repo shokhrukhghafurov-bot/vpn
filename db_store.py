@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS users (
     last_name TEXT,
     language TEXT NOT NULL DEFAULT 'ru',
     status TEXT NOT NULL DEFAULT 'active',
+    device_limit_override INTEGER,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -142,6 +143,7 @@ MIGRATION_SQL = [
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
+    "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_limit_override INTEGER",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
 
@@ -201,6 +203,7 @@ MIGRATION_SQL = [
 POST_MIGRATION_SQL = [
     "UPDATE users SET language = 'ru' WHERE language IS NULL OR language = ''",
     "UPDATE users SET status = 'active' WHERE status IS NULL OR status = ''",
+    "UPDATE users SET device_limit_override = NULL WHERE device_limit_override IS NOT NULL AND device_limit_override <= 0",
     f"UPDATE plans SET device_limit = {int(settings.VPN_DEFAULT_DEVICE_LIMIT)} WHERE device_limit IS NULL OR device_limit <= 0",
     "UPDATE plans SET is_active = TRUE WHERE is_active IS NULL",
     "UPDATE plans SET source_env_key = code WHERE source_env_key IS NULL OR source_env_key = ''",
@@ -288,6 +291,34 @@ def seed_locations_from_env() -> None:
         conn.commit()
 
 
+def _as_positive_int(value: Any) -> Optional[int]:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return None
+    if parsed <= 0:
+        return None
+    return parsed
+
+
+def _normalize_device_limit_override(value: Any) -> Optional[int]:
+    parsed = _as_positive_int(value)
+    if parsed is None:
+        return None
+    return min(parsed, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+
+
+def _resolve_effective_device_limit(plan_limit: Any = None, user_override: Any = None) -> int:
+    override_limit = _normalize_device_limit_override(user_override)
+    if override_limit is not None:
+        return override_limit
+    plan_value = _as_positive_int(plan_limit)
+    if plan_value is not None:
+        return min(plan_value, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    default_limit = _as_positive_int(settings.VPN_DEFAULT_DEVICE_LIMIT) or 1
+    return min(default_limit, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+
+
 def _normalize_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not row:
         return None
@@ -299,6 +330,7 @@ def _normalize_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
         "last_name": row.get("last_name"),
         "language": row.get("language") or "ru",
         "status": row.get("status") or "active",
+        "device_limit_override": _normalize_device_limit_override(row.get("device_limit_override")),
         "created_at": row.get("created_at"),
         "updated_at": row.get("updated_at"),
     }
@@ -460,19 +492,21 @@ def get_user_devices(user_id: int) -> List[Dict[str, Any]]:
 
 
 def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
+    user = get_user_by_id(user_id)
     subscription = get_current_subscription(user_id)
     latest = subscription or get_latest_subscription(user_id)
     devices = get_user_devices(user_id)
-    if latest:
-        allowed_limit = min(int(latest["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
-    else:
-        allowed_limit = settings.VPN_DEFAULT_DEVICE_LIMIT
+    allowed_limit = _resolve_effective_device_limit(
+        (latest or {}).get("device_limit"),
+        (user or {}).get("device_limit_override"),
+    )
     return {
         "subscription": latest,
         "is_active": bool(subscription),
         "devices": devices,
         "devices_used": len(devices),
         "device_limit": allowed_limit,
+        "device_limit_override": (user or {}).get("device_limit_override"),
     }
 
 
@@ -487,7 +521,7 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
         raise PermissionError("Active subscription required")
     if not settings.VPN_NEW_ACTIVATIONS_ENABLED:
         raise PermissionError("New activations are disabled")
-    allowed_limit = min(int(subscription["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
     existing = get_user_devices(user_id)
     for item in existing:
         if item["device_fingerprint"] == device_fingerprint:
@@ -708,6 +742,7 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
             subscription = cur.fetchone()
         conn.commit()
     refresh_subscription_statuses(payment["user_id"])
+    user_info = _normalize_user(user) or {}
     enqueue_notification(
         user_id=payment["user_id"],
         event_type="payment_paid",
@@ -718,7 +753,7 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
             "plan_name_ru": plan["name_ru"],
             "plan_name_en": plan["name_en"],
             "duration_days": int(plan["duration_days"]),
-            "device_limit": min(int(plan["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+            "device_limit": _resolve_effective_device_limit(plan["device_limit"], user_info.get("device_limit_override")),
             "expires_at": subscription["expires_at"].isoformat(),
         },
     )
@@ -751,6 +786,7 @@ def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, 
                     u.last_name,
                     u.language,
                     u.status,
+                    u.device_limit_override,
                     s.id AS subscription_id,
                     s.expires_at,
                     p.code AS plan_code,
@@ -772,17 +808,10 @@ def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, 
                 tuple(values),
             )
             items = []
-            now = now_utc()
             for row in cur.fetchall():
                 item = dict(row)
-                item["device_limit"] = min(int(item.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT), settings.VPN_MAX_DEVICES_PER_ACCOUNT)
-                expires_at = item.get("expires_at")
-                if item.get("status") == "blocked":
-                    item["access_status"] = "blocked"
-                elif expires_at and expires_at >= now:
-                    item["access_status"] = "active"
-                else:
-                    item["access_status"] = "expired"
+                item["device_limit_override"] = _normalize_device_limit_override(item.get("device_limit_override"))
+                item["device_limit"] = _resolve_effective_device_limit(item.get("device_limit"), item.get("device_limit_override"))
                 items.append(item)
             cur.execute("SELECT COUNT(*) AS total FROM users")
             total = cur.fetchone()["total"]
@@ -804,6 +833,8 @@ def admin_create_or_update_user(payload: Dict[str, Any], admin_name: str) -> Dic
     if not plan:
         raise ValueError("Plan not found")
     user = upsert_telegram_user(payload)
+    if "device_limit_override" in payload:
+        user = set_user_device_limit_override_by_telegram(int(user["telegram_id"]), payload.get("device_limit_override"), admin_name)["user"]
     expires_at = payload.get("expires_at")
     if expires_at:
         if isinstance(expires_at, str):
@@ -842,6 +873,7 @@ def get_user_snapshot_by_telegram(telegram_id: int) -> Dict[str, Any]:
         "devices": view["devices"],
         "devices_used": view["devices_used"],
         "device_limit": view["device_limit"],
+        "device_limit_override": view.get("device_limit_override"),
     }
 
 
@@ -876,6 +908,33 @@ def extend_user_subscription_by_telegram(telegram_id: int, days_added: int, reas
             )
         conn.commit()
     refresh_subscription_statuses(user["id"])
+    return get_user_snapshot_by_telegram(telegram_id)
+
+
+def set_user_device_limit_override_by_telegram(telegram_id: int, device_limit_override: Optional[int], admin_name: str) -> Dict[str, Any]:
+    user = get_user_by_telegram_id(telegram_id)
+    if not user:
+        raise ValueError("User not found")
+    normalized_override = _normalize_device_limit_override(device_limit_override)
+    note = (
+        f"Device limit override set to {normalized_override}"
+        if normalized_override is not None
+        else "Device limit override cleared (plan default)"
+    )
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE users SET device_limit_override = %s, updated_at = NOW() WHERE telegram_id = %s RETURNING *",
+                (normalized_override, telegram_id),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("User not found")
+            cur.execute(
+                "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
+                (row["id"], admin_name, note),
+            )
+        conn.commit()
     return get_user_snapshot_by_telegram(telegram_id)
 
 
@@ -1017,6 +1076,7 @@ def enqueue_subscription_notifications() -> None:
             )
             expired = [dict(row) for row in cur.fetchall()]
     for row in expiring:
+        user = get_user_by_id(int(row["user_id"])) or {}
         enqueue_notification(
             user_id=row["user_id"],
             event_type="subscription_expiring",
@@ -1028,10 +1088,11 @@ def enqueue_subscription_notifications() -> None:
                 "plan_name_ru": row["name_ru"],
                 "plan_name_en": row["name_en"],
                 "duration_days": int(row["duration_days"]),
-                "device_limit": min(int(row["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
             },
         )
     for row in expired:
+        user = get_user_by_id(int(row["user_id"])) or {}
         enqueue_notification(
             user_id=row["user_id"],
             event_type="subscription_expired",
@@ -1043,7 +1104,7 @@ def enqueue_subscription_notifications() -> None:
                 "plan_name_ru": row["name_ru"],
                 "plan_name_en": row["name_en"],
                 "duration_days": int(row["duration_days"]),
-                "device_limit": min(int(row["device_limit"]), settings.VPN_MAX_DEVICES_PER_ACCOUNT),
+                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
             },
         )
 
