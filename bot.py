@@ -3,6 +3,7 @@ import asyncio
 import logging
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 import httpx
 from aiogram import Bot, Dispatcher, F
@@ -333,11 +334,25 @@ def payment_inline(lang: str, checkout_url: str, payment_id: str) -> InlineKeybo
 
 
 
-def activated_inline(lang: str) -> InlineKeyboardMarkup:
+def build_open_app_url(token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    base = settings.OPEN_APP_URL or settings.APP_BASE_URL
+    if not token and not lang:
+        return base
+    parts = urlsplit(base)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if token:
+        query["token"] = token
+    if lang:
+        query["lang"] = lang
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+
+def activated_inline(lang: str, open_app_url: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=t["open_app"], url=settings.OPEN_APP_URL)],
+            [InlineKeyboardButton(text=t["open_app"], url=open_app_url or build_open_app_url(lang=lang))],
             [InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")],
             [InlineKeyboardButton(text=t["sub"], callback_data="menu:sub")],
             [InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")],
@@ -380,13 +395,13 @@ def download_platforms_inline(lang: str) -> InlineKeyboardMarkup:
 
 
 
-def platform_open_inline(lang: str, platform: str) -> InlineKeyboardMarkup:
+def platform_open_inline(lang: str, platform: str, open_app_url: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     url = settings.ANDROID_APP_URL if platform == "android" else settings.IOS_APP_URL
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=t["download_app"], url=url)],
-            [InlineKeyboardButton(text=t["open_app"], url=settings.OPEN_APP_URL)],
+            [InlineKeyboardButton(text=t["open_app"], url=open_app_url or build_open_app_url(lang=lang))],
             [InlineKeyboardButton(text=t["back"], callback_data="menu:download")],
         ]
     )
@@ -436,6 +451,7 @@ async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
 
 async def render_subscription_message(lang: str, token: str) -> Tuple[str, InlineKeyboardMarkup]:
     t = TEXT[lang]
+    open_app_url = build_open_app_url(token, lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     used = int(data.get("devices_used") or 0)
@@ -456,7 +472,7 @@ async def render_subscription_message(lang: str, token: str) -> Tuple[str, Inlin
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")],
-            [InlineKeyboardButton(text=t["open_app"], url=settings.OPEN_APP_URL)],
+            [InlineKeyboardButton(text=t["open_app"], url=open_app_url)],
             [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
         ]
     )
@@ -497,10 +513,11 @@ async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
 
 async def render_payment_success_message(lang: str, token: str) -> Tuple[str, InlineKeyboardMarkup]:
     t = TEXT[lang]
+    open_app_url = build_open_app_url(token, lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     if not sub:
-        return t["payment_received"], activated_inline(lang)
+        return t["payment_received"], activated_inline(lang, open_app_url)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
     text = "\n".join(
@@ -512,7 +529,7 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
             f"{t['available_devices']}: {device_limit} / {device_limit}",
         ]
     )
-    return text, activated_inline(lang)
+    return text, activated_inline(lang, open_app_url)
 
 
 @dp.message(Command("start"))
@@ -623,7 +640,7 @@ async def menu_from_text_alias(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
 async def download_android_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android"))
+        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", build_open_app_url(_ctx.get("token"), lang)))
 
     await with_user_guard(message, _handler)
 
@@ -631,7 +648,7 @@ async def download_android_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
 async def download_ios_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios"))
+        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", build_open_app_url(_ctx.get("token"), lang)))
 
     await with_user_guard(message, _handler)
 
@@ -775,7 +792,7 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
             text = TEXT[lang]["download_android"]
         else:
             text = TEXT[lang]["download_ios"]
-        await safe_edit(callback, text, platform_open_inline(lang, platform))
+        await safe_edit(callback, text, platform_open_inline(lang, platform, build_open_app_url(_ctx.get("token"), lang)))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
