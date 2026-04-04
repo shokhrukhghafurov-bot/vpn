@@ -838,6 +838,7 @@ def admin_create_or_update_user(payload: Dict[str, Any], admin_name: str) -> Dic
     user = upsert_telegram_user(payload)
     if "device_limit_override" in payload:
         user = set_user_device_limit_override_by_telegram(int(user["telegram_id"]), payload.get("device_limit_override"), admin_name)["user"]
+    refresh_subscription_statuses(user["id"])
     expires_at = payload.get("expires_at")
     if expires_at:
         if isinstance(expires_at, str):
@@ -853,12 +854,35 @@ def admin_create_or_update_user(payload: Dict[str, Any], admin_name: str) -> Dic
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status) VALUES (%s, %s, %s, %s, 'active')",
-                (user["id"], plan["id"], starts_at, expires_dt),
+                "SELECT * FROM subscriptions WHERE user_id = %s AND status = 'active' ORDER BY expires_at DESC, id DESC LIMIT 1",
+                (user["id"],),
             )
+            current = cur.fetchone()
+            if not current:
+                cur.execute(
+                    "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC, id DESC LIMIT 1",
+                    (user["id"],),
+                )
+                current = cur.fetchone()
+            if current:
+                cur.execute(
+                    """
+                    UPDATE subscriptions
+                    SET plan_id = %s, starts_at = %s, expires_at = %s, updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (plan["id"], starts_at, expires_dt, current["id"]),
+                )
+                note = f"Manual access updated for plan {plan['code']}"
+            else:
+                cur.execute(
+                    "INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status) VALUES (%s, %s, %s, %s, 'active')",
+                    (user["id"], plan["id"], starts_at, expires_dt),
+                )
+                note = f"Manual access issued for plan {plan['code']}"
             cur.execute(
                 "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
-                (user["id"], admin_name, f"Manual access issued for plan {plan['code']}"),
+                (user["id"], admin_name, note),
             )
         conn.commit()
     refresh_subscription_statuses(user["id"])
@@ -1045,18 +1069,68 @@ def enqueue_notification(user_id: int, event_type: str, unique_key: str, payload
     return bool(row)
 
 
+def purge_stale_subscription_notifications() -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                DELETE FROM bot_notifications n
+                WHERE n.sent_at IS NULL
+                  AND n.event_type = 'subscription_expiring'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM (
+                          SELECT DISTINCT ON (s.user_id) s.id, s.user_id, s.expires_at
+                          FROM subscriptions s
+                          WHERE s.status = 'active' AND s.expires_at > NOW()
+                          ORDER BY s.user_id, s.expires_at DESC, s.id DESC
+                      ) latest
+                      WHERE latest.user_id = n.user_id
+                        AND latest.expires_at <= NOW() + INTERVAL '1 day'
+                        AND latest.id = CASE
+                            WHEN COALESCE(n.payload->>'subscription_id', '') ~ '^[0-9]+$'
+                                THEN (n.payload->>'subscription_id')::BIGINT
+                            ELSE NULL
+                        END
+                  )
+                """
+            )
+            cur.execute(
+                """
+                DELETE FROM bot_notifications n
+                WHERE n.sent_at IS NULL
+                  AND n.event_type = 'subscription_expired'
+                  AND EXISTS (
+                      SELECT 1
+                      FROM subscriptions s
+                      WHERE s.user_id = n.user_id
+                        AND s.status = 'active'
+                  )
+                """
+            )
+        conn.commit()
+
+
+
 def enqueue_subscription_notifications() -> None:
     refresh_subscription_statuses()
+    purge_stale_subscription_notifications()
     now = now_utc()
     soon = now + timedelta(days=1)
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                SELECT s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
-                FROM subscriptions s
-                JOIN plans p ON p.id = s.plan_id
-                WHERE s.status = 'active' AND s.expires_at > NOW() AND s.expires_at <= NOW() + INTERVAL '1 day'
+                SELECT latest.id, latest.user_id, latest.expires_at, latest.plan_code, latest.name_ru, latest.name_en, latest.duration_days, latest.device_limit
+                FROM (
+                    SELECT DISTINCT ON (s.user_id)
+                        s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
+                    FROM subscriptions s
+                    JOIN plans p ON p.id = s.plan_id
+                    WHERE s.status = 'active' AND s.expires_at > NOW()
+                    ORDER BY s.user_id, s.expires_at DESC, s.id DESC
+                ) latest
+                WHERE latest.expires_at <= NOW() + INTERVAL '1 day'
                 """
             )
             expiring = [dict(row) for row in cur.fetchall()]
@@ -1112,7 +1186,9 @@ def enqueue_subscription_notifications() -> None:
         )
 
 
+
 def list_pending_notifications(limit: int = 100) -> List[Dict[str, Any]]:
+    purge_stale_subscription_notifications()
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
