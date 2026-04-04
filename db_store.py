@@ -266,28 +266,83 @@ def sync_plans_from_env() -> None:
         conn.commit()
 
 
-def seed_locations_from_env() -> None:
+def _load_default_locations() -> List[Dict[str, Any]]:
     try:
-        locations = json.loads(settings.DEFAULT_LOCATIONS_JSON or "[]")
+        raw_locations = json.loads(settings.DEFAULT_LOCATIONS_JSON or "[]")
     except json.JSONDecodeError:
-        locations = []
+        return []
+    if not isinstance(raw_locations, list):
+        return []
+
+    normalized: List[Dict[str, Any]] = []
+    for idx, item in enumerate(raw_locations, start=1):
+        if not isinstance(item, dict):
+            continue
+        code = str(item.get("code") or "").strip()
+        name_ru = str(item.get("name_ru") or "").strip()
+        name_en = str(item.get("name_en") or name_ru).strip()
+        if not code or not name_ru or not name_en:
+            continue
+        country_code = item.get("country_code")
+        if country_code is not None:
+            country_code = str(country_code).strip().upper() or None
+        normalized.append(
+            {
+                "code": code,
+                "name_ru": name_ru,
+                "name_en": name_en,
+                "country_code": country_code,
+                "is_active": bool(item.get("is_active", True)),
+                "is_recommended": bool(item.get("is_recommended", False)),
+                "is_reserve": bool(item.get("is_reserve", False)),
+                "status": str(item.get("status") or "online").strip() or "online",
+                "sort_order": int(item.get("sort_order") or idx * 10),
+            }
+        )
+    return normalized
+
+
+
+def seed_locations_from_env() -> None:
+    locations = _load_default_locations()
     if not locations:
         return
+
+    default_codes = [item["code"] for item in locations]
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT COUNT(*) AS count FROM locations")
-            row = cur.fetchone()
-            if row and row["count"] > 0:
-                return
             for item in locations:
                 cur.execute(
                     """
                     INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order)
                     VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s)
-                    ON CONFLICT (code) DO NOTHING
+                    ON CONFLICT (code) DO UPDATE SET
+                        name_ru = EXCLUDED.name_ru,
+                        name_en = EXCLUDED.name_en,
+                        country_code = EXCLUDED.country_code,
+                        is_active = EXCLUDED.is_active,
+                        is_recommended = EXCLUDED.is_recommended,
+                        is_reserve = EXCLUDED.is_reserve,
+                        status = EXCLUDED.status,
+                        sort_order = EXCLUDED.sort_order,
+                        updated_at = NOW()
                     """,
                     item,
                 )
+
+            placeholders = ", ".join(["%s"] * len(default_codes))
+            cur.execute(
+                f"""
+                UPDATE locations
+                SET is_active = FALSE,
+                    is_recommended = FALSE,
+                    is_reserve = FALSE,
+                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
+                    updated_at = NOW()
+                WHERE code NOT IN ({placeholders})
+                """,
+                tuple(default_codes),
+            )
         conn.commit()
 
 
