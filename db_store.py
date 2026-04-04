@@ -240,7 +240,7 @@ def bootstrap() -> None:
             _run_schema_migrations(cur)
         conn.commit()
     sync_plans_from_env()
-    seed_locations_from_env()
+    sync_locations_catalog()
 
 
 def sync_plans_from_env() -> None:
@@ -266,9 +266,9 @@ def sync_plans_from_env() -> None:
         conn.commit()
 
 
-def _load_default_locations() -> List[Dict[str, Any]]:
+def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
     try:
-        raw_locations = json.loads(settings.DEFAULT_LOCATIONS_JSON or "[]")
+        raw_locations = json.loads(raw_json or "[]")
     except json.JSONDecodeError:
         return []
     if not isinstance(raw_locations, list):
@@ -303,7 +303,17 @@ def _load_default_locations() -> List[Dict[str, Any]]:
 
 
 
-def seed_locations_from_env() -> None:
+def _load_default_locations() -> List[Dict[str, Any]]:
+    builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
+    if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED:
+        env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
+        if env_locations:
+            return env_locations
+    return builtin_locations
+
+
+
+def sync_locations_catalog() -> None:
     locations = _load_default_locations()
     if not locations:
         return
@@ -1103,6 +1113,7 @@ def settings_snapshot() -> Dict[str, Any]:
         "android_app_url": settings.ANDROID_APP_URL,
         "ios_app_url": settings.IOS_APP_URL,
         "settings_editable": settings.VPN_SETTINGS_EDITABLE,
+        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
         "plans": get_all_plans(),
     }
 
