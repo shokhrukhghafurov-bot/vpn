@@ -95,9 +95,14 @@ class Settings:
 
     DEFAULT_LOCATIONS_JSON: str = os.getenv(
         "DEFAULT_LOCATIONS_JSON",
-        '[{"code":"de-frankfurt","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":10},'
-        '{"code":"nl-amsterdam","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":20},'
-        '{"code":"us-newyork","name_ru":"США","name_en":"USA","country_code":"US","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":30}]',
+        '[{"code":"auto-fastest","name_ru":"Авто | Самый быстрый","name_en":"Auto | Fastest","country_code":null,"is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":10},'
+        '{"code":"auto-reserve","name_ru":"Авто | Резервный","name_en":"Auto | Reserve","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":true,"status":"online","sort_order":20},'
+        '{"code":"ru-1","name_ru":"Россия","name_en":"Russia","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":30},'
+        '{"code":"fi-1","name_ru":"Финляндия","name_en":"Finland","country_code":"FI","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":40},'
+        '{"code":"de-1","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":50},'
+        '{"code":"nl-1","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":60},'
+        '{"code":"fr-1","name_ru":"Франция","name_en":"France","country_code":"FR","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":70},'
+        '{"code":"at-1","name_ru":"Австрия","name_en":"Austria","country_code":"AT","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":80}]',
     )
 
     def __post_init__(self) -> None:
