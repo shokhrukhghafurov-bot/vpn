@@ -858,9 +858,6 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     if event_type == "device_removed":
         name = payload.get("device_name") or payload.get("platform") or "device"
         return f"{t['device_removed']}\n{name}", back_inline(lang)
-    if event_type == "admin_message":
-        text = str(payload.get("text") or "").strip() or t["main_menu"]
-        return text, back_inline(lang)
     return t["main_menu"], back_inline(lang)
 
 
