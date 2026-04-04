@@ -190,6 +190,54 @@ def require_admin(credentials: HTTPBasicCredentials = Depends(basic_security)) -
     return credentials.username
 
 
+def _flag_emoji(country_code: Optional[str]) -> str:
+    if not country_code or len(country_code) != 2:
+        return ""
+    code = country_code.upper()
+    if not code.isalpha():
+        return ""
+    return "".join(chr(127397 + ord(char)) for char in code)
+
+
+
+def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(row.get("code") or "")
+    country_code = row.get("country_code")
+    if code.startswith("auto-"):
+        return {
+            "type": "virtual",
+            "section_key": "system",
+            "section_name_ru": "Системные",
+            "section_name_en": "System",
+            "icon": "💎",
+        }
+    if "lte" in code.lower():
+        return {
+            "type": "mobile",
+            "section_key": "mobile",
+            "section_name_ru": "Мобильные",
+            "section_name_en": "Mobile",
+            "icon": "📶",
+        }
+    return {
+        "type": "node",
+        "section_key": "countries",
+        "section_name_ru": "Основные страны",
+        "section_name_en": "Main countries",
+        "icon": _flag_emoji(country_code),
+    }
+
+
+
+def serialize_location(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(row)
+    meta = _location_meta(item)
+    item.update(meta)
+    item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
+    item["display_name_en"] = f'{meta["icon"]} {item.get("name_en")}'.strip() if meta.get("icon") else item.get("name_en")
+    return item
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "service": settings.APP_NAME}
@@ -266,7 +314,7 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
 
 @app.get("/locations")
 def locations() -> Dict[str, Any]:
-    return {"ok": True, "items": list_locations(active_only=True)}
+    return {"ok": True, "items": [serialize_location(row) for row in list_locations(active_only=True)]}
 
 
 @app.get("/locations/status")
@@ -469,7 +517,7 @@ def admin_payments_export(status_filter: str = Query(default="all", alias="statu
 @app.get("/api/infra/admin/vpn/locations")
 def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "items": list_locations(active_only=False)}
+    return {"ok": True, "items": [serialize_location(row) for row in list_locations(active_only=False)]}
 
 
 @app.post("/api/infra/admin/vpn/locations")
