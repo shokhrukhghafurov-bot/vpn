@@ -305,7 +305,10 @@ def _normalize_device_limit_override(value: Any) -> Optional[int]:
     parsed = _as_positive_int(value)
     if parsed is None:
         return None
-    return min(parsed, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    # V2: per-user override must bypass the global default ceiling.
+    # Global max remains a default/plan cap for regular users,
+    # but selected users may explicitly receive a higher manual limit.
+    return parsed
 
 
 def _resolve_effective_device_limit(plan_limit: Any = None, user_override: Any = None) -> int:
