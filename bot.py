@@ -272,7 +272,7 @@ def is_supported_telegram_url(url: Optional[str]) -> bool:
     if not url:
         return False
     scheme = (urlsplit(url).scheme or "").lower()
-    return scheme in {"http", "https", "tg", "inet"}
+    return scheme in {"http", "https", "tg"}
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -389,7 +389,7 @@ def build_open_app_url(
     code: Optional[str] = None,
     token: Optional[str] = None,
 ) -> str:
-    base = settings.OPEN_APP_URL or settings.APP_BASE_URL
+    base = (settings.OPEN_APP_BRIDGE_URL or "").strip() or f"{settings.BACKEND_BASE_URL.rstrip('/')}/open-app"
     final_code = code or credential
     final_token = token if not final_code else None
     if not final_code and not final_token and not lang:
