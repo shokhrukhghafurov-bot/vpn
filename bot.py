@@ -92,8 +92,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "device_active": "активен",
         "device_inactive": "неактивен",
         "available_devices": "Доступно устройств",
-        "token_label": "Токен входа",
-        "copy_token": "Скопировать токен",
+        "token_label": "Код входа",
+        "copy_token": "Скопировать код",
     },
     "en": {
         "welcome": "Welcome to INET\nChoose an action below",
@@ -156,8 +156,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "device_active": "active",
         "device_inactive": "inactive",
         "available_devices": "Devices available",
-        "token_label": "Login token",
-        "copy_token": "Copy token",
+        "token_label": "Login code",
+        "copy_token": "Copy code",
     },
 }
 
@@ -189,9 +189,10 @@ async def api_request(
     *,
     token: Optional[str] = None,
     json_body: Optional[Dict[str, Any]] = None,
+    extra_headers: Optional[Dict[str, str]] = None,
 ) -> Dict[str, Any]:
     url = settings.BACKEND_BASE_URL.rstrip("/") + path
-    headers = {}
+    headers = dict(extra_headers or {})
     if token:
         headers["Authorization"] = f"Bearer {token}"
     try:
@@ -233,21 +234,26 @@ async def get_user_ctx(tg_user: Any, language_override: Optional[str] = None) ->
 
 
 
-async def issue_login_token_for_telegram_id(telegram_id: int, language: str = "ru") -> Optional[str]:
+async def issue_login_code_for_telegram_id(telegram_id: int, language: str = "ru") -> Tuple[Optional[str], Optional[str]]:
     try:
+        headers: Dict[str, str] = {}
+        if settings.AUTH_CODE_ISSUER_SECRET:
+            headers["X-Auth-Code-Secret"] = settings.AUTH_CODE_ISSUER_SECRET
         data = await api_request(
             "POST",
-            "/auth/telegram",
+            "/auth/code/issue",
             json_body={
                 "telegram_id": int(telegram_id),
                 "language": "en" if language == "en" else "ru",
             },
+            extra_headers=headers or None,
         )
-        token = (data.get("token") or "").strip()
-        return token or None
+        code = (data.get("code") or "").strip() or None
+        deep_link = (data.get("deep_link") or "").strip() or None
+        return code, deep_link
     except Exception:
-        logger.exception("Failed to issue login token for telegram user %s", telegram_id)
-        return None
+        logger.exception("Failed to issue login code for telegram user %s", telegram_id)
+        return None, None
 
 
 def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
@@ -376,14 +382,24 @@ def payment_inline(lang: str, checkout_url: str, payment_id: str) -> InlineKeybo
 
 
 
-def build_open_app_url(token: Optional[str] = None, lang: Optional[str] = None) -> str:
+def build_open_app_url(
+    credential: Optional[str] = None,
+    lang: Optional[str] = None,
+    *,
+    code: Optional[str] = None,
+    token: Optional[str] = None,
+) -> str:
     base = settings.OPEN_APP_URL or settings.APP_BASE_URL
-    if not token and not lang:
+    final_code = code or credential
+    final_token = token if not final_code else None
+    if not final_code and not final_token and not lang:
         return base
     parts = urlsplit(base)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if token:
-        query["token"] = token
+    if final_code:
+        query["code"] = final_code
+    elif final_token:
+        query["token"] = final_token
     if lang:
         query["lang"] = lang
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
@@ -491,15 +507,16 @@ async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
     await callback.answer(TEXT[lang]["menu"])
 
 
-async def render_subscription_message(lang: str, token: str) -> Tuple[str, InlineKeyboardMarkup]:
+async def render_subscription_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     t = TEXT[lang]
-    open_app_url = build_open_app_url(token, lang)
+    code, open_app_url = await issue_login_code_for_telegram_id(telegram_id, lang)
+    open_app_url = open_app_url or build_open_app_url(lang=lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     used = int(data.get("devices_used") or 0)
     limit = int(data.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT)
     if not sub:
-        text = append_token_details(t["subscription_none"], lang, token, limit)
+        text = append_token_details(t["subscription_none"], lang, code, limit)
     else:
         plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
         status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
@@ -511,9 +528,9 @@ async def render_subscription_message(lang: str, token: str) -> Tuple[str, Inlin
                 f"{t['devices_used']}: {used} / {limit}",
             ]
         )
-        text = append_token_details(text, lang, token, limit)
+        text = append_token_details(text, lang, code, limit)
     rows: List[List[InlineKeyboardButton]] = []
-    rows.extend(token_copy_rows(lang, token))
+    rows.extend(token_copy_rows(lang, code))
     rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
     if is_supported_telegram_url(open_app_url):
         rows.append([InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
@@ -554,14 +571,15 @@ async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
     return text, support_inline(lang)
 
 
-async def render_payment_success_message(lang: str, token: str) -> Tuple[str, InlineKeyboardMarkup]:
+async def render_payment_success_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     t = TEXT[lang]
-    open_app_url = build_open_app_url(token, lang)
+    code, open_app_url = await issue_login_code_for_telegram_id(telegram_id, lang)
+    open_app_url = open_app_url or build_open_app_url(lang=lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     if not sub:
-        text = append_token_details(t["payment_received"], lang, token, int(data.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT))
-        return text, activated_inline(lang, open_app_url, token)
+        text = append_token_details(t["payment_received"], lang, code, int(data.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT))
+        return text, activated_inline(lang, open_app_url, code)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
     text = "\n".join(
@@ -573,8 +591,8 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
             f"{t['available_devices']}: {device_limit} / {device_limit}",
         ]
     )
-    text = append_token_details(text, lang, token, device_limit)
-    return text, activated_inline(lang, open_app_url, token)
+    text = append_token_details(text, lang, code, device_limit)
+    return text, activated_inline(lang, open_app_url, code)
 
 
 @dp.message(Command("start"))
@@ -617,7 +635,7 @@ async def buy_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["sub"], TEXT["en"]["sub"]}))
 async def subscription_from_text(message: Message) -> None:
     async def _handler(lang: str, ctx: Dict[str, Any]) -> None:
-        text, markup = await render_subscription_message(lang, ctx["token"])
+        text, markup = await render_subscription_message(lang, ctx["token"], int(ctx["user"]["telegram_id"]))
         await message.answer(text, reply_markup=markup)
 
     await with_user_guard(message, _handler)
@@ -685,7 +703,8 @@ async def menu_from_text_alias(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
 async def download_android_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", build_open_app_url(_ctx.get("token"), lang)))
+        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
+        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", open_app_url or build_open_app_url(lang=lang)))
 
     await with_user_guard(message, _handler)
 
@@ -693,7 +712,8 @@ async def download_android_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
 async def download_ios_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", build_open_app_url(_ctx.get("token"), lang)))
+        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
+        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", open_app_url or build_open_app_url(lang=lang)))
 
     await with_user_guard(message, _handler)
 
@@ -777,7 +797,7 @@ async def cb_payment_check(callback: CallbackQuery) -> None:
         data = await api_request("GET", f"/payments/{payment_id}", token=ctx["token"])
         payment = data.get("payment") or {}
         if payment.get("status") == "paid":
-            text, markup = await render_payment_success_message(lang, ctx["token"])
+            text, markup = await render_payment_success_message(lang, ctx["token"], int(ctx["user"]["telegram_id"]))
             await safe_edit(callback, text, markup)
         else:
             text = f"{TEXT[lang]['payment_waiting']}: {payment.get('status', 'created')}"
@@ -791,7 +811,7 @@ async def cb_payment_check(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "menu:sub")
 async def cb_subscription(callback: CallbackQuery) -> None:
     async def _handler(lang: str, ctx: Dict[str, Any]) -> None:
-        text, markup = await render_subscription_message(lang, ctx["token"])
+        text, markup = await render_subscription_message(lang, ctx["token"], int(ctx["user"]["telegram_id"]))
         await safe_edit(callback, text, markup)
         await callback.answer()
 
@@ -837,7 +857,8 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
             text = TEXT[lang]["download_android"]
         else:
             text = TEXT[lang]["download_ios"]
-        await safe_edit(callback, text, platform_open_inline(lang, platform, build_open_app_url(_ctx.get("token"), lang)))
+        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
+        await safe_edit(callback, text, platform_open_inline(lang, platform, open_app_url or build_open_app_url(lang=lang)))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
@@ -887,7 +908,7 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     if event_type == "payment_paid":
         plan_name = payload.get("plan_name_en") if lang == "en" else payload.get("plan_name_ru")
         device_limit = int(payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT) or settings.VPN_DEFAULT_DEVICE_LIMIT)
-        token = await issue_login_token_for_telegram_id(int(item["telegram_id"]), lang)
+        code, deep_link = await issue_login_code_for_telegram_id(int(item["telegram_id"]), lang)
         text = "\n".join(
             [
                 t["payment_received"],
@@ -897,9 +918,9 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
                 f"{t['available_devices']}: {device_limit} / {device_limit}",
             ]
         )
-        text = append_token_details(text, lang, token, device_limit)
-        open_app_url = build_open_app_url(token, lang) if token else build_open_app_url(lang=lang)
-        return text, activated_inline(lang, open_app_url, token)
+        text = append_token_details(text, lang, code, device_limit)
+        open_app_url = deep_link or build_open_app_url(lang=lang)
+        return text, activated_inline(lang, open_app_url, code)
     if event_type == "subscription_expiring":
         text = f"{t['one_day_left']}\n\n{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}"
         markup = InlineKeyboardMarkup(
