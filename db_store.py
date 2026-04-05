@@ -377,6 +377,160 @@ def _load_default_locations() -> List[Dict[str, Any]]:
     return builtin_locations
 
 
+def _parse_json_object_if_possible(raw: Any) -> Optional[Dict[str, Any]]:
+    if isinstance(raw, dict):
+        return dict(raw)
+    if isinstance(raw, str):
+        candidate = raw.strip()
+        if not candidate:
+            return None
+        try:
+            value = json.loads(candidate)
+        except Exception:
+            return None
+        if isinstance(value, dict):
+            return value
+    return None
+
+
+def _extract_dns_servers_from_xray(payload: Dict[str, Any]) -> List[str]:
+    dns = payload.get("dns")
+    if not isinstance(dns, dict):
+        return []
+    servers = dns.get("servers")
+    if not isinstance(servers, list):
+        return []
+    result: List[str] = []
+    for item in servers:
+        if isinstance(item, str) and item.strip():
+            result.append(item.strip())
+        elif isinstance(item, dict):
+            address = str(item.get("address") or "").strip()
+            if address:
+                result.append(address)
+    return result
+
+
+def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    outbounds = payload.get("outbounds")
+    if not isinstance(outbounds, list):
+        return {}
+
+    proxy = None
+    for outbound in outbounds:
+        if not isinstance(outbound, dict):
+            continue
+        protocol = str(outbound.get("protocol") or "").strip().lower()
+        if protocol == "vless":
+            proxy = outbound
+            if str(outbound.get("tag") or "").strip().lower() == "proxy":
+                break
+    if not isinstance(proxy, dict):
+        return {}
+
+    settings_payload = proxy.get("settings")
+    stream_settings = proxy.get("streamSettings") if isinstance(proxy.get("streamSettings"), dict) else {}
+    vnext = settings_payload.get("vnext") if isinstance(settings_payload, dict) else None
+    if not isinstance(vnext, list) or not vnext:
+        return {}
+    upstream = vnext[0] if isinstance(vnext[0], dict) else {}
+    users = upstream.get("users") if isinstance(upstream, dict) else None
+    if not isinstance(users, list) or not users:
+        return {}
+    user = users[0] if isinstance(users[0], dict) else {}
+
+    grpc_settings = stream_settings.get("grpcSettings") if isinstance(stream_settings.get("grpcSettings"), dict) else {}
+    ws_settings = stream_settings.get("wsSettings") if isinstance(stream_settings.get("wsSettings"), dict) else {}
+    reality_settings = stream_settings.get("realitySettings") if isinstance(stream_settings.get("realitySettings"), dict) else {}
+    tls_settings = stream_settings.get("tlsSettings") if isinstance(stream_settings.get("tlsSettings"), dict) else {}
+
+    security = str(stream_settings.get("security") or proxy.get("security") or "reality").strip() or "reality"
+    server_name = str(
+        reality_settings.get("serverName")
+        or tls_settings.get("serverName")
+        or proxy.get("sni")
+        or ""
+    ).strip()
+
+    converted: Dict[str, Any] = {
+        "protocol": "vless",
+        "engine": "sing-box",
+        "server": str(upstream.get("address") or "").strip(),
+        "port": upstream.get("port"),
+        "uuid": str(user.get("id") or "").strip(),
+        "transport": str(stream_settings.get("network") or proxy.get("network") or "tcp").strip() or "tcp",
+        "network": str(stream_settings.get("network") or proxy.get("network") or "tcp").strip() or "tcp",
+        "security": security,
+        "flow": str(user.get("flow") or "").strip() or None,
+        "sni": server_name or None,
+        "server_name": server_name or None,
+        "service_name": str(grpc_settings.get("serviceName") or "").strip() or None,
+        "public_key": str(reality_settings.get("publicKey") or "").strip() or None,
+        "short_id": str(reality_settings.get("shortId") or "").strip() or None,
+        "fingerprint": str(reality_settings.get("fingerprint") or tls_settings.get("fingerprint") or "").strip() or None,
+        "allow_insecure": bool(tls_settings.get("allowInsecure") or proxy.get("allowInsecure") or False),
+        "host": None,
+        "path": None,
+        "packet_encoding": "xudp",
+        "domain_resolver": "dns-remote",
+        "connect_mode": "tun",
+        "full_tunnel": True,
+        "raw_xray_config": json.dumps(payload, ensure_ascii=False),
+        "rawXrayConfig": json.dumps(payload, ensure_ascii=False),
+    }
+
+    if converted["transport"] in {"ws", "websocket"}:
+        converted["host"] = str(ws_settings.get("headers", {}).get("Host") or "").strip() or None
+        converted["path"] = str(ws_settings.get("path") or "/").strip() or "/"
+
+    dns_servers = _extract_dns_servers_from_xray(payload)
+    if dns_servers:
+        converted["dns_servers"] = dns_servers
+        converted["dnsServers"] = dns_servers
+
+    alpn = tls_settings.get("alpn")
+    if isinstance(alpn, list):
+        normalized_alpn = [str(item).strip() for item in alpn if str(item).strip()]
+        if normalized_alpn:
+            converted["alpn"] = normalized_alpn
+
+    return {key: value for key, value in converted.items() if value is not None and value != ""}
+
+
+def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    if not normalized:
+        return {}
+
+    raw_xray = normalized.get("raw_xray_config") or normalized.get("rawXrayConfig")
+    raw_xray_payload = _parse_json_object_if_possible(raw_xray)
+    if raw_xray_payload:
+        converted = _convert_raw_xray_payload(raw_xray_payload)
+        for key, value in converted.items():
+            if normalized.get(key) in (None, "", [], {}):
+                normalized[key] = value
+
+    engine = str(normalized.get("engine") or "").strip().lower()
+    if engine in {"", "xray", "xray-core"}:
+        normalized["engine"] = "sing-box"
+
+    normalized.setdefault("protocol", "vless")
+    normalized.setdefault("transport", normalized.get("network") or "tcp")
+    normalized.setdefault("network", normalized.get("transport") or "tcp")
+    normalized.setdefault("security", "reality")
+    normalized.setdefault("mtu", 1400)
+    normalized.setdefault("domain_resolver", "dns-remote")
+    normalized.setdefault("packet_encoding", "xudp")
+    normalized.setdefault("connect_mode", "tun")
+    normalized.setdefault("full_tunnel", True)
+
+    dns_servers = normalized.get("dns_servers") or normalized.get("dnsServers")
+    if not dns_servers:
+        normalized["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
+        normalized["dnsServers"] = ["1.1.1.1", "8.8.8.8"]
+    return normalized
+
+
 def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
     if not normalized:
@@ -429,11 +583,11 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
     if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
         normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
-    return normalized
+    return _apply_admin_mobile_defaults(normalized)
 
 
 def _config_is_complete(payload: Dict[str, Any]) -> bool:
-    normalized = _normalize_vpn_payload_keys(payload)
+    normalized = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
     server = str(normalized.get("server") or "").strip()
     uuid = str(normalized.get("uuid") or "").strip()
     try:
@@ -455,22 +609,14 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
     if isinstance(stored, dict) and stored:
         payload.update(stored)
 
-    payload = _normalize_vpn_payload_keys(payload)
+    payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
     if not payload:
         return {}
 
-    payload.setdefault("protocol", "vless")
-    payload.setdefault("engine", "sing-box")
-    payload.setdefault("transport", "tcp")
-    payload.setdefault("security", "reality")
-    payload.setdefault("mtu", 1400)
-    if not payload.get("dns_servers"):
-        payload["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
-    payload.setdefault("domain_resolver", "dns-remote")
-    payload.setdefault("packet_encoding", "xudp")
     payload.setdefault("location_code", requested_location_code or row.get("code"))
     payload.setdefault("resolved_location_code", row.get("code"))
     payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
+    payload.setdefault("display_name", row.get("name_en") or row.get("name_ru") or row.get("code"))
     return payload
 
 
@@ -900,7 +1046,7 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     data["is_active"] = bool(data.get("is_active", True))
     data["is_recommended"] = bool(data.get("is_recommended", False))
     data["is_reserve"] = bool(data.get("is_reserve", False))
-    vpn_payload = _normalize_vpn_payload_keys(data.get("vpn_payload") or {})
+    vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     if data["code"] and not vpn_payload.get("location_code"):
         vpn_payload["location_code"] = data["code"]
     if data["name_en"] and not vpn_payload.get("remark"):
@@ -996,7 +1142,10 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
             except (TypeError, ValueError):
                 value = 100
         elif key == "vpn_payload":
-            value = Jsonb(_normalize_vpn_payload_keys(value or {}))
+            value = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(value or {})))
+            if "name_en" in payload and payload.get("name_en") and not value.get("remark"):
+                value["remark"] = str(payload.get("name_en") or "").strip()
+            value = Jsonb(value)
         updates.append(f"{key} = %s")
         values.append(value)
     if not updates:
