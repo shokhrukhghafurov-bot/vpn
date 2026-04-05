@@ -1,4 +1,7 @@
 import json
+
+# LTE bridge note: keep mobile-provider credentials on the bridge only.
+# Backend env should contain only client-facing bridge VLESS payloads.
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
