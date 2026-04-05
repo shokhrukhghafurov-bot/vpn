@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -35,6 +36,16 @@ def _env_int(name: str, default: int) -> int:
 def _env_list(name: str, default: str = "") -> List[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
+
+
+def _parse_json_object(raw: str) -> Dict[str, Any]:
+    if not raw or not raw.strip():
+        return {}
+    try:
+        value = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return value if isinstance(value, dict) else {}
 
 
 @dataclass
@@ -114,11 +125,86 @@ class Settings:
     DEFAULT_LOCATIONS_ENV_JSON: str = os.getenv("DEFAULT_LOCATIONS_JSON", "")
     DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED: bool = _env_bool("DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED", False)
 
+    VPN_ENGINE: str = os.getenv("VPN_ENGINE", "sing-box")
+    VLESS_DEFAULT_CONFIG_JSON: str = os.getenv("VLESS_DEFAULT_CONFIG_JSON", "")
+    VLESS_LOCATION_CONFIGS_JSON: str = os.getenv("VLESS_LOCATION_CONFIGS_JSON", "")
+    VLESS_SERVER: str = os.getenv("VLESS_SERVER", "")
+    VLESS_PORT: int = _env_int("VLESS_PORT", 443)
+    VLESS_UUID: str = os.getenv("VLESS_UUID", "")
+    VLESS_TRANSPORT: str = os.getenv("VLESS_TRANSPORT", "tcp")
+    VLESS_SECURITY: str = os.getenv("VLESS_SECURITY", "reality")
+    VLESS_FLOW: str = os.getenv("VLESS_FLOW", "")
+    VLESS_SNI: str = os.getenv("VLESS_SNI", "")
+    VLESS_HOST: str = os.getenv("VLESS_HOST", "")
+    VLESS_PATH: str = os.getenv("VLESS_PATH", "")
+    VLESS_SERVICE_NAME: str = os.getenv("VLESS_SERVICE_NAME", "")
+    VLESS_PUBLIC_KEY: str = os.getenv("VLESS_PUBLIC_KEY", "")
+    VLESS_SHORT_ID: str = os.getenv("VLESS_SHORT_ID", "")
+    VLESS_FINGERPRINT: str = os.getenv("VLESS_FINGERPRINT", "chrome")
+    VLESS_ALLOW_INSECURE: bool = _env_bool("VLESS_ALLOW_INSECURE", False)
+    VLESS_DNS_SERVERS: List[str] = None
+    VLESS_ALPN: List[str] = None
+    VLESS_DOMAIN_RESOLVER: str = os.getenv("VLESS_DOMAIN_RESOLVER", "dns-remote")
+    VLESS_PACKET_ENCODING: str = os.getenv("VLESS_PACKET_ENCODING", "xudp")
+    VLESS_MTU: int = _env_int("VLESS_MTU", 1400)
+    VLESS_RAW_SING_BOX_CONFIG: str = os.getenv("VLESS_RAW_SING_BOX_CONFIG", "")
+    VLESS_RAW_XRAY_CONFIG: str = os.getenv("VLESS_RAW_XRAY_CONFIG", "")
+
     def __post_init__(self) -> None:
         if self.CORS_ORIGINS is None:
             self.CORS_ORIGINS = _env_list("CORS_ORIGINS", "*")
         if self.APP_LANGS is None:
             self.APP_LANGS = _env_list("APP_LANGS", "ru,en")
+        if self.VLESS_DNS_SERVERS is None:
+            self.VLESS_DNS_SERVERS = _env_list("VLESS_DNS_SERVERS", "1.1.1.1,8.8.8.8")
+        if self.VLESS_ALPN is None:
+            self.VLESS_ALPN = _env_list("VLESS_ALPN", "")
+
+    def default_vpn_payload(self) -> Dict[str, Any]:
+        from_json = _parse_json_object(self.VLESS_DEFAULT_CONFIG_JSON)
+        if from_json:
+            return dict(from_json)
+        if not (self.VLESS_SERVER.strip() and self.VLESS_UUID.strip()):
+            return {}
+        payload: Dict[str, Any] = {
+            "protocol": "vless",
+            "engine": self.VPN_ENGINE or "sing-box",
+            "server": self.VLESS_SERVER.strip(),
+            "port": int(self.VLESS_PORT or 443),
+            "uuid": self.VLESS_UUID.strip(),
+            "transport": (self.VLESS_TRANSPORT or "tcp").strip() or "tcp",
+            "security": (self.VLESS_SECURITY or "reality").strip() or "reality",
+            "dns_servers": list(self.VLESS_DNS_SERVERS or ["1.1.1.1", "8.8.8.8"]),
+            "alpn": list(self.VLESS_ALPN or []),
+            "allow_insecure": bool(self.VLESS_ALLOW_INSECURE),
+            "mtu": int(self.VLESS_MTU or 1400),
+            "domain_resolver": (self.VLESS_DOMAIN_RESOLVER or "dns-remote").strip() or "dns-remote",
+            "packet_encoding": (self.VLESS_PACKET_ENCODING or "xudp").strip() or "xudp",
+        }
+        optional_values = {
+            "flow": self.VLESS_FLOW,
+            "sni": self.VLESS_SNI,
+            "host": self.VLESS_HOST,
+            "path": self.VLESS_PATH,
+            "service_name": self.VLESS_SERVICE_NAME,
+            "public_key": self.VLESS_PUBLIC_KEY,
+            "short_id": self.VLESS_SHORT_ID,
+            "fingerprint": self.VLESS_FINGERPRINT,
+            "raw_sing_box_config": self.VLESS_RAW_SING_BOX_CONFIG,
+            "raw_xray_config": self.VLESS_RAW_XRAY_CONFIG,
+        }
+        for key, value in optional_values.items():
+            if isinstance(value, str) and value.strip():
+                payload[key] = value.strip()
+        return payload
+
+    def location_vpn_payloads(self) -> Dict[str, Dict[str, Any]]:
+        raw = _parse_json_object(self.VLESS_LOCATION_CONFIGS_JSON)
+        out: Dict[str, Dict[str, Any]] = {}
+        for key, value in raw.items():
+            if isinstance(value, dict) and str(key).strip():
+                out[str(key).strip()] = dict(value)
+        return out
 
     def plan_definitions(self) -> List[Dict[str, Any]]:
         return [
