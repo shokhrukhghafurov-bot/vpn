@@ -79,6 +79,7 @@ CREATE TABLE IF NOT EXISTS locations (
     is_reserve BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'online',
     sort_order INTEGER NOT NULL DEFAULT 100,
+    vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -309,6 +310,7 @@ def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
                 "is_reserve": bool(item.get("is_reserve", False)),
                 "status": str(item.get("status") or "online").strip() or "online",
                 "sort_order": int(item.get("sort_order") or idx * 10),
+                "vpn_payload": item.get("vpn_payload") if isinstance(item.get("vpn_payload"), dict) else {},
             }
         )
     return normalized
@@ -334,10 +336,12 @@ def sync_locations_catalog() -> None:
     with db() as conn:
         with conn.cursor() as cur:
             for item in locations:
+                data = dict(item)
+                data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
                 cur.execute(
                     """
-                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order)
-                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s)
+                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload)
+                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s)
                     ON CONFLICT (code) DO UPDATE SET
                         name_ru = EXCLUDED.name_ru,
                         name_en = EXCLUDED.name_en,
@@ -347,9 +351,13 @@ def sync_locations_catalog() -> None:
                         is_reserve = EXCLUDED.is_reserve,
                         status = EXCLUDED.status,
                         sort_order = EXCLUDED.sort_order,
+                        vpn_payload = CASE
+                            WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
+                            ELSE locations.vpn_payload
+                        END,
                         updated_at = NOW()
                     """,
-                    item,
+                    data,
                 )
 
             placeholders = ", ".join(["%s"] * len(default_codes))
@@ -668,15 +676,17 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
 
 
 def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = dict(payload)
+    data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order)
-                VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s)
+                INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload)
+                VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s)
                 RETURNING *
                 """,
-                payload,
+                data,
             )
             row = cur.fetchone()
         conn.commit()
@@ -686,11 +696,11 @@ def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
 def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     updates = []
     values: List[Any] = []
-    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order"}
+    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "vpn_payload"}
     for key, value in payload.items():
         if key in allowed:
             updates.append(f"{key} = %s")
-            values.append(value)
+            values.append(Jsonb(value or {}) if key == "vpn_payload" else value)
     if not updates:
         raise ValueError("No valid fields to update")
     values.append(location_id)
@@ -704,6 +714,32 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
         conn.commit()
     return dict(row)
 
+
+
+
+def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
+    subscription = get_current_subscription(user_id)
+    if not subscription:
+        raise PermissionError("Active subscription required")
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM locations WHERE code = %s AND is_active = TRUE LIMIT 1",
+                (location_code,),
+            )
+            row = cur.fetchone()
+    if not row:
+        raise ValueError("Location not found")
+
+    payload = dict(row.get("vpn_payload") or {})
+    if not payload:
+        raise ValueError("VLESS config is not configured for this location")
+
+    payload.setdefault("protocol", "vless")
+    payload.setdefault("location_code", row["code"])
+    payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row["code"])
+    return payload
 
 def create_payment_record(
     user_id: int,
