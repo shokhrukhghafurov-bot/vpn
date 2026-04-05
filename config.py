@@ -66,13 +66,17 @@ class Settings:
     )
 
     BOT_NAME: str = os.getenv("BOT_NAME", "INET Bot")
-    BOT_USERNAME: str = os.getenv("BOT_USERNAME", "inet_bot")
+    BOT_USERNAME: str = os.getenv("BOT_USERNAME", "inetvpnru_bot")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", os.getenv("APP_BASE_URL", "http://127.0.0.1:3000"))
     BOT_NOTIFICATION_POLL_SEC: int = _env_int("BOT_NOTIFICATION_POLL_SEC", 45)
 
     AUTH_DEV_LOGIN_CODE: str = os.getenv("AUTH_DEV_LOGIN_CODE", "111111")
     AUTH_ALLOW_DEV_CODE: bool = _env_bool("AUTH_ALLOW_DEV_CODE", True)
+    AUTH_ACCESS_TOKEN_MINUTES: int = _env_int("AUTH_ACCESS_TOKEN_MINUTES", 60)
+    AUTH_REFRESH_TOKEN_DAYS: int = _env_int("AUTH_REFRESH_TOKEN_DAYS", 90)
+    AUTH_CODE_TTL_MINUTES: int = _env_int("AUTH_CODE_TTL_MINUTES", 5)
+    AUTH_CODE_ISSUER_SECRET: str = os.getenv("AUTH_CODE_ISSUER_SECRET", "")
 
     VPN_DEFAULT_DEVICE_LIMIT: int = _env_int("VPN_DEFAULT_DEVICE_LIMIT", 2)
     VPN_MAX_DEVICES_PER_ACCOUNT: int = _env_int("VPN_MAX_DEVICES_PER_ACCOUNT", 2)
