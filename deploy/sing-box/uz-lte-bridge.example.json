@@ -1,0 +1,40 @@
+{
+  "log": { "level": "info" },
+  "inbounds": [
+    {
+      "type": "vless",
+      "tag": "vless-in",
+      "listen": "::",
+      "listen_port": 443,
+      "users": [
+        { "name": "uz-lte-user", "uuid": "PASTE_UZ_UUID", "flow": "xtls-rprx-vision" }
+      ],
+      "tls": {
+        "enabled": true,
+        "server_name": "www.cloudflare.com",
+        "reality": {
+          "enabled": true,
+          "handshake": { "server": "www.cloudflare.com", "server_port": 443 },
+          "private_key": "PASTE_UZ_REALITY_PRIVATE_KEY",
+          "short_id": ["ef567890"]
+        }
+      }
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "socks",
+      "tag": "mobile-upstream",
+      "server": "UZ_PROVIDER_HOST",
+      "server_port": 10000,
+      "version": "5",
+      "username": "UZ_PROVIDER_USER",
+      "password": "UZ_PROVIDER_PASS",
+      "network": ["tcp", "udp"]
+    }
+  ],
+  "route": {
+    "final": "mobile-upstream",
+    "auto_detect_interface": true
+  }
+}
