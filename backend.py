@@ -27,6 +27,7 @@ from db_store import (
     get_payment_by_internal_or_external,
     get_payment_for_user,
     get_plan_by_code,
+    get_vpn_config_for_user,
     get_user_by_id,
     get_user_by_telegram_id,
     get_user_snapshot_by_telegram,
@@ -138,6 +139,7 @@ class LocationIn(BaseModel):
     is_reserve: bool = False
     status: str = "online"
     sort_order: int = 100
+    vpn_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
 class LocationPatchIn(BaseModel):
@@ -149,6 +151,7 @@ class LocationPatchIn(BaseModel):
     is_reserve: Optional[bool] = None
     status: Optional[str] = None
     sort_order: Optional[int] = None
+    vpn_payload: Optional[Dict[str, Any]] = None
 
 
 class BroadcastIn(BaseModel):
@@ -323,6 +326,8 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
 
 def serialize_location(row: Dict[str, Any]) -> Dict[str, Any]:
     item = dict(row)
+    raw_vpn_payload = item.pop("vpn_payload", None)
+    item["has_vpn_payload"] = bool(raw_vpn_payload)
     meta = _location_meta(item)
     item.update(meta)
     item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
@@ -620,6 +625,17 @@ def locations() -> Dict[str, Any]:
 def locations_status() -> Dict[str, Any]:
     rows = list_locations(active_only=False)
     return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in rows]}
+
+
+@app.get("/vpn/config/{location_code}")
+def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    try:
+        config = get_vpn_config_for_user(user["id"], location_code)
+        return {"ok": True, "config": config}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/support/faq")
