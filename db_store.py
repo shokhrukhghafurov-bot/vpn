@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
 
 import psycopg
+from psycopg import sql
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
 
@@ -236,12 +237,51 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
 ]
 
+SERIAL_ID_TABLES = (
+    "users",
+    "plans",
+    "subscriptions",
+    "devices",
+    "locations",
+    "payments",
+    "auth_codes",
+    "admin_notes",
+    "bot_notifications",
+    "bot_error_log",
+)
+
+
 
 def _run_schema_migrations(cur: psycopg.Cursor) -> None:
     for statement in MIGRATION_SQL:
         cur.execute(statement)
     for statement in POST_MIGRATION_SQL:
         cur.execute(statement)
+
+
+def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: str = "id") -> None:
+    cur.execute("SELECT pg_get_serial_sequence(%s, %s) AS sequence_name", (table_name, column_name))
+    row = cur.fetchone()
+    if not row:
+        return
+    sequence_name = row.get("sequence_name")
+    if not sequence_name:
+        return
+    cur.execute(
+        sql.SQL("SELECT COALESCE(MAX({column}), 0) AS max_id FROM {table}").format(
+            column=sql.Identifier(column_name),
+            table=sql.Identifier(table_name),
+        )
+    )
+    max_id_row = cur.fetchone()
+    max_id = int((max_id_row or {}).get("max_id") or 0)
+    next_value = max(1, max_id + 1)
+    cur.execute("SELECT setval(%s, %s, false)", (sequence_name, next_value))
+
+
+def _resync_serial_sequences(cur: psycopg.Cursor) -> None:
+    for table_name in SERIAL_ID_TABLES:
+        _resync_serial_sequence(cur, table_name)
 
 
 def now_utc() -> datetime:
@@ -257,6 +297,7 @@ def bootstrap() -> None:
         with conn.cursor() as cur:
             cur.execute(SCHEMA_SQL)
             _run_schema_migrations(cur)
+            _resync_serial_sequences(cur)
         conn.commit()
     sync_plans_from_env()
     sync_locations_catalog()
@@ -842,11 +883,27 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
 
 def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(payload)
-    data["vpn_payload"] = Jsonb(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
+    data["code"] = str(data.get("code") or "").strip()
+    data["name_ru"] = str(data.get("name_ru") or "").strip()
+    data["name_en"] = str(data.get("name_en") or data.get("name_ru") or "").strip()
+    country_code = data.get("country_code")
+    data["country_code"] = str(country_code).strip().upper() or None if country_code is not None else None
+    data["status"] = str(data.get("status") or "offline").strip() or "offline"
+    try:
+        data["sort_order"] = int(data.get("sort_order") or 100)
+    except (TypeError, ValueError):
+        data["sort_order"] = 100
+    vpn_payload = _normalize_vpn_payload_keys(data.get("vpn_payload") or {})
+    if data["code"] and not vpn_payload.get("location_code"):
+        vpn_payload["location_code"] = data["code"]
+    if data["name_en"] and not vpn_payload.get("remark"):
+        vpn_payload["remark"] = data["name_en"]
+    data["vpn_payload"] = Jsonb(vpn_payload)
     data["is_deleted"] = False
     data["location_source"] = _normalize_location_source(data.get("location_source") or "admin")
     with db() as conn:
         with conn.cursor() as cur:
+            _resync_serial_sequence(cur, "locations")
             cur.execute(
                 """
                 INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
@@ -878,9 +935,23 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     values: List[Any] = []
     allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "vpn_payload"}
     for key, value in payload.items():
-        if key in allowed:
-            updates.append(f"{key} = %s")
-            values.append(Jsonb(_normalize_vpn_payload_keys(value or {})) if key == "vpn_payload" else value)
+        if key not in allowed:
+            continue
+        if key in {"name_ru", "name_en"}:
+            value = str(value or "").strip()
+        elif key == "country_code":
+            value = str(value).strip().upper() or None if value is not None else None
+        elif key == "status":
+            value = str(value or "offline").strip() or "offline"
+        elif key == "sort_order":
+            try:
+                value = int(value)
+            except (TypeError, ValueError):
+                value = 100
+        elif key == "vpn_payload":
+            value = Jsonb(_normalize_vpn_payload_keys(value or {}))
+        updates.append(f"{key} = %s")
+        values.append(value)
     if not updates:
         raise ValueError("No valid fields to update")
     values.append(location_id)
