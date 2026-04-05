@@ -52,7 +52,7 @@ class Settings:
     APP_LANGS: List[str] = None
     APP_BASE_URL: str = os.getenv("APP_BASE_URL", "https://your-domain.com")
     ADMIN_PANEL_BASE_URL: str = os.getenv("ADMIN_PANEL_BASE_URL", "https://your-admin-domain.com")
-    OPEN_APP_URL: str = os.getenv("OPEN_APP_URL", os.getenv("APP_BASE_URL", "https://your-domain.com"))
+    OPEN_APP_URL: str = os.getenv("OPEN_APP_URL", "inet://login")
     ANDROID_APP_URL: str = os.getenv("ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.example.inet")
     IOS_APP_URL: str = os.getenv("IOS_APP_URL", "https://apps.apple.com/app/id000000000")
     SUPPORT_TELEGRAM_URL: str = os.getenv("SUPPORT_TELEGRAM_URL", "https://t.me/your_admin")
