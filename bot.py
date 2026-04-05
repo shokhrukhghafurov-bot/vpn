@@ -91,6 +91,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "device_active": "активен",
         "device_inactive": "неактивен",
         "available_devices": "Доступно устройств",
+        "token_label": "Токен входа",
+        "token_device_limit": "Максимум устройств по этому токену",
     },
     "en": {
         "welcome": "Welcome to INET\nChoose an action below",
@@ -153,6 +155,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "device_active": "active",
         "device_inactive": "inactive",
         "available_devices": "Devices available",
+        "token_label": "Login token",
+        "token_device_limit": "Max devices for this token",
     },
 }
 
@@ -225,6 +229,33 @@ async def get_user_ctx(tg_user: Any, language_override: Optional[str] = None) ->
     user = auth.get("user") or {}
     lang = "en" if (user.get("language") == "en") else "ru"
     return {"auth": auth, "user": user, "token": auth.get("token"), "lang": lang}
+
+
+
+async def issue_login_token_for_telegram_id(telegram_id: int, language: str = "ru") -> Optional[str]:
+    try:
+        data = await api_request(
+            "POST",
+            "/auth/telegram",
+            json_body={
+                "telegram_id": int(telegram_id),
+                "language": "en" if language == "en" else "ru",
+            },
+        )
+        token = (data.get("token") or "").strip()
+        return token or None
+    except Exception:
+        logger.exception("Failed to issue login token for telegram user %s", telegram_id)
+        return None
+
+
+def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
+    if not token:
+        return text
+    lines = [text, "", f"{TEXT[lang]['token_label']}:", token]
+    if device_limit is not None and int(device_limit) > 0:
+        lines.append(f"{TEXT[lang]['token_device_limit']}: {int(device_limit)}")
+    return "\n".join(lines)
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -457,7 +488,7 @@ async def render_subscription_message(lang: str, token: str) -> Tuple[str, Inlin
     used = int(data.get("devices_used") or 0)
     limit = int(data.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT)
     if not sub:
-        text = t["subscription_none"]
+        text = append_token_details(t["subscription_none"], lang, token, limit)
     else:
         plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
         status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
@@ -469,6 +500,7 @@ async def render_subscription_message(lang: str, token: str) -> Tuple[str, Inlin
                 f"{t['devices_used']}: {used} / {limit}",
             ]
         )
+        text = append_token_details(text, lang, token, limit)
     markup = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")],
@@ -517,7 +549,8 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     if not sub:
-        return t["payment_received"], activated_inline(lang, open_app_url)
+        text = append_token_details(t["payment_received"], lang, token, int(data.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT))
+        return text, activated_inline(lang, open_app_url)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
     text = "\n".join(
@@ -529,6 +562,7 @@ async def render_payment_success_message(lang: str, token: str) -> Tuple[str, In
             f"{t['available_devices']}: {device_limit} / {device_limit}",
         ]
     )
+    text = append_token_details(text, lang, token, device_limit)
     return text, activated_inline(lang, open_app_url)
 
 
@@ -841,7 +875,8 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     event_type = item.get("event_type")
     if event_type == "payment_paid":
         plan_name = payload.get("plan_name_en") if lang == "en" else payload.get("plan_name_ru")
-        device_limit = payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT)
+        device_limit = int(payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT) or settings.VPN_DEFAULT_DEVICE_LIMIT)
+        token = await issue_login_token_for_telegram_id(int(item["telegram_id"]), lang)
         text = "\n".join(
             [
                 t["payment_received"],
@@ -851,7 +886,9 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
                 f"{t['available_devices']}: {device_limit} / {device_limit}",
             ]
         )
-        return text, activated_inline(lang)
+        text = append_token_details(text, lang, token, device_limit)
+        open_app_url = build_open_app_url(token, lang) if token else build_open_app_url(lang=lang)
+        return text, activated_inline(lang, open_app_url)
     if event_type == "subscription_expiring":
         text = f"{t['one_day_left']}\n\n{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}"
         markup = InlineKeyboardMarkup(
