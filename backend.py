@@ -324,10 +324,12 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-def serialize_location(row: Dict[str, Any]) -> Dict[str, Any]:
+def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
     item = dict(row)
     raw_vpn_payload = item.pop("vpn_payload", None)
     item["has_vpn_payload"] = bool(raw_vpn_payload)
+    if include_payload:
+        item["vpn_payload"] = raw_vpn_payload if isinstance(raw_vpn_payload, dict) else {}
     meta = _location_meta(item)
     item.update(meta)
     item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
@@ -832,13 +834,13 @@ def admin_payments_export(status_filter: str = Query(default="all", alias="statu
 @app.get("/api/infra/admin/vpn/locations")
 def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "items": [serialize_location(row) for row in list_locations(active_only=False)]}
+    return {"ok": True, "items": [serialize_location(row, include_payload=True) for row in list_locations(active_only=False)]}
 
 
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "item": create_location(payload.model_dump())}
+    return {"ok": True, "item": serialize_location(create_location(payload.model_dump()), include_payload=True)}
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
@@ -846,7 +848,7 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     _ = admin_name
     data = {key: value for key, value in payload.model_dump().items() if value is not None}
     try:
-        return {"ok": True, "item": patch_location(location_id, data)}
+        return {"ok": True, "item": serialize_location(patch_location(location_id, data), include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
