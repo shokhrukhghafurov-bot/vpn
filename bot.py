@@ -272,7 +272,7 @@ def is_supported_telegram_url(url: Optional[str]) -> bool:
     if not url:
         return False
     scheme = (urlsplit(url).scheme or "").lower()
-    return scheme in {"http", "https", "tg"}
+    return scheme in {"http", "https", "tg", "inet"}
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineKeyboardMarkup] = None) -> None:
