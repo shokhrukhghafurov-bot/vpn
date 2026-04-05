@@ -317,27 +317,12 @@ def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
 
 
 
-def _merge_locations_catalog(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    merged: Dict[str, Dict[str, Any]] = {str(item.get("code") or "").strip(): dict(item) for item in base if str(item.get("code") or "").strip()}
-    for item in extra:
-        code = str(item.get("code") or "").strip()
-        if not code:
-            continue
-        current = dict(merged.get(code) or {})
-        current.update(item)
-        merged[code] = current
-    return sorted(merged.values(), key=lambda item: int(item.get("sort_order") or 0))
-
-
 def _load_default_locations() -> List[Dict[str, Any]]:
     builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
-    env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
     if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED:
+        env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
         if env_locations:
             return env_locations
-        return builtin_locations
-    if env_locations:
-        return _merge_locations_catalog(builtin_locations, env_locations)
     return builtin_locations
 
 
@@ -349,26 +334,50 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["port"] = normalized.get("server_port")
     if "id" in normalized and "uuid" not in normalized:
         normalized["uuid"] = normalized.get("id")
+    if "network" in normalized and "transport" not in normalized:
+        normalized["transport"] = normalized.get("network")
+    if "transport" in normalized and "network" not in normalized:
+        normalized["network"] = normalized.get("transport")
     if "server_name" in normalized and "sni" not in normalized:
         normalized["sni"] = normalized.get("server_name")
+    if "sni" in normalized and "server_name" not in normalized:
+        normalized["server_name"] = normalized.get("sni")
     if "serviceName" in normalized and "service_name" not in normalized:
         normalized["service_name"] = normalized.get("serviceName")
+    if "service_name" in normalized and "serviceName" not in normalized:
+        normalized["serviceName"] = normalized.get("service_name")
     if "publicKey" in normalized and "public_key" not in normalized:
         normalized["public_key"] = normalized.get("publicKey")
+    if "public_key" in normalized and "publicKey" not in normalized:
+        normalized["publicKey"] = normalized.get("public_key")
     if "shortId" in normalized and "short_id" not in normalized:
         normalized["short_id"] = normalized.get("shortId")
+    if "short_id" in normalized and "shortId" not in normalized:
+        normalized["shortId"] = normalized.get("short_id")
     if "dnsServers" in normalized and "dns_servers" not in normalized:
         normalized["dns_servers"] = normalized.get("dnsServers")
+    if "dns_servers" in normalized and "dnsServers" not in normalized:
+        normalized["dnsServers"] = normalized.get("dns_servers")
     if "allowInsecure" in normalized and "allow_insecure" not in normalized:
         normalized["allow_insecure"] = normalized.get("allowInsecure")
+    if "allow_insecure" in normalized and "allowInsecure" not in normalized:
+        normalized["allowInsecure"] = normalized.get("allow_insecure")
     if "domainResolver" in normalized and "domain_resolver" not in normalized:
         normalized["domain_resolver"] = normalized.get("domainResolver")
+    if "domain_resolver" in normalized and "domainResolver" not in normalized:
+        normalized["domainResolver"] = normalized.get("domain_resolver")
     if "packetEncoding" in normalized and "packet_encoding" not in normalized:
         normalized["packet_encoding"] = normalized.get("packetEncoding")
+    if "packet_encoding" in normalized and "packetEncoding" not in normalized:
+        normalized["packetEncoding"] = normalized.get("packet_encoding")
     if "rawSingBoxConfig" in normalized and "raw_sing_box_config" not in normalized:
         normalized["raw_sing_box_config"] = normalized.get("rawSingBoxConfig")
+    if "raw_sing_box_config" in normalized and "rawSingBoxConfig" not in normalized:
+        normalized["rawSingBoxConfig"] = normalized.get("raw_sing_box_config")
     if "rawXrayConfig" in normalized and "raw_xray_config" not in normalized:
         normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
+    if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
+        normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
     return normalized
 
 
@@ -1343,9 +1352,7 @@ def settings_snapshot() -> Dict[str, Any]:
         "android_app_url": settings.ANDROID_APP_URL,
         "ios_app_url": settings.IOS_APP_URL,
         "settings_editable": settings.VPN_SETTINGS_EDITABLE,
-        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else ("builtin_plus_env_merge" if settings.DEFAULT_LOCATIONS_ENV_JSON else "builtin_mvp"),
-        "default_locations_count": len(_load_default_locations()),
-        "location_payload_codes": sorted(settings.location_vpn_payloads().keys()),
+        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
         "plans": get_all_plans(),
     }
 
