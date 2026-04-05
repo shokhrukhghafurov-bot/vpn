@@ -80,6 +80,7 @@ CREATE TABLE IF NOT EXISTS locations (
     status TEXT NOT NULL DEFAULT 'online',
     sort_order INTEGER NOT NULL DEFAULT 100,
     vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
@@ -184,6 +185,7 @@ MIGRATION_SQL = [
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_reserve BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'online'",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 100",
+    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
 
@@ -225,6 +227,7 @@ POST_MIGRATION_SQL = [
     "UPDATE locations SET sort_order = 100 WHERE sort_order IS NULL",
     "UPDATE locations SET is_recommended = FALSE WHERE is_recommended IS NULL",
     "UPDATE locations SET is_reserve = FALSE WHERE is_reserve IS NULL",
+    "UPDATE locations SET is_deleted = FALSE WHERE is_deleted IS NULL",
     "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL OR currency = ''",
     "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
@@ -455,49 +458,25 @@ def sync_locations_catalog() -> None:
     if not locations:
         return
 
-    default_codes = [item["code"] for item in locations]
     with db() as conn:
         with conn.cursor() as cur:
+            cur.execute("SELECT COUNT(*) AS total FROM locations")
+            existing_total = int((cur.fetchone() or {}).get("total") or 0)
+            if existing_total > 0:
+                return
+
             for item in locations:
                 data = dict(item)
                 if not data.get("vpn_payload"):
                     data["vpn_payload"] = _compose_vpn_payload_for_location(data)
-                data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
+                data["vpn_payload"] = Jsonb(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
                 cur.execute(
                     """
                     INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload)
                     VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s)
-                    ON CONFLICT (code) DO UPDATE SET
-                        name_ru = EXCLUDED.name_ru,
-                        name_en = EXCLUDED.name_en,
-                        country_code = EXCLUDED.country_code,
-                        is_active = EXCLUDED.is_active,
-                        is_recommended = EXCLUDED.is_recommended,
-                        is_reserve = EXCLUDED.is_reserve,
-                        status = EXCLUDED.status,
-                        sort_order = EXCLUDED.sort_order,
-                        vpn_payload = CASE
-                            WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
-                            ELSE locations.vpn_payload
-                        END,
-                        updated_at = NOW()
                     """,
                     data,
                 )
-
-            placeholders = ", ".join(["%s"] * len(default_codes))
-            cur.execute(
-                f"""
-                UPDATE locations
-                SET is_active = FALSE,
-                    is_recommended = FALSE,
-                    is_reserve = FALSE,
-                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
-                    updated_at = NOW()
-                WHERE code NOT IN ({placeholders})
-                """,
-                tuple(default_codes),
-            )
         conn.commit()
 
 
@@ -790,9 +769,9 @@ def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
 
 
 def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
-    query = "SELECT * FROM locations"
+    query = "SELECT * FROM locations WHERE is_deleted = FALSE"
     if active_only:
-        query += " WHERE is_active = TRUE"
+        query += " AND is_active = TRUE"
     query += " ORDER BY sort_order ASC, id ASC"
     with db() as conn:
         with conn.cursor() as cur:
@@ -802,17 +781,48 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
 
 def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(payload)
+    data["code"] = str(data.get("code") or "").strip()
+    data["country_code"] = str(data.get("country_code") or "").strip().upper() or None
+    data["status"] = str(data.get("status") or "offline").strip().lower() or "offline"
+    data["sort_order"] = int(data.get("sort_order") or 100)
     data["vpn_payload"] = Jsonb(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload)
-                VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s)
-                RETURNING *
-                """,
-                data,
-            )
+            cur.execute("SELECT id, is_deleted FROM locations WHERE code = %s LIMIT 1", (data["code"],))
+            existing = cur.fetchone()
+            if existing and not existing.get("is_deleted"):
+                raise ValueError("Location code already exists")
+            if existing and existing.get("is_deleted"):
+                restore_data = dict(data)
+                restore_data["id"] = existing["id"]
+                cur.execute(
+                    """
+                    UPDATE locations
+                    SET name_ru = %(name_ru)s,
+                        name_en = %(name_en)s,
+                        country_code = %(country_code)s,
+                        is_active = %(is_active)s,
+                        is_recommended = %(is_recommended)s,
+                        is_reserve = %(is_reserve)s,
+                        status = %(status)s,
+                        sort_order = %(sort_order)s,
+                        vpn_payload = %(vpn_payload)s,
+                        is_deleted = FALSE,
+                        updated_at = NOW()
+                    WHERE id = %(id)s
+                    RETURNING *
+                    """,
+                    restore_data,
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload)
+                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s)
+                    RETURNING *
+                    """,
+                    data,
+                )
             row = cur.fetchone()
         conn.commit()
     return dict(row)
@@ -825,11 +835,17 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in payload.items():
         if key in allowed:
             updates.append(f"{key} = %s")
+            if key == "country_code" and value is not None:
+                value = str(value).strip().upper() or None
+            if key == "status" and value is not None:
+                value = str(value).strip().lower() or "offline"
+            if key == "sort_order" and value is not None:
+                value = int(value)
             values.append(Jsonb(_normalize_vpn_payload_keys(value or {})) if key == "vpn_payload" else value)
     if not updates:
         raise ValueError("No valid fields to update")
     values.append(location_id)
-    query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s RETURNING *"
+    query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s AND is_deleted = FALSE RETURNING *"
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(query, tuple(values))
@@ -840,6 +856,28 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     return dict(row)
 
 
+def delete_location(location_id: int) -> Dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE locations
+                SET is_deleted = TRUE,
+                    is_active = FALSE,
+                    is_recommended = FALSE,
+                    is_reserve = FALSE,
+                    status = 'offline',
+                    updated_at = NOW()
+                WHERE id = %s AND is_deleted = FALSE
+                RETURNING *
+                """,
+                (location_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Location not found")
+        conn.commit()
+    return dict(row)
 
 
 def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
@@ -855,7 +893,7 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE LIMIT 1",
+                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE LIMIT 1",
                     (location_code,),
                 )
                 row = cur.fetchone()
