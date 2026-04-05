@@ -5,7 +5,7 @@ from uuid import uuid4
 
 import jwt
 import requests
-from fastapi import Depends, FastAPI, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -27,6 +27,8 @@ from db_store import (
     get_user_by_telegram_id,
     get_user_snapshot_by_telegram,
     get_user_subscription_view,
+    issue_auth_code,
+    consume_auth_code,
     list_admin_users,
     list_bot_errors,
     list_broadcast_targets,
@@ -65,6 +67,14 @@ class TelegramAuthIn(BaseModel):
 class CodeAuthIn(BaseModel):
     code: str
     telegram_id: Optional[int] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
+
+
+class IssueCodeIn(BaseModel):
+    telegram_id: int
     username: Optional[str] = None
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -167,31 +177,43 @@ def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
     return secrets.compare_digest(left_bytes, right_bytes)
 
 
-def issue_token(user_id: int, *, expires_in_days: int = 30, token_type: str = "access") -> str:
+def issue_token(user_id: int, *, expires_delta: timedelta, token_type: str = "access") -> str:
     payload = {
         "sub": str(user_id),
         "typ": token_type,
-        "exp": datetime.now(timezone.utc) + timedelta(days=expires_in_days),
+        "exp": datetime.now(timezone.utc) + expires_delta,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
 
 
 def issue_access_token(user_id: int) -> str:
-    return issue_token(user_id, expires_in_days=30, token_type="access")
+    return issue_token(
+        user_id,
+        expires_delta=timedelta(minutes=max(1, int(settings.AUTH_ACCESS_TOKEN_MINUTES or 60))),
+        token_type="access",
+    )
 
 
 
 def issue_refresh_token(user_id: int) -> str:
-    return issue_token(user_id, expires_in_days=90, token_type="refresh")
+    return issue_token(
+        user_id,
+        expires_delta=timedelta(days=max(1, int(settings.AUTH_REFRESH_TOKEN_DAYS or 90))),
+        token_type="refresh",
+    )
 
 
 
-def _decode_token(raw_token: str) -> Dict[str, Any]:
+def _decode_token(raw_token: str, *, expected_type: Optional[str] = None) -> Dict[str, Any]:
     try:
-        return jwt.decode(raw_token, settings.JWT_SECRET, algorithms=["HS256"])
+        payload = jwt.decode(raw_token, settings.JWT_SECRET, algorithms=["HS256"])
     except Exception as exc:
         raise HTTPException(status_code=401, detail="Invalid token") from exc
+    token_type = str(payload.get("typ") or "")
+    if expected_type and token_type != expected_type:
+        raise HTTPException(status_code=401, detail=f"Invalid token type: expected {expected_type}")
+    return payload
 
 
 
@@ -229,12 +251,22 @@ def _fallback_code_user_payload(payload: CodeAuthIn) -> Dict[str, Any]:
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    payload = _decode_token(credentials.credentials)
+    payload = _decode_token(credentials.credentials, expected_type="access")
     user_id = int(payload["sub"])
     user = get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
     return user
+
+
+
+def require_code_issuer(x_auth_code_secret: Optional[str] = Header(default=None)) -> bool:
+    configured_secret = (settings.AUTH_CODE_ISSUER_SECRET or "").strip()
+    if not configured_secret:
+        return True
+    if _safe_compare_secret(x_auth_code_secret, configured_secret):
+        return True
+    raise HTTPException(status_code=401, detail="Invalid code issuer secret")
 
 
 
@@ -317,16 +349,49 @@ def auth_telegram(payload: TelegramAuthIn) -> Dict[str, Any]:
     return _issue_auth_payload(user, is_new=existing is None)
 
 
+@app.post("/auth/code/issue")
+def auth_code_issue(payload: IssueCodeIn, _: bool = Depends(require_code_issuer)) -> Dict[str, Any]:
+    existing = get_user_by_telegram_id(payload.telegram_id)
+    user = upsert_telegram_user(payload.model_dump())
+    issued = issue_auth_code(
+        int(user["id"]),
+        ttl_minutes=settings.AUTH_CODE_TTL_MINUTES,
+        meta={
+            "telegram_id": payload.telegram_id,
+            "language": payload.language,
+        },
+    )
+    code = str(issued["code"])
+    base = settings.OPEN_APP_URL or "inet://login"
+    separator = "&" if "?" in base else "?"
+    deep_link = f"{base}{separator}code={code}&lang={user.get('language') or payload.language or 'ru'}"
+    return {
+        "ok": True,
+        "code": code,
+        "deep_link": deep_link,
+        "expires_at": issued["expires_at"].isoformat(),
+        "user": user,
+        "is_new": existing is None,
+    }
+
+
 @app.post("/auth/code")
 def auth_code(payload: CodeAuthIn) -> Dict[str, Any]:
-    if not settings.AUTH_ALLOW_DEV_CODE:
-        raise HTTPException(status_code=403, detail="Code login disabled")
-    if payload.code != settings.AUTH_DEV_LOGIN_CODE:
-        raise HTTPException(status_code=401, detail="Invalid code")
-    user_payload = _fallback_code_user_payload(payload)
-    existing = get_user_by_telegram_id(int(user_payload["telegram_id"]))
-    user = upsert_telegram_user(user_payload)
-    return _issue_auth_payload(user, is_new=existing is None)
+    normalized_code = (payload.code or "").strip()
+    if settings.AUTH_ALLOW_DEV_CODE and normalized_code == settings.AUTH_DEV_LOGIN_CODE:
+        user_payload = _fallback_code_user_payload(payload)
+        existing = get_user_by_telegram_id(int(user_payload["telegram_id"]))
+        user = upsert_telegram_user(user_payload)
+        return _issue_auth_payload(user, is_new=existing is None)
+
+    user = consume_auth_code(normalized_code)
+    if not user:
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+
+    requested_language = "en" if payload.language == "en" else "ru"
+    if user.get("language") != requested_language:
+        user = set_user_language(int(user["id"]), requested_language)
+    return _issue_auth_payload(user, is_new=False)
 
 
 @app.post("/auth/refresh")
@@ -339,7 +404,7 @@ def auth_refresh(
         raw_token = credentials.credentials
     if not raw_token:
         raise HTTPException(status_code=401, detail="Missing refresh token")
-    decoded = _decode_token(raw_token)
+    decoded = _decode_token(raw_token, expected_type="refresh")
     user_id = int(decoded["sub"])
     user = get_user_by_id(user_id)
     if not user:
