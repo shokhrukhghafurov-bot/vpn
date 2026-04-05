@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from uuid import uuid4
@@ -98,6 +99,17 @@ CREATE TABLE IF NOT EXISTS payments (
 );
 CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
 CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
+
+CREATE TABLE IF NOT EXISTS auth_codes (
+    code TEXT PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at TIMESTAMPTZ NOT NULL,
+    used_at TIMESTAMPTZ,
+    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_auth_codes_user_id ON auth_codes(user_id);
+CREATE INDEX IF NOT EXISTS idx_auth_codes_expires_at ON auth_codes(expires_at);
 
 CREATE TABLE IF NOT EXISTS admin_notes (
     id SERIAL PRIMARY KEY,
@@ -1091,6 +1103,69 @@ def export_payments_csv(status_filter: str = "all") -> str:
             row.get("paid_at"),
         ])
     return output.getvalue()
+
+
+def issue_auth_code(user_id: int, ttl_minutes: Optional[int] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    ttl = max(1, int(ttl_minutes or settings.AUTH_CODE_TTL_MINUTES or 5))
+    code = secrets.token_urlsafe(18)
+    expires_at = now_utc() + timedelta(minutes=ttl)
+    payload = meta or {}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE auth_codes
+                SET used_at = NOW()
+                WHERE user_id = %s AND used_at IS NULL
+                """,
+                (user_id,),
+            )
+            cur.execute(
+                """
+                INSERT INTO auth_codes (code, user_id, expires_at, meta)
+                VALUES (%s, %s, %s, %s)
+                RETURNING *
+                """,
+                (code, user_id, expires_at, Jsonb(payload)),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    return dict(row)
+
+
+def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
+    normalized = (code or "").strip()
+    if not normalized:
+        return None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT *
+                FROM auth_codes
+                WHERE code = %s
+                FOR UPDATE
+                """,
+                (normalized,),
+            )
+            row = cur.fetchone()
+            if not row:
+                conn.rollback()
+                return None
+            if row.get("used_at") is not None or row.get("expires_at") <= now_utc():
+                conn.rollback()
+                return None
+            cur.execute(
+                "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
+                (normalized,),
+            )
+            cur.execute(
+                "SELECT * FROM users WHERE id = %s",
+                (row["user_id"],),
+            )
+            user = cur.fetchone()
+        conn.commit()
+    return _normalize_user(user)
 
 
 def settings_snapshot() -> Dict[str, Any]:
