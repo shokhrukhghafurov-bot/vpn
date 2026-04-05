@@ -23,6 +23,8 @@ from db_store import (
     create_payment_record,
     delete_device,
     export_payments_csv,
+    _compose_vpn_payload_for_location,
+    _config_is_complete,
     get_active_plans,
     get_payment_by_internal_or_external,
     get_payment_for_user,
@@ -327,9 +329,8 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
 def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
     item = dict(row)
     raw_vpn_payload = item.pop("vpn_payload", None)
-    item["has_vpn_payload"] = bool(raw_vpn_payload)
-    if include_payload:
-        item["vpn_payload"] = raw_vpn_payload if isinstance(raw_vpn_payload, dict) else {}
+    normalized_payload = dict(raw_vpn_payload) if isinstance(raw_vpn_payload, dict) else {}
+    item["has_vpn_payload"] = bool(normalized_payload)
     meta = _location_meta(item)
     item.update(meta)
     item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
@@ -337,6 +338,11 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["name"] = item.get("display_name_ru") or item.get("name_ru") or item.get("name_en")
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
+    if include_payload:
+        resolved_payload = _compose_vpn_payload_for_location(dict(row))
+        item["vpn_payload"] = normalized_payload
+        item["resolved_vpn_payload"] = resolved_payload
+        item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
     return item
 
 
@@ -840,7 +846,7 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "item": serialize_location(create_location(payload.model_dump()), include_payload=True)}
+    return {"ok": True, "item": create_location(payload.model_dump())}
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
@@ -848,7 +854,7 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     _ = admin_name
     data = {key: value for key, value in payload.model_dump().items() if value is not None}
     try:
-        return {"ok": True, "item": serialize_location(patch_location(location_id, data), include_payload=True)}
+        return {"ok": True, "item": patch_location(location_id, data)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
