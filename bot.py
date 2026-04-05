@@ -251,9 +251,9 @@ async def issue_login_token_for_telegram_id(telegram_id: int, language: str = "r
 
 
 def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
-    if not token:
-        return text
-    return "\n".join([text, "", f"{TEXT[lang]['token_label']}:", token])
+    # Token text is intentionally hidden in the message body.
+    # Access is provided via the copy button only.
+    return text
 
 
 def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
