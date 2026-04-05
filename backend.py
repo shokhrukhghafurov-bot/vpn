@@ -22,6 +22,7 @@ from db_store import (
     create_location,
     create_payment_record,
     delete_device,
+    delete_location,
     export_payments_csv,
     _compose_vpn_payload_for_location,
     _config_is_complete,
@@ -846,7 +847,10 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "item": create_location(payload.model_dump())}
+    try:
+        return {"ok": True, "item": create_location(payload.model_dump())}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
@@ -855,6 +859,15 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     data = {key: value for key, value in payload.model_dump().items() if value is not None}
     try:
         return {"ok": True, "item": patch_location(location_id, data)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/infra/admin/vpn/locations/{location_id}")
+def admin_locations_delete(location_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        return {"ok": True, "item": delete_location(location_id)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
