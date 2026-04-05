@@ -326,6 +326,105 @@ def _load_default_locations() -> List[Dict[str, Any]]:
     return builtin_locations
 
 
+def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    if not normalized:
+        return {}
+    if "server_port" in normalized and "port" not in normalized:
+        normalized["port"] = normalized.get("server_port")
+    if "id" in normalized and "uuid" not in normalized:
+        normalized["uuid"] = normalized.get("id")
+    if "server_name" in normalized and "sni" not in normalized:
+        normalized["sni"] = normalized.get("server_name")
+    if "serviceName" in normalized and "service_name" not in normalized:
+        normalized["service_name"] = normalized.get("serviceName")
+    if "publicKey" in normalized and "public_key" not in normalized:
+        normalized["public_key"] = normalized.get("publicKey")
+    if "shortId" in normalized and "short_id" not in normalized:
+        normalized["short_id"] = normalized.get("shortId")
+    if "dnsServers" in normalized and "dns_servers" not in normalized:
+        normalized["dns_servers"] = normalized.get("dnsServers")
+    if "allowInsecure" in normalized and "allow_insecure" not in normalized:
+        normalized["allow_insecure"] = normalized.get("allowInsecure")
+    if "domainResolver" in normalized and "domain_resolver" not in normalized:
+        normalized["domain_resolver"] = normalized.get("domainResolver")
+    if "packetEncoding" in normalized and "packet_encoding" not in normalized:
+        normalized["packet_encoding"] = normalized.get("packetEncoding")
+    if "rawSingBoxConfig" in normalized and "raw_sing_box_config" not in normalized:
+        normalized["raw_sing_box_config"] = normalized.get("rawSingBoxConfig")
+    if "rawXrayConfig" in normalized and "raw_xray_config" not in normalized:
+        normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
+    return normalized
+
+
+def _config_is_complete(payload: Dict[str, Any]) -> bool:
+    normalized = _normalize_vpn_payload_keys(payload)
+    server = str(normalized.get("server") or "").strip()
+    uuid = str(normalized.get("uuid") or "").strip()
+    try:
+        port = int(normalized.get("port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    return bool(server and uuid and port > 0)
+
+
+def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location_code: Optional[str] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {}
+    default_payload = settings.default_vpn_payload()
+    if default_payload:
+        payload.update(default_payload)
+    overrides = settings.location_vpn_payloads().get(str(row.get("code") or "").strip())
+    if overrides:
+        payload.update(overrides)
+    stored = row.get("vpn_payload")
+    if isinstance(stored, dict) and stored:
+        payload.update(stored)
+
+    payload = _normalize_vpn_payload_keys(payload)
+    if not payload:
+        return {}
+
+    payload.setdefault("protocol", "vless")
+    payload.setdefault("engine", "sing-box")
+    payload.setdefault("transport", "tcp")
+    payload.setdefault("security", "reality")
+    payload.setdefault("mtu", 1400)
+    if not payload.get("dns_servers"):
+        payload["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
+    payload.setdefault("domain_resolver", "dns-remote")
+    payload.setdefault("packet_encoding", "xudp")
+    payload.setdefault("location_code", requested_location_code or row.get("code"))
+    payload.setdefault("resolved_location_code", row.get("code"))
+    payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
+    return payload
+
+
+def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
+    rows = list_locations(active_only=True)
+    if not rows:
+        return None
+
+    def candidates(predicate) -> List[Dict[str, Any]]:
+        return [row for row in rows if predicate(row) and _compose_vpn_payload_for_location(row)]
+
+    if code == "auto-fastest":
+        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_recommended"))
+        if picks:
+            return picks[0]
+        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
+        if picks:
+            return picks[0]
+    if code == "auto-reserve":
+        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_reserve"))
+        if picks:
+            return picks[0]
+        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
+        if len(picks) >= 2:
+            return picks[1]
+        if picks:
+            return picks[0]
+    return None
+
 
 def sync_locations_catalog() -> None:
     locations = _load_default_locations()
@@ -337,6 +436,8 @@ def sync_locations_catalog() -> None:
         with conn.cursor() as cur:
             for item in locations:
                 data = dict(item)
+                if not data.get("vpn_payload"):
+                    data["vpn_payload"] = _compose_vpn_payload_for_location(data)
                 data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
                 cur.execute(
                     """
@@ -677,7 +778,7 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
 
 def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
     data = dict(payload)
-    data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
+    data["vpn_payload"] = Jsonb(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -700,7 +801,7 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     for key, value in payload.items():
         if key in allowed:
             updates.append(f"{key} = %s")
-            values.append(Jsonb(value or {}) if key == "vpn_payload" else value)
+            values.append(Jsonb(_normalize_vpn_payload_keys(value or {})) if key == "vpn_payload" else value)
     if not updates:
         raise ValueError("No valid fields to update")
     values.append(location_id)
@@ -722,23 +823,26 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
     if not subscription:
         raise PermissionError("Active subscription required")
 
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM locations WHERE code = %s AND is_active = TRUE LIMIT 1",
-                (location_code,),
-            )
-            row = cur.fetchone()
+    if location_code in {"auto-fastest", "auto-reserve"}:
+        row = _pick_virtual_location(location_code)
+        if not row:
+            raise ValueError("No active VLESS node is available for auto selection")
+    else:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE LIMIT 1",
+                    (location_code,),
+                )
+                row = cur.fetchone()
     if not row:
         raise ValueError("Location not found")
 
-    payload = dict(row.get("vpn_payload") or {})
+    payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
     if not payload:
         raise ValueError("VLESS config is not configured for this location")
-
-    payload.setdefault("protocol", "vless")
-    payload.setdefault("location_code", row["code"])
-    payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row["code"])
+    if not _config_is_complete(payload):
+        raise ValueError("VLESS config is incomplete for this location")
     return payload
 
 def create_payment_record(
