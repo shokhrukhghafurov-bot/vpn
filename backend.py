@@ -8,6 +8,7 @@ from uuid import uuid4
 
 import jwt
 import requests
+import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
@@ -853,6 +854,9 @@ def admin_locations_create(payload: LocationIn, admin_name: str = Depends(requir
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        detail = str(exc).strip() or "Database error while saving location"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
