@@ -478,20 +478,41 @@ def sync_locations_catalog() -> None:
                     INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
                     VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
                     ON CONFLICT (code) DO UPDATE SET
-                        name_ru = EXCLUDED.name_ru,
-                        name_en = EXCLUDED.name_en,
-                        country_code = EXCLUDED.country_code,
-                        is_active = CASE WHEN locations.is_deleted THEN locations.is_active ELSE EXCLUDED.is_active END,
-                        is_recommended = CASE WHEN locations.is_deleted THEN locations.is_recommended ELSE EXCLUDED.is_recommended END,
-                        is_reserve = CASE WHEN locations.is_deleted THEN locations.is_reserve ELSE EXCLUDED.is_reserve END,
-                        status = CASE WHEN locations.is_deleted THEN locations.status ELSE EXCLUDED.status END,
-                        sort_order = EXCLUDED.sort_order,
+                        -- Preserve admin-edited catalog rows across restarts.
+                        -- Bootstrap should only backfill missing defaults, not overwrite
+                        -- mutable values changed from the admin panel.
+                        name_ru = CASE
+                            WHEN COALESCE(NULLIF(BTRIM(locations.name_ru), ''), NULL) IS NULL THEN EXCLUDED.name_ru
+                            ELSE locations.name_ru
+                        END,
+                        name_en = CASE
+                            WHEN COALESCE(NULLIF(BTRIM(locations.name_en), ''), NULL) IS NULL THEN EXCLUDED.name_en
+                            ELSE locations.name_en
+                        END,
+                        country_code = CASE
+                            WHEN COALESCE(NULLIF(BTRIM(locations.country_code), ''), NULL) IS NULL THEN EXCLUDED.country_code
+                            ELSE locations.country_code
+                        END,
+                        is_active = locations.is_active,
+                        is_recommended = locations.is_recommended,
+                        is_reserve = locations.is_reserve,
+                        status = CASE
+                            WHEN COALESCE(NULLIF(BTRIM(locations.status), ''), NULL) IS NULL THEN EXCLUDED.status
+                            ELSE locations.status
+                        END,
+                        sort_order = CASE
+                            WHEN locations.sort_order IS NULL THEN EXCLUDED.sort_order
+                            ELSE locations.sort_order
+                        END,
                         vpn_payload = CASE
                             WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
                             ELSE locations.vpn_payload
                         END,
                         is_deleted = locations.is_deleted,
-                        location_source = 'catalog',
+                        location_source = CASE
+                            WHEN COALESCE(NULLIF(BTRIM(locations.location_source), ''), 'catalog') = 'admin' THEN 'admin'
+                            ELSE 'catalog'
+                        END,
                         updated_at = NOW()
                     """,
                     data,
