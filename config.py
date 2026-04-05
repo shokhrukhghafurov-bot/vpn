@@ -1,7 +1,4 @@
 import json
-
-# LTE bridge note: keep mobile-provider credentials on the bridge only.
-# Backend env should contain only client-facing bridge VLESS payloads.
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List
@@ -15,7 +12,9 @@ BUILTIN_MVP_LOCATIONS_JSON = (
     '{"code":"de-1","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":50},'
     '{"code":"nl-1","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":60},'
     '{"code":"fr-1","name_ru":"Франция","name_en":"France","country_code":"FR","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":70},'
-    '{"code":"at-1","name_ru":"Австрия","name_en":"Austria","country_code":"AT","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":80}]'
+    '{"code":"at-1","name_ru":"Австрия","name_en":"Austria","country_code":"AT","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":80},'
+    '{"code":"ru-lte","name_ru":"Россия LTE","name_en":"Russia LTE","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":false,"status":"offline","sort_order":110,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte","remark":"Russia LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"],"bridge_mode":"upstream_mobile_proxy","provider_country":"RU","provider_type":"socks5"}},'
+    '{"code":"uz-lte","name_ru":"Узбекистан LTE","name_en":"Uzbekistan LTE","country_code":"UZ","is_active":true,"is_recommended":false,"is_reserve":false,"status":"offline","sort_order":120,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"uz-lte","remark":"Uzbekistan LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"],"bridge_mode":"upstream_mobile_proxy","provider_country":"UZ","provider_type":"socks5"}}]'
 )
 
 
