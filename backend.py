@@ -1,12 +1,16 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+import html
+import json
 import secrets
 from uuid import uuid4
 
 import jwt
 import requests
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, Response
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -337,6 +341,125 @@ def _bot_public_url() -> str:
     return settings.SUPPORT_TELEGRAM_URL
 
 
+def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    base = settings.OPEN_APP_URL or "inet://login"
+    parts = urlsplit(base)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if code:
+        query["code"] = code
+    elif token:
+        query["token"] = token
+    if lang:
+        query["lang"] = lang
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    base = (settings.OPEN_APP_BRIDGE_URL or "").strip() or str(request.url_for("open_app_bridge"))
+    parts = urlsplit(base)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    if code:
+        query["code"] = code
+    elif token:
+        query["token"] = token
+    if lang:
+        query["lang"] = lang
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+@app.get("/open-app", response_class=HTMLResponse, name="open_app_bridge")
+def open_app_bridge(
+    request: Request,
+    code: Optional[str] = Query(default=None),
+    token: Optional[str] = Query(default=None),
+    lang: str = Query(default="ru"),
+) -> HTMLResponse:
+    norm_lang = "en" if lang == "en" else "ru"
+    native_url = _build_native_open_app_url(code=code, token=token, lang=norm_lang)
+    bot_url = _bot_public_url()
+    page_text = {
+        "ru": {
+            "title": "Открываем INET",
+            "headline": "Открываем приложение…",
+            "body": "Приложение должно открыться автоматически. Если этого не произошло, нажмите кнопку ниже.",
+            "open_button": "Открыть приложение",
+            "android_button": "Скачать Android",
+            "ios_button": "Скачать iPhone / iPad",
+            "bot_button": "Вернуться в бота",
+            "code_label": "Код для входа",
+        },
+        "en": {
+            "title": "Opening INET",
+            "headline": "Opening the app…",
+            "body": "The app should open automatically. If it does not, use the button below.",
+            "open_button": "Open app",
+            "android_button": "Download Android",
+            "ios_button": "Download iPhone / iPad",
+            "bot_button": "Back to bot",
+            "code_label": "Login code",
+        },
+    }[norm_lang]
+    code_block = ""
+    if code:
+        code_block = f'<div class="code"><div class="label">{html.escape(page_text["code_label"])}</div><code>{html.escape(code)}</code></div>'
+    native_url_attr = html.escape(native_url, quote=True)
+    native_url_js = json.dumps(native_url)
+    android_url = html.escape(settings.ANDROID_APP_URL, quote=True)
+    ios_url = html.escape(settings.IOS_APP_URL, quote=True)
+    bot_url_attr = html.escape(bot_url, quote=True)
+    title = html.escape(page_text["title"])
+    headline = html.escape(page_text["headline"])
+    body = html.escape(page_text["body"])
+    open_button = html.escape(page_text["open_button"])
+    android_button = html.escape(page_text["android_button"])
+    ios_button = html.escape(page_text["ios_button"])
+    bot_button = html.escape(page_text["bot_button"])
+    html_page = f"""<!doctype html>
+<html lang="{norm_lang}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1220; color: #f3f4f6; }}
+    .wrap {{ max-width: 560px; margin: 0 auto; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }}
+    .card {{ width: 100%; background: #111827; border: 1px solid #1f2937; border-radius: 24px; padding: 24px; box-sizing: border-box; box-shadow: 0 10px 30px rgba(0,0,0,.35); }}
+    h1 {{ margin: 0 0 12px; font-size: 28px; line-height: 1.2; }}
+    p {{ margin: 0 0 20px; color: #cbd5e1; font-size: 16px; line-height: 1.5; }}
+    .actions {{ display: grid; gap: 12px; }}
+    .btn {{ display: block; text-align: center; text-decoration: none; padding: 14px 16px; border-radius: 14px; font-weight: 700; }}
+    .btn-primary {{ background: #22c55e; color: #04130a; }}
+    .btn-secondary {{ background: #1f2937; color: #f3f4f6; }}
+    .code {{ margin: 0 0 20px; padding: 16px; border-radius: 16px; background: #0f172a; border: 1px solid #1e293b; }}
+    .label {{ font-size: 13px; color: #94a3b8; margin-bottom: 8px; }}
+    code {{ display: block; font-size: 18px; font-weight: 700; word-break: break-all; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>{headline}</h1>
+      <p>{body}</p>
+      {code_block}
+      <div class="actions">
+        <a class="btn btn-primary" href="{native_url_attr}">{open_button}</a>
+        <a class="btn btn-secondary" href="{android_url}">{android_button}</a>
+        <a class="btn btn-secondary" href="{ios_url}">{ios_button}</a>
+        <a class="btn btn-secondary" href="{bot_url_attr}">{bot_button}</a>
+      </div>
+    </div>
+  </div>
+  <script>
+    window.setTimeout(function () {{
+      window.location.href = {native_url_js};
+    }}, 120);
+  </script>
+</body>
+</html>"""
+    return HTMLResponse(content=html_page)
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "service": settings.APP_NAME}
@@ -350,7 +473,7 @@ def auth_telegram(payload: TelegramAuthIn) -> Dict[str, Any]:
 
 
 @app.post("/auth/code/issue")
-def auth_code_issue(payload: IssueCodeIn, _: bool = Depends(require_code_issuer)) -> Dict[str, Any]:
+def auth_code_issue(request: Request, payload: IssueCodeIn, _: bool = Depends(require_code_issuer)) -> Dict[str, Any]:
     existing = get_user_by_telegram_id(payload.telegram_id)
     user = upsert_telegram_user(payload.model_dump())
     issued = issue_auth_code(
@@ -362,9 +485,11 @@ def auth_code_issue(payload: IssueCodeIn, _: bool = Depends(require_code_issuer)
         },
     )
     code = str(issued["code"])
-    base = settings.OPEN_APP_URL or "inet://login"
-    separator = "&" if "?" in base else "?"
-    deep_link = f"{base}{separator}code={code}&lang={user.get('language') or payload.language or 'ru'}"
+    deep_link = _build_open_app_bridge_url(
+        request,
+        code=code,
+        lang=user.get("language") or payload.language or "ru",
+    )
     return {
         "ok": True,
         "code": code,
