@@ -360,6 +360,9 @@ def _bot_public_url() -> str:
 def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
     base = settings.OPEN_APP_URL or "inet://login"
     parts = urlsplit(base)
+    path = parts.path
+    if parts.scheme and parts.scheme not in {"http", "https"} and path == "/":
+        path = ""
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     if code:
         query["code"] = code
@@ -367,7 +370,7 @@ def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[st
         query["token"] = token
     if lang:
         query["lang"] = lang
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
 
 
 def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
