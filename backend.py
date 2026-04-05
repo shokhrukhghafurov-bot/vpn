@@ -339,6 +339,7 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["name"] = item.get("display_name_ru") or item.get("name_ru") or item.get("name_en")
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
+    item["location_source"] = str(item.get("location_source") or "catalog")
     if include_payload:
         resolved_payload = _compose_vpn_payload_for_location(dict(row))
         item["vpn_payload"] = normalized_payload
@@ -847,10 +848,8 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    try:
-        return {"ok": True, "item": create_location(payload.model_dump())}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    item = create_location(payload.model_dump())
+    return {"ok": True, "item": serialize_location(item, include_payload=True)}
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
@@ -858,7 +857,8 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     _ = admin_name
     data = {key: value for key, value in payload.model_dump().items() if value is not None}
     try:
-        return {"ok": True, "item": patch_location(location_id, data)}
+        item = patch_location(location_id, data)
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -867,9 +867,10 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
 def admin_locations_delete(location_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
     try:
-        return {"ok": True, "item": delete_location(location_id)}
+        item = delete_location(location_id)
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
 
 
 @app.get("/api/infra/admin/vpn/settings")
