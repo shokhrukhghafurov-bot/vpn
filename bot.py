@@ -10,16 +10,12 @@ from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
+    CopyTextButton,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
     ReplyKeyboardRemove,
 )
-
-try:
-    from aiogram.types import CopyTextButton
-except Exception:  # pragma: no cover - older aiogram fallback
-    CopyTextButton = None
 
 from config import settings
 from db_store import (
@@ -257,33 +253,20 @@ async def issue_login_token_for_telegram_id(telegram_id: int, language: str = "r
 def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
     if not token:
         return text
-    lines = [text, "", f"{TEXT[lang]['token_label']}:", token]
-    return "\n".join(lines)
+    return "\n".join([text, "", f"{TEXT[lang]['token_label']}:", token])
 
 
-def _telegram_supported_button_url(url: Optional[str]) -> bool:
+def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
+    if not token:
+        return []
+    return [[InlineKeyboardButton(text=TEXT[lang]["copy_token"], copy_text=CopyTextButton(text=token))]]
+
+
+def is_supported_telegram_url(url: Optional[str]) -> bool:
     if not url:
         return False
-    try:
-        scheme = (urlsplit(url).scheme or "").lower()
-    except Exception:
-        return False
+    scheme = (urlsplit(url).scheme or "").lower()
     return scheme in {"http", "https", "tg"}
-
-
-def _copy_token_row(lang: str, token: Optional[str]) -> Optional[List[InlineKeyboardButton]]:
-    value = (token or "").strip()
-    if not value or len(value) > 256 or CopyTextButton is None:
-        return None
-    try:
-        return [InlineKeyboardButton(text=TEXT[lang]["copy_token"], copy_text=CopyTextButton(text=value))]
-    except Exception:
-        return None
-
-
-def _with_copy_token_row(rows: List[List[InlineKeyboardButton]], lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
-    copy_row = _copy_token_row(lang, token)
-    return ([copy_row] if copy_row else []) + rows
 
 
 async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineKeyboardMarkup] = None) -> None:
@@ -294,10 +277,7 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineK
             await callback.answer(text)
     except Exception:
         if callback.message:
-            try:
-                await callback.message.answer(text, reply_markup=markup)
-            except Exception:
-                await callback.message.answer(text)
+            await callback.message.answer(text, reply_markup=markup)
 
 
 async def show_backend_error(target: Message | CallbackQuery, lang: str) -> None:
@@ -413,17 +393,14 @@ def build_open_app_url(token: Optional[str] = None, lang: Optional[str] = None) 
 def activated_inline(lang: str, open_app_url: Optional[str] = None, token: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     rows: List[List[InlineKeyboardButton]] = []
-    target_url = open_app_url or build_open_app_url(lang=lang)
-    if _telegram_supported_button_url(target_url):
-        rows.append([InlineKeyboardButton(text=t["open_app"], url=target_url)])
-    rows.extend(
-        [
-            [InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")],
-            [InlineKeyboardButton(text=t["sub"], callback_data="menu:sub")],
-            [InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")],
-        ]
-    )
-    return InlineKeyboardMarkup(inline_keyboard=_with_copy_token_row(rows, lang, token))
+    rows.extend(token_copy_rows(lang, token))
+    final_open_url = open_app_url or build_open_app_url(lang=lang)
+    if is_supported_telegram_url(final_open_url):
+        rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
+    rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
+    rows.append([InlineKeyboardButton(text=t["sub"], callback_data="menu:sub")])
+    rows.append([InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -461,15 +438,15 @@ def download_platforms_inline(lang: str) -> InlineKeyboardMarkup:
 
 
 
-def platform_open_inline(lang: str, platform: str, open_app_url: Optional[str] = None, token: Optional[str] = None) -> InlineKeyboardMarkup:
+def platform_open_inline(lang: str, platform: str, open_app_url: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     url = settings.ANDROID_APP_URL if platform == "android" else settings.IOS_APP_URL
     rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=t["download_app"], url=url)]]
-    target_url = open_app_url or build_open_app_url(lang=lang)
-    if _telegram_supported_button_url(target_url):
-        rows.append([InlineKeyboardButton(text=t["open_app"], url=target_url)])
+    final_open_url = open_app_url or build_open_app_url(lang=lang)
+    if is_supported_telegram_url(final_open_url):
+        rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:download")])
-    return InlineKeyboardMarkup(inline_keyboard=_with_copy_token_row(rows, lang, token))
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -535,13 +512,13 @@ async def render_subscription_message(lang: str, token: str) -> Tuple[str, Inlin
             ]
         )
         text = append_token_details(text, lang, token, limit)
-    rows: List[List[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")],
-        [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
-    ]
-    if _telegram_supported_button_url(open_app_url):
-        rows.insert(1, [InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
-    markup = InlineKeyboardMarkup(inline_keyboard=_with_copy_token_row(rows, lang, token))
+    rows: List[List[InlineKeyboardButton]] = []
+    rows.extend(token_copy_rows(lang, token))
+    rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
+    if is_supported_telegram_url(open_app_url):
+        rows.append([InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
+    rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, markup
 
 
@@ -708,7 +685,7 @@ async def menu_from_text_alias(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
 async def download_android_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", build_open_app_url(_ctx.get("token"), lang), _ctx.get("token")))
+        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", build_open_app_url(_ctx.get("token"), lang)))
 
     await with_user_guard(message, _handler)
 
@@ -716,7 +693,7 @@ async def download_android_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
 async def download_ios_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", build_open_app_url(_ctx.get("token"), lang), _ctx.get("token")))
+        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", build_open_app_url(_ctx.get("token"), lang)))
 
     await with_user_guard(message, _handler)
 
@@ -860,7 +837,7 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
             text = TEXT[lang]["download_android"]
         else:
             text = TEXT[lang]["download_ios"]
-        await safe_edit(callback, text, platform_open_inline(lang, platform, build_open_app_url(_ctx.get("token"), lang), _ctx.get("token")))
+        await safe_edit(callback, text, platform_open_inline(lang, platform, build_open_app_url(_ctx.get("token"), lang)))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
