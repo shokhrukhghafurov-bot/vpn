@@ -317,12 +317,27 @@ def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
 
 
 
+def _merge_locations_catalog(base: List[Dict[str, Any]], extra: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    merged: Dict[str, Dict[str, Any]] = {str(item.get("code") or "").strip(): dict(item) for item in base if str(item.get("code") or "").strip()}
+    for item in extra:
+        code = str(item.get("code") or "").strip()
+        if not code:
+            continue
+        current = dict(merged.get(code) or {})
+        current.update(item)
+        merged[code] = current
+    return sorted(merged.values(), key=lambda item: int(item.get("sort_order") or 0))
+
+
 def _load_default_locations() -> List[Dict[str, Any]]:
     builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
+    env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
     if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED:
-        env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
         if env_locations:
             return env_locations
+        return builtin_locations
+    if env_locations:
+        return _merge_locations_catalog(builtin_locations, env_locations)
     return builtin_locations
 
 
@@ -1328,7 +1343,9 @@ def settings_snapshot() -> Dict[str, Any]:
         "android_app_url": settings.ANDROID_APP_URL,
         "ios_app_url": settings.IOS_APP_URL,
         "settings_editable": settings.VPN_SETTINGS_EDITABLE,
-        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
+        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else ("builtin_plus_env_merge" if settings.DEFAULT_LOCATIONS_ENV_JSON else "builtin_mvp"),
+        "default_locations_count": len(_load_default_locations()),
+        "location_payload_codes": sorted(settings.location_vpn_payloads().keys()),
         "plans": get_all_plans(),
     }
 
