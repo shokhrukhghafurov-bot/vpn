@@ -62,8 +62,17 @@ class TelegramAuthIn(BaseModel):
     language: str = "ru"
 
 
-class CodeAuthIn(TelegramAuthIn):
+class CodeAuthIn(BaseModel):
     code: str
+    telegram_id: Optional[int] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
+
+
+class RefreshIn(BaseModel):
+    refresh_token: Optional[str] = None
 
 
 class LanguageIn(BaseModel):
@@ -158,23 +167,70 @@ def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
     return secrets.compare_digest(left_bytes, right_bytes)
 
 
-def issue_token(user_id: int) -> str:
+def issue_token(user_id: int, *, expires_in_days: int = 30, token_type: str = "access") -> str:
     payload = {
         "sub": str(user_id),
-        "exp": datetime.now(timezone.utc) + timedelta(days=30),
+        "typ": token_type,
+        "exp": datetime.now(timezone.utc) + timedelta(days=expires_in_days),
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
+
+
+
+def issue_access_token(user_id: int) -> str:
+    return issue_token(user_id, expires_in_days=30, token_type="access")
+
+
+
+def issue_refresh_token(user_id: int) -> str:
+    return issue_token(user_id, expires_in_days=90, token_type="refresh")
+
+
+
+def _decode_token(raw_token: str) -> Dict[str, Any]:
+    try:
+        return jwt.decode(raw_token, settings.JWT_SECRET, algorithms=["HS256"])
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+
+
+
+def _issue_auth_payload(user: Dict[str, Any], *, is_new: bool = False) -> Dict[str, Any]:
+    access_token = issue_access_token(int(user["id"]))
+    refresh_token = issue_refresh_token(int(user["id"]))
+    view = get_user_subscription_view(int(user["id"]))
+    return {
+        "ok": True,
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": user,
+        "subscription": view.get("subscription"),
+        "language": user.get("language") or "ru",
+        "is_new": is_new,
+    }
+
+
+
+def _fallback_code_user_payload(payload: CodeAuthIn) -> Dict[str, Any]:
+    suffix = str(payload.code or settings.AUTH_DEV_LOGIN_CODE)[-6:]
+    telegram_id = payload.telegram_id or int(f"900{suffix}")
+    language = "en" if payload.language == "en" else "ru"
+    return {
+        "telegram_id": telegram_id,
+        "username": payload.username or f"inet_dev_{suffix}",
+        "first_name": payload.first_name or "INET",
+        "last_name": payload.last_name or "Dev",
+        "language": language,
+    }
 
 
 
 def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
     if not credentials or not credentials.credentials:
         raise HTTPException(status_code=401, detail="Missing bearer token")
-    try:
-        payload = jwt.decode(credentials.credentials, settings.JWT_SECRET, algorithms=["HS256"])
-        user_id = int(payload["sub"])
-    except Exception as exc:
-        raise HTTPException(status_code=401, detail="Invalid token") from exc
+    payload = _decode_token(credentials.credentials)
+    user_id = int(payload["sub"])
     user = get_user_by_id(user_id)
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -235,7 +291,18 @@ def serialize_location(row: Dict[str, Any]) -> Dict[str, Any]:
     item.update(meta)
     item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
     item["display_name_en"] = f'{meta["icon"]} {item.get("name_en")}'.strip() if meta.get("icon") else item.get("name_en")
+    item["name"] = item.get("display_name_ru") or item.get("name_ru") or item.get("name_en")
+    item["recommended"] = bool(item.get("is_recommended"))
+    item["reserve"] = bool(item.get("is_reserve"))
     return item
+
+
+
+def _bot_public_url() -> str:
+    bot_username = (settings.BOT_USERNAME or "").strip().lstrip("@")
+    if bot_username:
+        return f"https://t.me/{bot_username}"
+    return settings.SUPPORT_TELEGRAM_URL
 
 
 @app.get("/health")
@@ -247,8 +314,7 @@ def health() -> Dict[str, Any]:
 def auth_telegram(payload: TelegramAuthIn) -> Dict[str, Any]:
     existing = get_user_by_telegram_id(payload.telegram_id)
     user = upsert_telegram_user(payload.model_dump())
-    token = issue_token(user["id"])
-    return {"ok": True, "token": token, "user": user, "is_new": existing is None}
+    return _issue_auth_payload(user, is_new=existing is None)
 
 
 @app.post("/auth/code")
@@ -257,22 +323,65 @@ def auth_code(payload: CodeAuthIn) -> Dict[str, Any]:
         raise HTTPException(status_code=403, detail="Code login disabled")
     if payload.code != settings.AUTH_DEV_LOGIN_CODE:
         raise HTTPException(status_code=401, detail="Invalid code")
-    existing = get_user_by_telegram_id(payload.telegram_id)
-    user = upsert_telegram_user(payload.model_dump(exclude={"code"}))
-    token = issue_token(user["id"])
-    return {"ok": True, "token": token, "user": user, "is_new": existing is None}
+    user_payload = _fallback_code_user_payload(payload)
+    existing = get_user_by_telegram_id(int(user_payload["telegram_id"]))
+    user = upsert_telegram_user(user_payload)
+    return _issue_auth_payload(user, is_new=existing is None)
+
+
+@app.post("/auth/refresh")
+def auth_refresh(
+    payload: RefreshIn,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    raw_token = (payload.refresh_token or "").strip()
+    if not raw_token and credentials and credentials.credentials:
+        raw_token = credentials.credentials
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+    decoded = _decode_token(raw_token)
+    user_id = int(decoded["sub"])
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return _issue_auth_payload(user, is_new=False)
 
 
 @app.get("/auth/me")
 def auth_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     view = get_user_subscription_view(user["id"])
-    return {"ok": True, "user": user, **view}
+    return {"ok": True, "user": user, **view, "language": user.get("language") or "ru"}
+
+
+@app.post("/auth/logout")
+def auth_logout(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    return {"ok": True, "logged_out": True, "user_id": user["id"]}
 
 
 @app.patch("/users/me/language")
 def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     updated = set_user_language(user["id"], payload.language)
     return {"ok": True, "user": updated}
+
+
+@app.get("/app/config")
+def app_config() -> Dict[str, Any]:
+    return {
+        "app_name": settings.APP_NAME,
+        "support_url": settings.SUPPORT_TELEGRAM_URL,
+        "bot_url": _bot_public_url(),
+        "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
+        "payments_enabled": settings.PAYMENTS_ENABLED,
+        "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
+        "feature_flags": {
+            "auth_refresh": True,
+            "auth_logout": True,
+            "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
+            "payments_enabled": settings.PAYMENTS_ENABLED,
+            "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
+            "settings_editable": settings.VPN_SETTINGS_EDITABLE,
+        },
+    }
 
 
 @app.get("/plans")
