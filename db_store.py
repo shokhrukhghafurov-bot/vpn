@@ -881,53 +881,98 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
             return [dict(row) for row in cur.fetchall()]
 
 
-def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = dict(payload)
+def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_status: str = "offline") -> Dict[str, Any]:
+    data = dict(payload or {})
     data["code"] = str(data.get("code") or "").strip()
     data["name_ru"] = str(data.get("name_ru") or "").strip()
     data["name_en"] = str(data.get("name_en") or data.get("name_ru") or "").strip()
     country_code = data.get("country_code")
     data["country_code"] = str(country_code).strip().upper() or None if country_code is not None else None
-    data["status"] = str(data.get("status") or "offline").strip() or "offline"
+    data["status"] = str(data.get("status") or default_status).strip().lower() or default_status
+    if data["status"] not in {"online", "offline", "reserve"}:
+        data["status"] = default_status
     try:
         data["sort_order"] = int(data.get("sort_order") or 100)
     except (TypeError, ValueError):
         data["sort_order"] = 100
+    data["is_active"] = bool(data.get("is_active", True))
+    data["is_recommended"] = bool(data.get("is_recommended", False))
+    data["is_reserve"] = bool(data.get("is_reserve", False))
     vpn_payload = _normalize_vpn_payload_keys(data.get("vpn_payload") or {})
     if data["code"] and not vpn_payload.get("location_code"):
         vpn_payload["location_code"] = data["code"]
     if data["name_en"] and not vpn_payload.get("remark"):
         vpn_payload["remark"] = data["name_en"]
-    data["vpn_payload"] = Jsonb(vpn_payload)
+    data["vpn_payload"] = vpn_payload
+    return data
+
+
+
+def _insert_or_upsert_location(cur: psycopg.Cursor, data: Dict[str, Any]) -> Dict[str, Any]:
+    db_data = dict(data)
+    db_data["vpn_payload"] = Jsonb(db_data.get("vpn_payload") or {})
+    cur.execute(
+        """
+        INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
+        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
+        ON CONFLICT (code) DO UPDATE SET
+            name_ru = EXCLUDED.name_ru,
+            name_en = EXCLUDED.name_en,
+            country_code = EXCLUDED.country_code,
+            is_active = EXCLUDED.is_active,
+            is_recommended = EXCLUDED.is_recommended,
+            is_reserve = EXCLUDED.is_reserve,
+            status = EXCLUDED.status,
+            sort_order = EXCLUDED.sort_order,
+            vpn_payload = EXCLUDED.vpn_payload,
+            is_deleted = FALSE,
+            location_source = EXCLUDED.location_source,
+            updated_at = NOW()
+        RETURNING *
+        """,
+        db_data,
+    )
+    row = cur.fetchone()
+    if not row:
+        raise ValueError("Location was not saved")
+    return dict(row)
+
+
+
+def _is_locations_sequence_conflict(exc: Exception) -> bool:
+    text = str(exc).lower()
+    constraint_name = str(getattr(getattr(exc, "diag", None), "constraint_name", "") or "").lower()
+    return (
+        "duplicate key value violates unique constraint" in text
+        and ("locations_pkey" in text or constraint_name == "locations_pkey")
+    )
+
+
+
+def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
+    data = _normalize_location_mutation_payload(payload)
+    if not data["code"]:
+        raise ValueError("code is required")
+    if not data["name_ru"]:
+        raise ValueError("name_ru is required")
+    if not data["name_en"]:
+        raise ValueError("name_en is required")
     data["is_deleted"] = False
     data["location_source"] = _normalize_location_source(data.get("location_source") or "admin")
     with db() as conn:
         with conn.cursor() as cur:
-            _resync_serial_sequence(cur, "locations")
-            cur.execute(
-                """
-                INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
-                VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
-                ON CONFLICT (code) DO UPDATE SET
-                    name_ru = EXCLUDED.name_ru,
-                    name_en = EXCLUDED.name_en,
-                    country_code = EXCLUDED.country_code,
-                    is_active = EXCLUDED.is_active,
-                    is_recommended = EXCLUDED.is_recommended,
-                    is_reserve = EXCLUDED.is_reserve,
-                    status = EXCLUDED.status,
-                    sort_order = EXCLUDED.sort_order,
-                    vpn_payload = EXCLUDED.vpn_payload,
-                    is_deleted = FALSE,
-                    location_source = EXCLUDED.location_source,
-                    updated_at = NOW()
-                RETURNING *
-                """,
-                data,
-            )
-            row = cur.fetchone()
+            try:
+                _resync_serial_sequence(cur, "locations")
+                row = _insert_or_upsert_location(cur, data)
+            except psycopg.Error as exc:
+                conn.rollback()
+                if not _is_locations_sequence_conflict(exc):
+                    raise
+                with conn.cursor() as retry_cur:
+                    _resync_serial_sequence(retry_cur, "locations")
+                    row = _insert_or_upsert_location(retry_cur, data)
         conn.commit()
-    return dict(row)
+    return row
 
 
 def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
