@@ -848,8 +848,11 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    item = create_location(payload.model_dump())
-    return {"ok": True, "item": serialize_location(item, include_payload=True)}
+    try:
+        item = create_location(payload.model_dump())
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
