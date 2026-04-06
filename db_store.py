@@ -240,16 +240,15 @@ POST_MIGRATION_SQL = [
 ]
 
 SERIAL_ID_TABLES = (
-    "users",
-    "plans",
-    "subscriptions",
-    "devices",
-    "locations",
-    "payments",
-    "auth_codes",
-    "admin_notes",
-    "bot_notifications",
-    "bot_error_log",
+    ("users", "id"),
+    ("plans", "id"),
+    ("subscriptions", "id"),
+    ("devices", "id"),
+    ("locations", "id"),
+    ("admin_notes", "id"),
+    ("manual_extensions", "id"),
+    ("bot_notifications", "id"),
+    ("bot_error_log", "id"),
 )
 
 
@@ -262,6 +261,22 @@ def _run_schema_migrations(cur: psycopg.Cursor) -> None:
 
 
 def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: str = "id") -> None:
+    cur.execute(
+        """
+        SELECT EXISTS (
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = current_schema()
+              AND table_name = %s
+              AND column_name = %s
+        ) AS column_exists
+        """,
+        (table_name, column_name),
+    )
+    column_row = cur.fetchone() or {}
+    if not column_row.get("column_exists"):
+        return
+
     cur.execute("SELECT pg_get_serial_sequence(%s, %s) AS sequence_name", (table_name, column_name))
     row = cur.fetchone()
     if not row:
@@ -282,8 +297,8 @@ def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: s
 
 
 def _resync_serial_sequences(cur: psycopg.Cursor) -> None:
-    for table_name in SERIAL_ID_TABLES:
-        _resync_serial_sequence(cur, table_name)
+    for table_name, column_name in SERIAL_ID_TABLES:
+        _resync_serial_sequence(cur, table_name, column_name)
 
 
 def now_utc() -> datetime:
