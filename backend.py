@@ -1,4 +1,6 @@
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
+from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import html
@@ -328,6 +330,105 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
+@lru_cache(maxsize=1)
+def _mobile_tun_runtime_matrix() -> Dict[str, Dict[str, Any]]:
+    repo_root = Path(__file__).resolve().parent.parent
+
+    android_runtime = {
+        "runtime_adapter": repo_root / "android/app/src/main/kotlin/com/example/inet_app/vpn/libbox/runtime/OfficialLibboxAndroidRuntime.kt",
+        "runtime_factory": repo_root / "android/app/src/main/kotlin/com/example/inet_app/vpn/libbox/LibboxRuntimeFactory.kt",
+        "runtime_binary": repo_root / "android/app/libs/libbox.aar",
+    }
+    ios_runtime = {
+        "packet_tunnel": repo_root / "ios/PacketTunnel/PacketTunnelProvider.swift",
+        "runtime_adapter": repo_root / "ios/PacketTunnel/libbox/runtime/OfficialLibboxAppleRuntime.swift",
+        "runtime_binary": repo_root / "ios/Frameworks/Libbox.xcframework",
+    }
+
+    def summarize(paths: Dict[str, Path], *, platform: str) -> Dict[str, Any]:
+        present = {name: path.exists() for name, path in paths.items()}
+        ready = all(present.values())
+        missing = [name for name, exists in present.items() if not exists]
+        if ready:
+            summary = "runtime bundled"
+        elif platform == "ios" and present.get("packet_tunnel") and present.get("runtime_adapter") and not present.get("runtime_binary"):
+            summary = "source wired, build Libbox.xcframework"
+        elif platform == "android" and present.get("runtime_adapter") and present.get("runtime_factory") and not present.get("runtime_binary"):
+            summary = "code wired, libbox.aar missing"
+        else:
+            summary = "missing: " + ", ".join(missing) if missing else "not ready"
+        return {
+            "ready": ready,
+            "summary": summary,
+            "present": present,
+        }
+
+    return {
+        "android": summarize(android_runtime, platform="android"),
+        "ios": summarize(ios_runtime, platform="ios"),
+    }
+
+
+def _location_tun_status(row: Dict[str, Any], resolved_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    matrix = _mobile_tun_runtime_matrix()
+    payload_ready = bool(resolved_payload) and _config_is_complete(resolved_payload)
+    is_active = bool(row.get("is_active"))
+    location_status = str(row.get("status") or "offline").strip().lower()
+    live_status = location_status == "online"
+
+    def build(platform: str) -> Dict[str, Any]:
+        runtime = matrix[platform]
+        if not payload_ready:
+            return {
+                "state": "err",
+                "label": "payload incomplete",
+                "can_connect": False,
+                "reason": "нужны server/port/uuid в effective payload",
+                "runtime_ready": runtime["ready"],
+                "runtime_summary": runtime["summary"],
+            }
+        if not runtime["ready"]:
+            return {
+                "state": "err",
+                "label": "build/runtime missing",
+                "can_connect": False,
+                "reason": runtime["summary"],
+                "runtime_ready": runtime["ready"],
+                "runtime_summary": runtime["summary"],
+            }
+        if not is_active:
+            return {
+                "state": "warn",
+                "label": "disabled in admin",
+                "can_connect": False,
+                "reason": "location is_active=false",
+                "runtime_ready": runtime["ready"],
+                "runtime_summary": runtime["summary"],
+            }
+        if not live_status:
+            return {
+                "state": "warn",
+                "label": "node offline",
+                "can_connect": False,
+                "reason": f"location status={location_status or 'offline'}",
+                "runtime_ready": runtime["ready"],
+                "runtime_summary": runtime["summary"],
+            }
+        return {
+            "state": "ok",
+            "label": "TUN ready",
+            "can_connect": True,
+            "reason": runtime["summary"],
+            "runtime_ready": runtime["ready"],
+            "runtime_summary": runtime["summary"],
+        }
+
+    return {
+        "android": build("android"),
+        "ios": build("ios"),
+    }
+
+
 def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
     item = dict(row)
     raw_vpn_payload = item.pop("vpn_payload", None)
@@ -341,8 +442,9 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
+    resolved_payload = _compose_vpn_payload_for_location(dict(row))
+    item["tun_status"] = _location_tun_status(item, resolved_payload)
     if include_payload:
-        resolved_payload = _compose_vpn_payload_for_location(dict(row))
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
         item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
