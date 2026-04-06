@@ -252,17 +252,16 @@ POST_MIGRATION_SQL = [
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
 ]
 
-SERIAL_ID_TABLES = (
-    "users",
-    "plans",
-    "subscriptions",
-    "devices",
-    "locations",
-    "payments",
-    "auth_codes",
-    "admin_notes",
-    "bot_notifications",
-    "bot_error_log",
+SERIAL_SEQUENCE_TARGETS = (
+    ("users", "id"),
+    ("plans", "id"),
+    ("subscriptions", "id"),
+    ("devices", "id"),
+    ("locations", "id"),
+    ("admin_notes", "id"),
+    ("manual_extensions", "id"),
+    ("bot_notifications", "id"),
+    ("bot_error_log", "id"),
 )
 
 
@@ -274,7 +273,24 @@ def _run_schema_migrations(cur: psycopg.Cursor) -> None:
         cur.execute(statement)
 
 
+def _table_has_column(cur: psycopg.Cursor, table_name: str, column_name: str) -> bool:
+    cur.execute(
+        """
+        SELECT 1
+        FROM information_schema.columns
+        WHERE table_schema = CURRENT_SCHEMA()
+          AND table_name = %s
+          AND column_name = %s
+        LIMIT 1
+        """,
+        (table_name, column_name),
+    )
+    return bool(cur.fetchone())
+
+
 def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: str = "id") -> None:
+    if not _table_has_column(cur, table_name, column_name):
+        return
     cur.execute("SELECT pg_get_serial_sequence(%s, %s) AS sequence_name", (table_name, column_name))
     row = cur.fetchone()
     if not row:
@@ -295,8 +311,8 @@ def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: s
 
 
 def _resync_serial_sequences(cur: psycopg.Cursor) -> None:
-    for table_name in SERIAL_ID_TABLES:
-        _resync_serial_sequence(cur, table_name)
+    for table_name, column_name in SERIAL_SEQUENCE_TARGETS:
+        _resync_serial_sequence(cur, table_name, column_name)
 
 
 def now_utc() -> datetime:
