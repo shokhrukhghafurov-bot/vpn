@@ -150,6 +150,13 @@ CREATE TABLE IF NOT EXISTS bot_error_log (
     error_message TEXT NOT NULL,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS vpn_runtime_settings (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
 """
 
 MIGRATION_SQL = [
@@ -209,6 +216,11 @@ MIGRATION_SQL = [
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS context TEXT",
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
+    # runtime settings
+    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
+    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+
     # indexes compatible with old databases
     "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
@@ -237,18 +249,20 @@ POST_MIGRATION_SQL = [
     "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL OR currency = ''",
     "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
+    "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
 ]
 
 SERIAL_ID_TABLES = (
-    ("users", "id"),
-    ("plans", "id"),
-    ("subscriptions", "id"),
-    ("devices", "id"),
-    ("locations", "id"),
-    ("admin_notes", "id"),
-    ("manual_extensions", "id"),
-    ("bot_notifications", "id"),
-    ("bot_error_log", "id"),
+    "users",
+    "plans",
+    "subscriptions",
+    "devices",
+    "locations",
+    "payments",
+    "auth_codes",
+    "admin_notes",
+    "bot_notifications",
+    "bot_error_log",
 )
 
 
@@ -261,22 +275,6 @@ def _run_schema_migrations(cur: psycopg.Cursor) -> None:
 
 
 def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: str = "id") -> None:
-    cur.execute(
-        """
-        SELECT EXISTS (
-            SELECT 1
-            FROM information_schema.columns
-            WHERE table_schema = current_schema()
-              AND table_name = %s
-              AND column_name = %s
-        ) AS column_exists
-        """,
-        (table_name, column_name),
-    )
-    column_row = cur.fetchone() or {}
-    if not column_row.get("column_exists"):
-        return
-
     cur.execute("SELECT pg_get_serial_sequence(%s, %s) AS sequence_name", (table_name, column_name))
     row = cur.fetchone()
     if not row:
@@ -297,8 +295,8 @@ def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: s
 
 
 def _resync_serial_sequences(cur: psycopg.Cursor) -> None:
-    for table_name, column_name in SERIAL_ID_TABLES:
-        _resync_serial_sequence(cur, table_name, column_name)
+    for table_name in SERIAL_ID_TABLES:
+        _resync_serial_sequence(cur, table_name)
 
 
 def now_utc() -> datetime:
@@ -316,6 +314,7 @@ def bootstrap() -> None:
             _run_schema_migrations(cur)
             _resync_serial_sequences(cur)
         conn.commit()
+    apply_runtime_settings_overrides()
     sync_plans_from_env()
     sync_locations_catalog()
 
@@ -325,22 +324,241 @@ def sync_plans_from_env() -> None:
         with conn.cursor() as cur:
             for plan in settings.plan_definitions():
                 cur.execute(
-                    """
-                    INSERT INTO plans (code, name_ru, name_en, price_rub, duration_days, device_limit, is_active, source_env_key)
-                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(price_rub)s, %(duration_days)s, %(device_limit)s, %(is_active)s, %(source_env_key)s)
-                    ON CONFLICT (code) DO UPDATE SET
-                        name_ru = EXCLUDED.name_ru,
-                        name_en = EXCLUDED.name_en,
-                        price_rub = EXCLUDED.price_rub,
-                        duration_days = EXCLUDED.duration_days,
-                        device_limit = EXCLUDED.device_limit,
-                        is_active = EXCLUDED.is_active,
-                        source_env_key = EXCLUDED.source_env_key,
-                        updated_at = NOW()
-                    """,
-                    plan,
+                    "SELECT id FROM plans WHERE source_env_key = %s LIMIT 1",
+                    (plan["source_env_key"],),
                 )
+                existing = cur.fetchone()
+                if existing:
+                    cur.execute(
+                        """
+                        UPDATE plans
+                        SET code = %(code)s,
+                            name_ru = %(name_ru)s,
+                            name_en = %(name_en)s,
+                            price_rub = %(price_rub)s,
+                            duration_days = %(duration_days)s,
+                            device_limit = %(device_limit)s,
+                            is_active = %(is_active)s,
+                            source_env_key = %(source_env_key)s,
+                            updated_at = NOW()
+                        WHERE id = %(id)s
+                        """,
+                        {**plan, "id": existing["id"]},
+                    )
+                else:
+                    cur.execute(
+                        """
+                        INSERT INTO plans (code, name_ru, name_en, price_rub, duration_days, device_limit, is_active, source_env_key)
+                        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(price_rub)s, %(duration_days)s, %(device_limit)s, %(is_active)s, %(source_env_key)s)
+                        ON CONFLICT (code) DO UPDATE SET
+                            name_ru = EXCLUDED.name_ru,
+                            name_en = EXCLUDED.name_en,
+                            price_rub = EXCLUDED.price_rub,
+                            duration_days = EXCLUDED.duration_days,
+                            device_limit = EXCLUDED.device_limit,
+                            is_active = EXCLUDED.is_active,
+                            source_env_key = EXCLUDED.source_env_key,
+                            updated_at = NOW()
+                        """,
+                        plan,
+                    )
         conn.commit()
+
+
+def _coerce_runtime_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
+def _coerce_runtime_int(value: Any, default: int, minimum: int = 1) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return max(minimum, int(default))
+    return max(minimum, parsed)
+
+
+def _coerce_runtime_str(value: Any, default: str) -> str:
+    text_value = str(value or "").strip()
+    return text_value or default
+
+
+def _coerce_runtime_languages(value: Any, default: List[str]) -> List[str]:
+    if isinstance(value, str):
+        items = [item.strip() for item in value.split(",")]
+    elif isinstance(value, list):
+        items = [str(item).strip() for item in value]
+    else:
+        items = list(default or [])
+    normalized = [item for item in items if item]
+    return normalized or list(default or ["ru", "en"])
+
+
+def _runtime_plan_slot(plan: Dict[str, Any]) -> Optional[str]:
+    source_key = str(plan.get("source_env_key") or "").strip().upper()
+    if source_key == "PLAN_DAILY":
+        return "daily"
+    if source_key == "PLAN_MONTHLY":
+        return "monthly"
+    slot = str(plan.get("slot") or "").strip().lower()
+    return slot or None
+
+
+def _current_runtime_plan_payloads() -> List[Dict[str, Any]]:
+    plans: List[Dict[str, Any]] = []
+    for item in get_all_plans():
+        slot = _runtime_plan_slot(item)
+        if slot not in {"daily", "monthly"}:
+            continue
+        plans.append({
+            "slot": slot,
+            "code": str(item.get("code") or "").strip() or slot,
+            "name_ru": str(item.get("name_ru") or "").strip() or slot,
+            "name_en": str(item.get("name_en") or item.get("name_ru") or "").strip() or slot,
+            "price_rub": _coerce_runtime_int(item.get("price_rub"), 0, minimum=0),
+            "duration_days": _coerce_runtime_int(item.get("duration_days"), 1, minimum=1),
+            "device_limit": _coerce_runtime_int(item.get("device_limit"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1),
+            "is_active": bool(item.get("is_active", True)),
+        })
+    plans.sort(key=lambda item: 0 if item["slot"] == "daily" else 1)
+    return plans
+
+
+def get_runtime_settings_payload() -> Dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT payload FROM vpn_runtime_settings WHERE id = 1")
+            row = cur.fetchone()
+    payload = row.get("payload") if row else {}
+    return dict(payload or {})
+
+
+def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = dict(payload or get_runtime_settings_payload() or {})
+    settings.APP_NAME = _coerce_runtime_str(data.get("app_name"), settings.APP_NAME)
+    settings.APP_ENV = _coerce_runtime_str(data.get("app_env"), settings.APP_ENV)
+    settings.APP_LANGS = _coerce_runtime_languages(data.get("languages"), list(settings.APP_LANGS or ["ru", "en"]))
+    settings.BOT_NAME = _coerce_runtime_str(data.get("bot_name"), settings.BOT_NAME)
+    settings.BOT_USERNAME = _coerce_runtime_str(data.get("bot_username"), settings.BOT_USERNAME)
+    settings.SUPPORT_TELEGRAM_URL = _coerce_runtime_str(data.get("support_telegram_url"), settings.SUPPORT_TELEGRAM_URL)
+    settings.PAYMENTS_ENABLED = _coerce_runtime_bool(data.get("payments_enabled"), settings.PAYMENTS_ENABLED)
+    settings.VPN_MAINTENANCE_MODE = _coerce_runtime_bool(data.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE)
+    settings.VPN_NEW_ACTIVATIONS_ENABLED = _coerce_runtime_bool(data.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED)
+    max_devices = _coerce_runtime_int(data.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
+    default_device_limit = _coerce_runtime_int(data.get("device_limit"), max_devices, minimum=1)
+    settings.VPN_MAX_DEVICES_PER_ACCOUNT = max_devices
+    settings.VPN_DEFAULT_DEVICE_LIMIT = min(default_device_limit, max_devices)
+    settings.VPN_SETTINGS_EDITABLE = True
+
+    plans = data.get("plans") if isinstance(data.get("plans"), list) else _current_runtime_plan_payloads()
+    plan_by_slot = {
+        slot: item
+        for item in plans
+        if isinstance(item, dict) and (slot := _runtime_plan_slot(item)) in {"daily", "monthly"}
+    }
+
+    daily_plan = plan_by_slot.get("daily")
+    if daily_plan:
+        settings.PLAN_DAILY_CODE = _coerce_runtime_str(daily_plan.get("code"), settings.PLAN_DAILY_CODE)
+        settings.PLAN_DAILY_NAME_RU = _coerce_runtime_str(daily_plan.get("name_ru"), settings.PLAN_DAILY_NAME_RU)
+        settings.PLAN_DAILY_NAME_EN = _coerce_runtime_str(daily_plan.get("name_en"), settings.PLAN_DAILY_NAME_EN)
+        settings.PLAN_DAILY_PRICE_RUB = _coerce_runtime_int(daily_plan.get("price_rub"), settings.PLAN_DAILY_PRICE_RUB, minimum=0)
+        settings.PLAN_DAILY_DURATION_DAYS = _coerce_runtime_int(daily_plan.get("duration_days"), settings.PLAN_DAILY_DURATION_DAYS, minimum=1)
+        settings.PLAN_DAILY_DEVICE_LIMIT = min(
+            _coerce_runtime_int(daily_plan.get("device_limit"), settings.PLAN_DAILY_DEVICE_LIMIT, minimum=1),
+            settings.VPN_MAX_DEVICES_PER_ACCOUNT,
+        )
+        daily_active = _coerce_runtime_bool(daily_plan.get("is_active"), settings.PLAN_DAILY_ENABLED and settings.VPN_SHOW_DAILY_PLAN)
+        settings.PLAN_DAILY_ENABLED = daily_active
+        settings.VPN_SHOW_DAILY_PLAN = daily_active
+
+    monthly_plan = plan_by_slot.get("monthly")
+    if monthly_plan:
+        settings.PLAN_MONTHLY_CODE = _coerce_runtime_str(monthly_plan.get("code"), settings.PLAN_MONTHLY_CODE)
+        settings.PLAN_MONTHLY_NAME_RU = _coerce_runtime_str(monthly_plan.get("name_ru"), settings.PLAN_MONTHLY_NAME_RU)
+        settings.PLAN_MONTHLY_NAME_EN = _coerce_runtime_str(monthly_plan.get("name_en"), settings.PLAN_MONTHLY_NAME_EN)
+        settings.PLAN_MONTHLY_PRICE_RUB = _coerce_runtime_int(monthly_plan.get("price_rub"), settings.PLAN_MONTHLY_PRICE_RUB, minimum=0)
+        settings.PLAN_MONTHLY_DURATION_DAYS = _coerce_runtime_int(monthly_plan.get("duration_days"), settings.PLAN_MONTHLY_DURATION_DAYS, minimum=1)
+        settings.PLAN_MONTHLY_DEVICE_LIMIT = min(
+            _coerce_runtime_int(monthly_plan.get("device_limit"), settings.PLAN_MONTHLY_DEVICE_LIMIT, minimum=1),
+            settings.VPN_MAX_DEVICES_PER_ACCOUNT,
+        )
+        monthly_active = _coerce_runtime_bool(monthly_plan.get("is_active"), settings.PLAN_MONTHLY_ENABLED and settings.VPN_SHOW_MONTHLY_PLAN)
+        settings.PLAN_MONTHLY_ENABLED = monthly_active
+        settings.VPN_SHOW_MONTHLY_PLAN = monthly_active
+
+    return data
+
+
+def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = {
+        "app_name": _coerce_runtime_str(payload.get("app_name"), settings.APP_NAME),
+        "app_env": _coerce_runtime_str(payload.get("app_env"), settings.APP_ENV),
+        "languages": _coerce_runtime_languages(payload.get("languages"), list(settings.APP_LANGS or ["ru", "en"])),
+        "bot_name": _coerce_runtime_str(payload.get("bot_name"), settings.BOT_NAME),
+        "bot_username": _coerce_runtime_str(payload.get("bot_username"), settings.BOT_USERNAME),
+        "support_telegram_url": _coerce_runtime_str(payload.get("support_telegram_url"), settings.SUPPORT_TELEGRAM_URL),
+        "payments_enabled": _coerce_runtime_bool(payload.get("payments_enabled"), settings.PAYMENTS_ENABLED),
+        "maintenance_mode": _coerce_runtime_bool(payload.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE),
+        "new_activations_enabled": _coerce_runtime_bool(payload.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED),
+    }
+    max_devices = _coerce_runtime_int(payload.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
+    normalized["max_devices_per_account"] = max_devices
+    normalized["device_limit"] = min(
+        _coerce_runtime_int(payload.get("device_limit"), max_devices, minimum=1),
+        max_devices,
+    )
+
+    plans_input = payload.get("plans") if isinstance(payload.get("plans"), list) else _current_runtime_plan_payloads()
+    normalized_plans: List[Dict[str, Any]] = []
+    for slot in ("daily", "monthly"):
+        raw_plan = next((item for item in plans_input if isinstance(item, dict) and _runtime_plan_slot(item) == slot), None) or {}
+        base_code = settings.PLAN_DAILY_CODE if slot == "daily" else settings.PLAN_MONTHLY_CODE
+        base_name_ru = settings.PLAN_DAILY_NAME_RU if slot == "daily" else settings.PLAN_MONTHLY_NAME_RU
+        base_name_en = settings.PLAN_DAILY_NAME_EN if slot == "daily" else settings.PLAN_MONTHLY_NAME_EN
+        base_price = settings.PLAN_DAILY_PRICE_RUB if slot == "daily" else settings.PLAN_MONTHLY_PRICE_RUB
+        base_duration = settings.PLAN_DAILY_DURATION_DAYS if slot == "daily" else settings.PLAN_MONTHLY_DURATION_DAYS
+        base_limit = settings.PLAN_DAILY_DEVICE_LIMIT if slot == "daily" else settings.PLAN_MONTHLY_DEVICE_LIMIT
+        base_active = (settings.PLAN_DAILY_ENABLED and settings.VPN_SHOW_DAILY_PLAN) if slot == "daily" else (settings.PLAN_MONTHLY_ENABLED and settings.VPN_SHOW_MONTHLY_PLAN)
+        name_ru = _coerce_runtime_str(raw_plan.get("name_ru"), base_name_ru)
+        name_en = _coerce_runtime_str(raw_plan.get("name_en"), raw_plan.get("name_ru") or base_name_en)
+        normalized_plans.append({
+            "slot": slot,
+            "code": _coerce_runtime_str(raw_plan.get("code"), base_code),
+            "name_ru": name_ru,
+            "name_en": name_en,
+            "price_rub": _coerce_runtime_int(raw_plan.get("price_rub"), base_price, minimum=0),
+            "duration_days": _coerce_runtime_int(raw_plan.get("duration_days"), base_duration, minimum=1),
+            "device_limit": min(_coerce_runtime_int(raw_plan.get("device_limit"), base_limit, minimum=1), max_devices),
+            "is_active": _coerce_runtime_bool(raw_plan.get("is_active"), base_active),
+        })
+    normalized["plans"] = normalized_plans
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO vpn_runtime_settings (id, payload, updated_at)
+                VALUES (1, %s, NOW())
+                ON CONFLICT (id) DO UPDATE SET
+                    payload = EXCLUDED.payload,
+                    updated_at = NOW()
+                """,
+                (Jsonb(normalized),),
+            )
+        conn.commit()
+    apply_runtime_settings_overrides(normalized)
+    sync_plans_from_env()
+    return normalized
 
 
 def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
@@ -1692,6 +1910,13 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
 
 
 def settings_snapshot() -> Dict[str, Any]:
+    plans = []
+    for item in get_all_plans():
+        row = dict(item)
+        slot = _runtime_plan_slot(row)
+        if slot:
+            row["slot"] = slot
+        plans.append(row)
     return {
         "app_name": settings.APP_NAME,
         "app_env": settings.APP_ENV,
@@ -1710,9 +1935,9 @@ def settings_snapshot() -> Dict[str, Any]:
         "open_app_url": settings.OPEN_APP_URL,
         "android_app_url": settings.ANDROID_APP_URL,
         "ios_app_url": settings.IOS_APP_URL,
-        "settings_editable": settings.VPN_SETTINGS_EDITABLE,
+        "settings_editable": True,
         "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
-        "plans": get_all_plans(),
+        "plans": plans,
     }
 
 
