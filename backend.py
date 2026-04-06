@@ -52,6 +52,7 @@ from db_store import (
     set_user_language,
     set_user_status_by_telegram,
     settings_snapshot,
+    save_runtime_settings_payload,
     sync_plans_from_env,
     upsert_telegram_user,
     update_payment,
@@ -175,6 +176,32 @@ class VpnClientEventIn(BaseModel):
     location_code: Optional[str] = None
     error_message: Optional[str] = None
     details: Optional[str] = None
+
+
+class AdminPlanSettingsIn(BaseModel):
+    slot: str
+    code: str
+    name_ru: str
+    name_en: Optional[str] = None
+    price_rub: int = Field(default=0, ge=0)
+    duration_days: int = Field(default=1, ge=1)
+    device_limit: int = Field(default=1, ge=1)
+    is_active: bool = True
+
+
+class AdminVpnSettingsIn(BaseModel):
+    app_name: str
+    app_env: str = "production"
+    languages: List[str] = Field(default_factory=lambda: ["ru", "en"])
+    bot_name: str
+    bot_username: str
+    support_telegram_url: str
+    payments_enabled: bool = False
+    maintenance_mode: bool = False
+    new_activations_enabled: bool = True
+    max_devices_per_account: int = Field(default=1, ge=1)
+    device_limit: Optional[int] = Field(default=None, ge=1)
+    plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
 
 @app.on_event("startup")
@@ -800,7 +827,7 @@ def app_config() -> Dict[str, Any]:
             "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
             "payments_enabled": settings.PAYMENTS_ENABLED,
             "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
-            "settings_editable": settings.VPN_SETTINGS_EDITABLE,
+            "settings_editable": True,
         },
     }
 
@@ -1103,16 +1130,14 @@ def admin_settings(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 
 
 @app.post("/api/infra/admin/vpn/settings")
-def admin_settings_save(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+def admin_settings_save(payload: AdminVpnSettingsIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    if not settings.VPN_SETTINGS_EDITABLE:
-        return {
-            "ok": False,
-            "read_only": True,
-            "message": "Settings are loaded from Railway env. Change env values and redeploy.",
-            "settings": settings_snapshot(),
-        }
-    return {"ok": True, "message": "Editable mode is enabled, but env-first mode is recommended.", "settings": settings_snapshot()}
+    save_runtime_settings_payload(payload.model_dump(exclude_none=True))
+    return {
+        "ok": True,
+        "message": "Settings saved to database and applied immediately.",
+        "settings": settings_snapshot(),
+    }
 
 
 
