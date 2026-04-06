@@ -1,6 +1,4 @@
 from datetime import datetime, timedelta, timezone
-from functools import lru_cache
-from pathlib import Path
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 import html
@@ -170,6 +168,15 @@ class TestSendIn(BaseModel):
     text: str
 
 
+class VpnClientEventIn(BaseModel):
+    platform: str
+    stage: str = "runtime"
+    status: Optional[str] = None
+    location_code: Optional[str] = None
+    error_message: Optional[str] = None
+    details: Optional[str] = None
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     bootstrap()
@@ -330,103 +337,206 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
 
 
 
-@lru_cache(maxsize=1)
-def _mobile_tun_runtime_matrix() -> Dict[str, Dict[str, Any]]:
-    repo_root = Path(__file__).resolve().parent.parent
+def _diagnostic_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
-    android_runtime = {
-        "runtime_adapter": repo_root / "android/app/src/main/kotlin/com/example/inet_app/vpn/libbox/runtime/OfficialLibboxAndroidRuntime.kt",
-        "runtime_factory": repo_root / "android/app/src/main/kotlin/com/example/inet_app/vpn/libbox/LibboxRuntimeFactory.kt",
-        "runtime_binary": repo_root / "android/app/libs/libbox.aar",
-    }
-    ios_runtime = {
-        "packet_tunnel": repo_root / "ios/PacketTunnel/PacketTunnelProvider.swift",
-        "runtime_adapter": repo_root / "ios/PacketTunnel/libbox/runtime/OfficialLibboxAppleRuntime.swift",
-        "runtime_binary": repo_root / "ios/Frameworks/Libbox.xcframework",
+
+
+def _diagnostic_bool(value: Any) -> Optional[bool]:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return None
+
+
+
+def _diagnostic_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
+
+
+
+def _diagnostic_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
+    return []
+
+
+
+def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str) -> Dict[str, Any]:
+    issues: List[str] = []
+    fixes: List[str] = []
+
+    server = _diagnostic_text(payload.get("server"))
+    port = _diagnostic_int(payload.get("port"))
+    uuid = _diagnostic_text(payload.get("uuid"))
+    security = _diagnostic_text(payload.get("security") or "reality").lower() or "reality"
+    transport = _diagnostic_text(payload.get("transport") or payload.get("network") or "tcp").lower() or "tcp"
+    sni = _diagnostic_text(payload.get("server_name") or payload.get("sni"))
+    public_key = _diagnostic_text(payload.get("public_key") or payload.get("publicKey"))
+    short_id = _diagnostic_text(payload.get("short_id") or payload.get("shortId"))
+    service_name = _diagnostic_text(payload.get("service_name") or payload.get("serviceName"))
+    path = _diagnostic_text(payload.get("path"))
+    connect_mode = _diagnostic_text(payload.get("connect_mode") or "tun").lower() or "tun"
+    full_tunnel = _diagnostic_bool(payload.get("full_tunnel"))
+    dns_servers = _diagnostic_string_list(payload.get("dns_servers") or payload.get("dnsServers"))
+
+    if not payload:
+        issues.append("vpn_payload is empty")
+        fixes.append("Open Edit payload and fill server, port, uuid, and Reality fields.")
+
+    if not server:
+        issues.append("server is missing")
+    if port <= 0:
+        issues.append("port is missing")
+    if not uuid:
+        issues.append("uuid is missing")
+
+    if any(issue in {"server is missing", "port is missing", "uuid is missing"} for issue in issues):
+        fixes.append("Set server/port/uuid in effective payload.")
+
+    if security == "reality":
+        if not public_key:
+            issues.append("Reality public_key is missing")
+        if not sni:
+            issues.append("Reality server_name / sni is missing")
+        if not short_id:
+            issues.append("Reality short_id is missing")
+        if any(issue.startswith("Reality ") for issue in issues):
+            fixes.append("For Reality fill public_key, short_id, and server_name/sni.")
+
+    if transport in {"grpc"} and not service_name:
+        issues.append("gRPC service_name is missing")
+        fixes.append("Set service_name for gRPC transport.")
+
+    if transport in {"ws", "websocket"} and not path:
+        issues.append("WebSocket path is missing")
+        fixes.append("Set path for WebSocket transport.")
+
+    if connect_mode != "tun":
+        issues.append(f"connect_mode must be tun, got {connect_mode or 'empty'}")
+        fixes.append("Set connect_mode=tun.")
+
+    if full_tunnel is False:
+        issues.append("full_tunnel is disabled")
+        fixes.append("Set full_tunnel=true for full-device routing.")
+
+    if not dns_servers:
+        issues.append("dns_servers is empty")
+        fixes.append("Add dns_servers, for example 1.1.1.1 and 8.8.8.8.")
+
+    fatal_prefixes = (
+        "vpn_payload is empty",
+        "server is missing",
+        "port is missing",
+        "uuid is missing",
+        "Reality public_key is missing",
+        "Reality server_name / sni is missing",
+        "Reality short_id is missing",
+        "connect_mode must be tun",
+    )
+    fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
+
+    if fatal_issues:
+        status = "error"
+        label = f"{platform_label}: payload incomplete"
+    elif issues:
+        status = "warning"
+        label = f"{platform_label}: check payload"
+    else:
+        status = "ready"
+        label = f"{platform_label}: ready"
+
+    if not issues and not _config_is_complete(payload):
+        status = "error"
+        label = f"{platform_label}: payload incomplete"
+        issues.append("effective payload is incomplete")
+        fixes.append("Fill required fields in effective payload.")
+
+    unique_fixes = list(dict.fromkeys([item for item in fixes if item]))
+    return {
+        "status": status,
+        "label": label,
+        "issues": issues,
+        "fixes": unique_fixes,
     }
 
-    def summarize(paths: Dict[str, Path], *, platform: str) -> Dict[str, Any]:
-        present = {name: path.exists() for name, path in paths.items()}
-        ready = all(present.values())
-        missing = [name for name, exists in present.items() if not exists]
-        if ready:
-            summary = "runtime bundled"
-        elif platform == "ios" and present.get("packet_tunnel") and present.get("runtime_adapter") and not present.get("runtime_binary"):
-            summary = "source wired, build Libbox.xcframework"
-        elif platform == "android" and present.get("runtime_adapter") and present.get("runtime_factory") and not present.get("runtime_binary"):
-            summary = "code wired, libbox.aar missing"
-        else:
-            summary = "missing: " + ", ".join(missing) if missing else "not ready"
-        return {
-            "ready": ready,
-            "summary": summary,
-            "present": present,
-        }
+
+
+def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = resolved_payload if isinstance(resolved_payload, dict) else _compose_vpn_payload_for_location(dict(row))
+    android = _build_tun_platform_diagnostics(payload, "Android")
+    ios = _build_tun_platform_diagnostics(payload, "iOS")
+
+    summary_status = "ready"
+    if android["status"] == "error" or ios["status"] == "error":
+        summary_status = "error"
+    elif android["status"] == "warning" or ios["status"] == "warning":
+        summary_status = "warning"
+
+    issues = list(dict.fromkeys(android.get("issues", []) + ios.get("issues", [])))
+    fixes = list(dict.fromkeys(android.get("fixes", []) + ios.get("fixes", [])))
+    if summary_status == "ready":
+        summary_text = "TUN payload is ready for Android and iOS."
+    else:
+        summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
 
     return {
-        "android": summarize(android_runtime, platform="android"),
-        "ios": summarize(ios_runtime, platform="ios"),
+        "summary_status": summary_status,
+        "summary_text": summary_text,
+        "issues": issues,
+        "fixes": fixes,
+        "android": android,
+        "ios": ios,
     }
 
 
-def _location_tun_status(row: Dict[str, Any], resolved_payload: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
-    matrix = _mobile_tun_runtime_matrix()
-    payload_ready = bool(resolved_payload) and _config_is_complete(resolved_payload)
-    is_active = bool(row.get("is_active"))
-    location_status = str(row.get("status") or "offline").strip().lower()
-    live_status = location_status == "online"
 
-    def build(platform: str) -> Dict[str, Any]:
-        runtime = matrix[platform]
-        if not payload_ready:
-            return {
-                "state": "err",
-                "label": "payload incomplete",
-                "can_connect": False,
-                "reason": "нужны server/port/uuid в effective payload",
-                "runtime_ready": runtime["ready"],
-                "runtime_summary": runtime["summary"],
-            }
-        if not runtime["ready"]:
-            return {
-                "state": "err",
-                "label": "build/runtime missing",
-                "can_connect": False,
-                "reason": runtime["summary"],
-                "runtime_ready": runtime["ready"],
-                "runtime_summary": runtime["summary"],
-            }
-        if not is_active:
-            return {
-                "state": "warn",
-                "label": "disabled in admin",
-                "can_connect": False,
-                "reason": "location is_active=false",
-                "runtime_ready": runtime["ready"],
-                "runtime_summary": runtime["summary"],
-            }
-        if not live_status:
-            return {
-                "state": "warn",
-                "label": "node offline",
-                "can_connect": False,
-                "reason": f"location status={location_status or 'offline'}",
-                "runtime_ready": runtime["ready"],
-                "runtime_summary": runtime["summary"],
-            }
-        return {
-            "state": "ok",
-            "label": "TUN ready",
-            "can_connect": True,
-            "reason": runtime["summary"],
-            "runtime_ready": runtime["ready"],
-            "runtime_summary": runtime["summary"],
-        }
+def _location_error_created_at(row: Dict[str, Any]) -> str:
+    for key in ("updated_at", "created_at"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat()
+        text = _diagnostic_text(value)
+        if text:
+            return text
+    return datetime.now(timezone.utc).isoformat()
 
-    return {
-        "android": build("android"),
-        "ios": build("ios"),
-    }
+
+
+def build_location_tun_error_items() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for row in list_locations(active_only=False):
+        diagnostics = build_location_tun_diagnostics(row)
+        if diagnostics.get("summary_status") == "ready":
+            continue
+        code = _diagnostic_text(row.get("code")) or "unknown"
+        issues = diagnostics.get("issues", [])
+        fixes = diagnostics.get("fixes", [])
+        message_parts = []
+        if issues:
+            message_parts.append("Issues: " + " | ".join(issues[:4]))
+        if fixes:
+            message_parts.append("Fix: " + " | ".join(fixes[:3]))
+        items.append({
+            "created_at": _location_error_created_at(row),
+            "source": f"vpn-location:{code}",
+            "context": diagnostics.get("summary_status") or "error",
+            "error_message": " || ".join(message_parts) or (diagnostics.get("summary_text") or "TUN payload needs attention."),
+        })
+    return items
+
 
 
 def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
@@ -442,12 +552,12 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
-    resolved_payload = _compose_vpn_payload_for_location(dict(row))
-    item["tun_status"] = _location_tun_status(item, resolved_payload)
     if include_payload:
+        resolved_payload = _compose_vpn_payload_for_location(dict(row))
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
         item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
+        item["tun_diagnostics"] = build_location_tun_diagnostics(row, resolved_payload=resolved_payload)
     return item
 
 
@@ -1051,7 +1161,26 @@ def admin_broadcast(payload: BroadcastIn, admin_name: str = Depends(require_admi
     return {"ok": True, "sent": sent, "failed": failed, "total": sent + failed}
 
 
+@app.post("/vpn/client-events")
+def vpn_client_events(payload: VpnClientEventIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    platform = _diagnostic_text(payload.platform).lower() or "unknown"
+    stage = _diagnostic_text(payload.stage).lower() or "runtime"
+    status = _diagnostic_text(payload.status).lower()
+    location_code = _diagnostic_text(payload.location_code)
+    user_label = str(user.get("telegram_id") or user.get("id") or "unknown")
+    context_parts = [f"user={user_label}"]
+    if location_code:
+        context_parts.append(f"location={location_code}")
+    if status:
+        context_parts.append(f"status={status}")
+    message = _diagnostic_text(payload.error_message) or _diagnostic_text(payload.details) or f"Client VPN event: {stage}"
+    record_bot_error(f"vpn-client-{platform}-{stage}", " | ".join(context_parts), message)
+    return {"ok": True}
+
+
 @app.get("/api/infra/admin/vpn/errors")
 def admin_errors(limit: int = Query(default=50, ge=1, le=500), admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "items": list_bot_errors(limit=limit)}
+    items = list_bot_errors(limit=limit) + build_location_tun_error_items()
+    items.sort(key=lambda item: _diagnostic_text(item.get("created_at")) or "", reverse=True)
+    return {"ok": True, "items": items[:limit]}
