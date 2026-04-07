@@ -890,7 +890,7 @@ def locations() -> Dict[str, Any]:
 
 @app.get("/locations/status")
 def locations_status() -> Dict[str, Any]:
-    rows = list_locations(active_only=False)
+    rows = list_locations(active_only=True)
     return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in rows]}
 
 
