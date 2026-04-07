@@ -973,26 +973,49 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     if not rows:
         return None
 
-    def candidates(predicate) -> List[Dict[str, Any]]:
-        return [row for row in rows if predicate(row) and _compose_vpn_payload_for_location(row)]
+    excluded = {"auto-fastest", "auto-reserve"}
+    preferred_main_codes = ["ru-lte"]
+    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2"]
+
+    def is_online(row: Dict[str, Any]) -> bool:
+        return str(row.get("status") or "").strip().lower() == "online"
+
+    def with_payload(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [row for row in items if row.get("code") not in excluded and _compose_vpn_payload_for_location(row)]
+
+    def by_codes(codes: List[str]) -> List[Dict[str, Any]]:
+        order = {code_item: idx for idx, code_item in enumerate(codes)}
+        found = [row for row in rows if is_online(row) and str(row.get("code") or "") in order]
+        return sorted(with_payload(found), key=lambda row: order.get(str(row.get("code") or ""), 999))
+
+    def generic(predicate) -> List[Dict[str, Any]]:
+        return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
 
     if code == "auto-fastest":
-        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_recommended"))
+        picks = by_codes(preferred_main_codes)
         if picks:
-            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
-        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
+        picks = by_codes(preferred_reserve_codes)
         if picks:
-            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
+        picks = generic(lambda row: is_online(row) and row.get("is_recommended"))
+        if picks:
+            return picks[0]
+        picks = generic(lambda row: is_online(row))
+        if picks:
+            return picks[0]
+
     if code == "auto-reserve":
-        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_reserve"))
+        picks = by_codes(preferred_reserve_codes)
         if picks:
-            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
-        picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
+        picks = generic(lambda row: is_online(row) and row.get("is_reserve"))
         if picks:
-            picks = sorted(picks, key=_location_speed_rank, reverse=True)
+            return picks[0]
+        picks = by_codes(preferred_main_codes)
+        if picks:
+            return picks[0]
+        picks = generic(lambda row: is_online(row))
         if len(picks) >= 2:
             return picks[1]
         if picks:
