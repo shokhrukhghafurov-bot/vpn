@@ -149,6 +149,10 @@ class LocationIn(BaseModel):
     is_reserve: bool = False
     status: str = "online"
     sort_order: int = 100
+    download_mbps: Optional[float] = None
+    upload_mbps: Optional[float] = None
+    ping_ms: Optional[int] = None
+    speed_checked_at: Optional[str] = None
     vpn_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -161,6 +165,10 @@ class LocationPatchIn(BaseModel):
     is_reserve: Optional[bool] = None
     status: Optional[str] = None
     sort_order: Optional[int] = None
+    download_mbps: Optional[float] = None
+    upload_mbps: Optional[float] = None
+    ping_ms: Optional[int] = None
+    speed_checked_at: Optional[str] = None
     vpn_payload: Optional[Dict[str, Any]] = None
 
 
