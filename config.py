@@ -153,6 +153,9 @@ class Settings:
 
     RU_LTE_SOURCE_URLS: List[str] = None
     RU_LTE_REFRESH_ON_STARTUP: bool = _env_bool("RU_LTE_REFRESH_ON_STARTUP", False)
+    RU_LTE_AUTO_REFRESH_ENABLED: bool = _env_bool("RU_LTE_AUTO_REFRESH_ENABLED", False)
+    RU_LTE_AUTO_REFRESH_MINUTES: int = _env_int("RU_LTE_AUTO_REFRESH_MINUTES", 30)
+    RU_LTE_AUTO_REFRESH_TIMEOUT_SEC: int = _env_int("RU_LTE_AUTO_REFRESH_TIMEOUT_SEC", 600)
     RU_LTE_MAX_CANDIDATES: int = _env_int("RU_LTE_MAX_CANDIDATES", 3)
 
     def __post_init__(self) -> None:
