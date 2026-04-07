@@ -5,10 +5,12 @@ import html
 import json
 import secrets
 from uuid import uuid4
+import time
 
 import jwt
 import requests
 import psycopg
+from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
@@ -60,6 +62,7 @@ from db_store import (
     update_payment,
     extend_user_subscription_by_telegram,
     enqueue_notification,
+    _get_user_subscription_view_with_conn,
 )
 
 
@@ -218,7 +221,24 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
-app.add_middleware(GZipMiddleware, minimum_size=512)
+
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+_LOCATIONS_CACHE_TTL_SEC = 15
+_locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
+
+
+def _cached_locations_payload() -> List[Dict[str, Any]]:
+    now = time.monotonic()
+    cached_items = _locations_cache.get("items")
+    expires_at = float(_locations_cache.get("expires_at") or 0.0)
+    if cached_items is not None and expires_at > now:
+        return cached_items
+    items = [serialize_location(row) for row in list_locations(active_only=True)]
+    _locations_cache["items"] = items
+    _locations_cache["expires_at"] = now + _LOCATIONS_CACHE_TTL_SEC
+    return items
+
 
 
 def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
@@ -602,13 +622,8 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
-
-    requested_code = str(item.get("code") or "").strip()
-    resolved_row = _pick_virtual_location(requested_code) if requested_code in {"auto-fastest", "auto-reserve"} else dict(row)
-    resolved_payload = _compose_vpn_payload_for_location(dict(resolved_row), requested_location_code=requested_code) if resolved_row else {}
+    resolved_payload = _compose_vpn_payload_for_location(dict(row))
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
-    item["selectable"] = bool(item["vpn_payload_complete"])
-    item["resolved_location_code"] = resolved_payload.get("resolved_location_code") if resolved_payload else None
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
@@ -737,28 +752,9 @@ def open_app_bridge(
     </div>
   </div>
   <script>
-    (function () {{
-      var nativeUrl = {native_url_js};
-      var opened = false;
-      function openNative() {{
-        if (opened) return;
-        opened = true;
-        window.location.href = nativeUrl;
-        window.setTimeout(function () {{
-          window.location.replace(nativeUrl);
-        }}, 250);
-      }}
-      document.addEventListener('visibilitychange', function () {{
-        if (document.visibilityState === 'hidden') {{
-          opened = true;
-        }}
-      }});
-      window.addEventListener('pagehide', function () {{
-        opened = true;
-      }});
-      openNative();
-      window.setTimeout(openNative, 120);
-    }})();
+    window.setTimeout(function () {{
+      window.location.href = {native_url_js};
+    }}, 120);
   </script>
 </body>
 </html>"""
@@ -772,11 +768,6 @@ def open_app_bridge(
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "service": settings.APP_NAME}
-
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon() -> Response:
-    return Response(status_code=204)
 
 
 @app.post("/auth/telegram")
@@ -871,23 +862,14 @@ def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_curre
 
 
 @app.get("/app/config")
-def app_config(request: Request) -> Dict[str, Any]:
+def app_config() -> Dict[str, Any]:
     return {
         "app_name": settings.APP_NAME,
         "support_url": settings.SUPPORT_TELEGRAM_URL,
         "bot_url": _bot_public_url(),
-        "backend_base_url": settings.BACKEND_BASE_URL,
-        "open_app_url": settings.OPEN_APP_URL,
-        "open_app_bridge_url": _build_open_app_bridge_url(request),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "payments_enabled": settings.PAYMENTS_ENABLED,
         "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
-        "auth": {
-            "code_ttl_minutes": settings.AUTH_CODE_TTL_MINUTES,
-            "code_reuse_grace_seconds": settings.AUTH_CODE_REUSE_GRACE_SECONDS,
-            "refresh_enabled": True,
-            "logout_enabled": True,
-        },
         "feature_flags": {
             "auth_refresh": True,
             "auth_logout": True,
@@ -907,13 +889,15 @@ def plans() -> Dict[str, Any]:
 
 @app.get("/subscriptions/me")
 def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    view = get_user_subscription_view(user["id"])
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+        view = _get_user_subscription_view_with_conn(conn, user["id"])
     return {"ok": True, **view}
 
 
 @app.get("/devices")
 def devices(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
-    view = get_user_subscription_view(user["id"])
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+        view = _get_user_subscription_view_with_conn(conn, user["id"])
     return {"ok": True, "items": view["devices"], "devices_used": view["devices_used"], "device_limit": view["device_limit"]}
 
 
@@ -938,13 +922,13 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
 
 @app.get("/locations")
 def locations() -> Dict[str, Any]:
-    return {"ok": True, "items": [serialize_location(row) for row in list_locations(active_only=True)]}
+    return {"ok": True, "items": _cached_locations_payload()}
 
 
 @app.get("/locations/status")
 def locations_status() -> Dict[str, Any]:
-    rows = list_locations(active_only=True)
-    return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in rows]}
+    items = _cached_locations_payload()
+    return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
 
 
 @app.get("/vpn/config/{location_code}")
