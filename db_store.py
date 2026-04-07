@@ -968,6 +968,17 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
     return payload
 
 
+def _location_speed_rank(row: Dict[str, Any]) -> tuple:
+    download = _normalize_optional_float(row.get("download_mbps")) or 0.0
+    upload = _normalize_optional_float(row.get("upload_mbps")) or 0.0
+    ping = _normalize_optional_int(row.get("ping_ms"))
+    has_speed = 1 if (download > 0 or upload > 0 or (ping is not None and ping > 0)) else 0
+    ping_score = 0 if ping is None else max(0, 10000 - ping)
+    recommended = 1 if bool(row.get("is_recommended")) else 0
+    reserve = 1 if bool(row.get("is_reserve")) else 0
+    return (has_speed, download, upload, ping_score, recommended, -reserve, -(int(row.get("sort_order") or 9999)))
+
+
 def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     rows = list_locations(active_only=True)
     if not rows:
@@ -981,7 +992,14 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
         return str(row.get("status") or "").strip().lower() == "online"
 
     def with_payload(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        return [row for row in items if row.get("code") not in excluded and _compose_vpn_payload_for_location(row)]
+        valid = []
+        for row in items:
+            if row.get("code") in excluded:
+                continue
+            payload = _compose_vpn_payload_for_location(row)
+            if payload and _config_is_complete(payload):
+                valid.append(row)
+        return valid
 
     def by_codes(codes: List[str]) -> List[Dict[str, Any]]:
         order = {code_item: idx for idx, code_item in enumerate(codes)}
@@ -991,7 +1009,21 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     def generic(predicate) -> List[Dict[str, Any]]:
         return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
 
+    def measured(predicate) -> List[Dict[str, Any]]:
+        return generic(
+            lambda row: predicate(row)
+            and ((_normalize_optional_float(row.get("download_mbps")) or 0) > 0
+                 or (_normalize_optional_float(row.get("upload_mbps")) or 0) > 0
+                 or (_normalize_optional_int(row.get("ping_ms")) or 0) > 0)
+        )
+
     if code == "auto-fastest":
+        picks = measured(lambda row: is_online(row) and not row.get("is_reserve"))
+        if picks:
+            return picks[0]
+        picks = measured(lambda row: is_online(row))
+        if picks:
+            return picks[0]
         picks = by_codes(preferred_main_codes)
         if picks:
             return picks[0]
@@ -1006,6 +1038,9 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
             return picks[0]
 
     if code == "auto-reserve":
+        picks = measured(lambda row: is_online(row) and row.get("is_reserve"))
+        if picks:
+            return picks[0]
         picks = by_codes(preferred_reserve_codes)
         if picks:
             return picks[0]
@@ -1013,6 +1048,11 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
         if picks:
             return picks[0]
         picks = by_codes(preferred_main_codes)
+        if picks:
+            return picks[0]
+        picks = measured(lambda row: is_online(row))
+        if len(picks) >= 2:
+            return picks[1]
         if picks:
             return picks[0]
         picks = generic(lambda row: is_online(row))
