@@ -226,10 +226,13 @@ def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
 
 
 def issue_token(user_id: int, *, expires_delta: timedelta, token_type: str = "access") -> str:
+    now = datetime.now(timezone.utc)
     payload = {
         "sub": str(user_id),
         "typ": token_type,
-        "exp": datetime.now(timezone.utc) + expires_delta,
+        "iat": now,
+        "exp": now + expires_delta,
+        "jti": uuid.uuid4().hex,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
@@ -266,17 +269,20 @@ def _decode_token(raw_token: str, *, expected_type: Optional[str] = None) -> Dic
 
 
 def _issue_auth_payload(user: Dict[str, Any], *, is_new: bool = False) -> Dict[str, Any]:
-    access_token = issue_access_token(int(user["id"]))
-    refresh_token = issue_refresh_token(int(user["id"]))
-    view = get_user_subscription_view(int(user["id"]))
+    user_id = int(user["id"])
+    refresh_subscription_statuses(user_id)
+    fresh_user = get_user_by_id(user_id) or user
+    access_token = issue_access_token(user_id)
+    refresh_token = issue_refresh_token(user_id)
+    view = get_user_subscription_view(user_id)
     return {
         "ok": True,
         "token": access_token,
         "access_token": access_token,
         "refresh_token": refresh_token,
-        "user": user,
+        "user": fresh_user,
         "subscription": view.get("subscription"),
-        "language": user.get("language") or "ru",
+        "language": fresh_user.get("language") or "ru",
         "is_new": is_new,
     }
 
@@ -730,7 +736,11 @@ def open_app_bridge(
   </script>
 </body>
 </html>"""
-    return HTMLResponse(content=html_page)
+    response = HTMLResponse(content=html_page)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    return response
 
 
 @app.get("/health")
@@ -749,8 +759,10 @@ def auth_telegram(payload: TelegramAuthIn) -> Dict[str, Any]:
 def auth_code_issue(request: Request, payload: IssueCodeIn, _: bool = Depends(require_code_issuer)) -> Dict[str, Any]:
     existing = get_user_by_telegram_id(payload.telegram_id)
     user = upsert_telegram_user(payload.model_dump())
+    refresh_subscription_statuses(int(user["id"]))
+    fresh_user = get_user_by_id(int(user["id"])) or user
     issued = issue_auth_code(
-        int(user["id"]),
+        int(fresh_user["id"]),
         ttl_minutes=settings.AUTH_CODE_TTL_MINUTES,
         meta={
             "telegram_id": payload.telegram_id,
@@ -761,14 +773,14 @@ def auth_code_issue(request: Request, payload: IssueCodeIn, _: bool = Depends(re
     deep_link = _build_open_app_bridge_url(
         request,
         code=code,
-        lang=user.get("language") or payload.language or "ru",
+        lang=fresh_user.get("language") or payload.language or "ru",
     )
     return {
         "ok": True,
         "code": code,
         "deep_link": deep_link,
         "expires_at": issued["expires_at"].isoformat(),
-        "user": user,
+        "user": fresh_user,
         "is_new": existing is None,
     }
 
