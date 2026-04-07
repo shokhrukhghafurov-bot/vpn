@@ -7,6 +7,7 @@ import json
 import secrets
 from uuid import uuid4
 import time
+import threading
 
 import jwt
 import requests
@@ -406,6 +407,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "sources": source_stats,
         "candidates_total": len(candidates),
         "selected": assigned,
+        "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
+        "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
     }
 
 
@@ -414,9 +417,10 @@ def on_startup() -> None:
     bootstrap()
     if settings.RU_LTE_REFRESH_ON_STARTUP:
         try:
-            refresh_ru_lte_locations()
-        except Exception:
-            pass
+            _run_ru_lte_refresh_safe(source="startup")
+        except Exception as exc:
+            _set_ru_lte_refresh_error(exc)
+    _start_ru_lte_auto_refresh_loop()
 
 
 app.add_middleware(
@@ -431,6 +435,49 @@ app.add_middleware(GZipMiddleware, minimum_size=500)
 
 _LOCATIONS_CACHE_TTL_SEC = 15
 _locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
+_ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+
+
+def _invalidate_locations_cache() -> None:
+    _locations_cache["items"] = None
+    _locations_cache["expires_at"] = 0.0
+
+
+def _set_ru_lte_refresh_success() -> None:
+    _ru_lte_refresh_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
+    _ru_lte_refresh_state["last_error"] = None
+    _ru_lte_refresh_state["last_error_at"] = None
+
+
+def _set_ru_lte_refresh_error(exc: Exception) -> None:
+    _ru_lte_refresh_state["last_error"] = str(exc)
+    _ru_lte_refresh_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_ru_lte_refresh_safe(*, source: str = "manual") -> Dict[str, Any]:
+    result = refresh_ru_lte_locations()
+    result["refresh_source"] = source
+    _invalidate_locations_cache()
+    _set_ru_lte_refresh_success()
+    return result
+
+
+def _start_ru_lte_auto_refresh_loop() -> None:
+    if not settings.RU_LTE_AUTO_REFRESH_ENABLED:
+        return
+    interval_minutes = max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30))
+    timeout_seconds = max(60, int(settings.RU_LTE_AUTO_REFRESH_TIMEOUT_SEC or 600))
+
+    def worker() -> None:
+        while True:
+            try:
+                _run_ru_lte_refresh_safe(source="auto")
+            except Exception as exc:
+                _set_ru_lte_refresh_error(exc)
+            time.sleep(timeout_seconds if timeout_seconds > interval_minutes * 60 else interval_minutes * 60)
+
+    thread = threading.Thread(target=worker, name="ru-lte-auto-refresh", daemon=True)
+    thread.start()
 
 
 def _cached_locations_payload() -> List[Dict[str, Any]]:
@@ -1524,6 +1571,7 @@ def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict
     ok_count = sum(1 for item in results if item.get("status") == "ok")
     error_count = sum(1 for item in results if item.get("status") == "error")
     skipped_count = sum(1 for item in results if item.get("status") == "skipped")
+    _invalidate_locations_cache()
     return {
         "ok": True,
         "tested": len(results),
@@ -1536,13 +1584,19 @@ def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict
 @app.post("/api/infra/admin/vpn/locations/refresh-ru-lte")
 def admin_refresh_ru_lte(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return refresh_ru_lte_locations()
+    return _run_ru_lte_refresh_safe(source="manual")
 
 
 @app.get("/api/infra/admin/vpn/locations")
 def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return {"ok": True, "items": [serialize_location(row, include_payload=True) for row in list_locations(active_only=False)]}
+    return {
+        "ok": True,
+        "items": [serialize_location(row, include_payload=True) for row in list_locations(active_only=False)],
+        "ru_lte_refresh": dict(_ru_lte_refresh_state),
+        "ru_lte_auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
+        "ru_lte_auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
+    }
 
 
 @app.post("/api/infra/admin/vpn/locations")
