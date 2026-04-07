@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
 import base64
 import html
 import json
@@ -907,17 +907,101 @@ def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[st
     return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
 
 
-def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
-    base = (settings.OPEN_APP_BRIDGE_URL or "").strip() or str(request.url_for("open_app_bridge"))
-    parts = urlsplit(base)
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if code:
-        query["code"] = code
-    elif token:
-        query["token"] = token
-    if lang:
-        query["lang"] = lang
-    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+def _subscription_authorized(token: str) -> bool:
+    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+    provided = str(token or "").strip()
+    return bool(expected and provided and secrets.compare_digest(provided, expected))
+
+
+
+def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
+    normalized = _normalize_vpn_payload_keys(payload)
+    if not normalized or not _config_is_complete(normalized):
+        raise ValueError("VLESS payload is incomplete")
+
+    uuid = str(normalized.get("uuid") or "").strip()
+    server = str(normalized.get("server") or "").strip()
+    port = int(normalized.get("port") or 443)
+    remark = str(normalized.get("remark") or normalized.get("display_name") or fallback_name).strip() or fallback_name
+
+    query: Dict[str, Any] = {
+        "type": str(normalized.get("transport") or normalized.get("network") or "tcp").strip() or "tcp",
+        "security": str(normalized.get("security") or "reality").strip() or "reality",
+    }
+    optional_keys = {
+        "flow": normalized.get("flow"),
+        "sni": normalized.get("sni") or normalized.get("server_name"),
+        "host": normalized.get("host"),
+        "path": normalized.get("path"),
+        "serviceName": normalized.get("service_name") or normalized.get("serviceName"),
+        "pbk": normalized.get("public_key") or normalized.get("publicKey"),
+        "sid": normalized.get("short_id") or normalized.get("shortId"),
+        "fp": normalized.get("fingerprint"),
+        "alpn": ",".join(str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()),
+        "packetEncoding": normalized.get("packet_encoding") or normalized.get("packetEncoding"),
+    }
+    for key, value in optional_keys.items():
+        text = str(value or "").strip()
+        if text:
+            query[key] = text
+
+    return f"vless://{quote(uuid, safe='')}@{server}:{port}?{urlencode(query)}#{quote(remark, safe='')}"
+
+
+
+def _subscription_location_rows() -> List[Dict[str, Any]]:
+    concrete: List[Dict[str, Any]] = []
+    for row in list_locations(active_only=True):
+        code = str(row.get("code") or "").strip()
+        if code in {"auto-fastest", "auto-reserve"}:
+            continue
+        if str(row.get("status") or "").strip().lower() != "online":
+            continue
+        payload = _compose_vpn_payload_for_location(dict(row))
+        if payload and _config_is_complete(payload):
+            concrete.append(dict(row))
+    priority = {
+        "ru-lte": 0,
+        "ru-lte-reserve-1": 1,
+        "ru-lte-reserve-2": 2,
+        "se": 3,
+    }
+    concrete.sort(key=lambda row: (priority.get(str(row.get("code") or ""), 1000), int(row.get("sort_order") or 9999), str(row.get("name_en") or row.get("code") or "")))
+    return concrete
+
+
+@app.get("/sub/{token}")
+def public_subscription(token: str) -> Response:
+    if not _subscription_authorized(token):
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    rows = _subscription_location_rows()
+    lines: List[str] = []
+    for row in rows:
+        payload = _compose_vpn_payload_for_location(dict(row))
+        try:
+            lines.append(_build_vless_subscription_line(payload, fallback_name=str(row.get("name_en") or row.get("name_ru") or row.get("code") or "VLESS")))
+        except Exception:
+            continue
+
+    if not lines:
+        raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
+
+    content = "\n".join(lines) + "\n"
+    headers = {
+        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
+        "Profile-Title": quote(f"base64:{base64.b64encode(f'{settings.APP_NAME} Subscription'.encode('utf-8')).decode('ascii')}", safe=':='),
+        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={int(time.time()) + 86400 * 3650}",
+    }
+    return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+@app.get("/sub")
+def public_subscription_hint() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "message": "Use /sub/<SUBSCRIPTION_TOKEN>",
+    }
 
 
 @app.get("/open-app", response_class=HTMLResponse, name="open_app_bridge")
