@@ -835,15 +835,50 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _apply_admin_mobile_defaults(normalized)
 
 
+def _placeholder_like_value(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    placeholder_prefixes = ("paste_", "your_", "replace_", "todo", "changeme")
+    if lowered.startswith(placeholder_prefixes):
+        return True
+    if "example.com" in lowered or "example.net" in lowered or "example.org" in lowered:
+        return True
+    if lowered in {"ru_provider_host", "uz_provider_host", "ru_provider_user", "uz_provider_user", "ru_provider_pass", "uz_provider_pass"}:
+        return True
+    return False
+
+
 def _config_is_complete(payload: Dict[str, Any]) -> bool:
     normalized = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
     server = str(normalized.get("server") or "").strip()
     uuid = str(normalized.get("uuid") or "").strip()
+    security = str(normalized.get("security") or "reality").strip().lower() or "reality"
+    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
+    sni = str(normalized.get("server_name") or normalized.get("sni") or "").strip()
+    public_key = str(normalized.get("public_key") or normalized.get("publicKey") or "").strip()
+    short_id = str(normalized.get("short_id") or normalized.get("shortId") or "").strip()
+    service_name = str(normalized.get("service_name") or normalized.get("serviceName") or "").strip()
+    path = str(normalized.get("path") or "").strip()
+    dns_servers = normalized.get("dns_servers") or normalized.get("dnsServers") or []
     try:
         port = int(normalized.get("port") or 0)
     except (TypeError, ValueError):
         port = 0
-    return bool(server and uuid and port > 0)
+
+    if _placeholder_like_value(server) or _placeholder_like_value(uuid) or port <= 0:
+        return False
+    if not isinstance(dns_servers, list) or not [str(item).strip() for item in dns_servers if str(item).strip() and not _placeholder_like_value(item)]:
+        return False
+    if security == "reality":
+        if _placeholder_like_value(public_key) or _placeholder_like_value(short_id) or _placeholder_like_value(sni):
+            return False
+    if transport == "grpc" and _placeholder_like_value(service_name):
+        return False
+    if transport in {"ws", "websocket"} and _placeholder_like_value(path):
+        return False
+    return True
 
 
 def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location_code: Optional[str] = None) -> Dict[str, Any]:
