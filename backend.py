@@ -593,11 +593,11 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
+    resolved_payload = _compose_vpn_payload_for_location(dict(row))
+    item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
     if include_payload:
-        resolved_payload = _compose_vpn_payload_for_location(dict(row))
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
-        item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
         item["tun_diagnostics"] = build_location_tun_diagnostics(row, resolved_payload=resolved_payload)
     return item
 
