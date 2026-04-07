@@ -926,7 +926,90 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
     if not item:
         raise HTTPException(status_code=404, detail="Device not found")
     return {"ok": True, "device": item}
+    
+def _quote_url_value(value: Any) -> str:
+    from urllib.parse import quote
+    return quote(str(value or "").strip(), safe="")
 
+def _build_vless_link(payload: Dict[str, Any]) -> str:
+    uuid = str(payload.get("uuid") or "").strip()
+    server = str(payload.get("server") or "").strip()
+    port = int(payload.get("port") or 443)
+
+    if not uuid or not server:
+        raise ValueError("Missing uuid or server")
+
+    security = str(payload.get("security") or "reality").strip() or "reality"
+    flow = str(payload.get("flow") or "").strip()
+    sni = str(payload.get("sni") or payload.get("server_name") or "").strip()
+    fp = str(payload.get("fingerprint") or "chrome").strip()
+    pbk = str(payload.get("public_key") or payload.get("publicKey") or "").strip()
+    sid = str(payload.get("short_id") or payload.get("shortId") or "").strip()
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip() or "tcp"
+    host = str(payload.get("host") or "").strip()
+    path = str(payload.get("path") or "").strip()
+    service_name = str(payload.get("service_name") or payload.get("serviceName") or "").strip()
+    remark = str(
+        payload.get("remark")
+        or payload.get("display_name")
+        or payload.get("location_code")
+        or "node"
+    ).strip()
+
+    params = ["encryption=none"]
+
+    if flow:
+        params.append(f"flow={_quote_url_value(flow)}")
+    if security:
+        params.append(f"security={_quote_url_value(security)}")
+    if sni:
+        params.append(f"sni={_quote_url_value(sni)}")
+    if fp:
+        params.append(f"fp={_quote_url_value(fp)}")
+    if pbk:
+        params.append(f"pbk={_quote_url_value(pbk)}")
+    if sid:
+        params.append(f"sid={_quote_url_value(sid)}")
+    if transport:
+        params.append(f"type={_quote_url_value(transport)}")
+
+    if transport in {"ws", "websocket"}:
+        if host:
+            params.append(f"host={_quote_url_value(host)}")
+        if path:
+            params.append(f"path={_quote_url_value(path)}")
+
+    if transport == "grpc" and service_name:
+        params.append(f"serviceName={_quote_url_value(service_name)}")
+
+    return f"vless://{uuid}@{server}:{port}?{'&'.join(params)}#{_quote_url_value(remark)}"
+
+
+def _subscription_lines_for_locations(location_code: Optional[str] = None) -> List[str]:
+    rows = list_locations(active_only=True)
+    lines: List[str] = []
+
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+
+        if code in {"auto-fastest", "auto-reserve"}:
+            continue
+
+        if location_code and code != location_code:
+            continue
+
+        payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=code)
+        if not payload:
+            continue
+        if not _config_is_complete(payload):
+            continue
+
+        try:
+            lines.append(_build_vless_link(payload))
+        except Exception:
+            continue
+
+    return lines
 
 @app.get("/locations")
 def locations() -> Dict[str, Any]:
@@ -937,7 +1020,30 @@ def locations() -> Dict[str, Any]:
 def locations_status() -> Dict[str, Any]:
     items = _cached_locations_payload()
     return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
+@app.get("/sub/{token}", response_class=PlainTextResponse)
+def subscription_all(token: str) -> str:
+    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+    if not expected or token != expected:
+        raise HTTPException(status_code=404, detail="Not found")
 
+    lines = _subscription_lines_for_locations()
+    if not lines:
+        raise HTTPException(status_code=404, detail="No subscription nodes available")
+
+    return "\n".join(lines) + "\n"
+
+
+@app.get("/sub/{token}/{location_code}", response_class=PlainTextResponse)
+def subscription_one_location(token: str, location_code: str) -> str:
+    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+    if not expected or token != expected:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    lines = _subscription_lines_for_locations(location_code=location_code)
+    if not lines:
+        raise HTTPException(status_code=404, detail="No subscription nodes available for this location")
+
+    return "\n".join(lines) + "\n"
 
 @app.get("/vpn/config/{location_code}")
 def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
