@@ -1217,11 +1217,29 @@ def get_user_devices(user_id: int) -> List[Dict[str, Any]]:
             return [dict(row) for row in cur.fetchall()]
 
 
-def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
-    user = get_user_by_id(user_id)
-    subscription = get_current_subscription(user_id)
-    latest = subscription or get_latest_subscription(user_id)
-    devices = get_user_devices(user_id)
+def _get_user_subscription_view_with_conn(conn: psycopg.Connection, user_id: int) -> Dict[str, Any]:
+    refresh_subscription_statuses(user_id)
+    with conn.cursor() as cur:
+        cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
+        user_row = cur.fetchone()
+        user = _normalize_user(user_row)
+
+        cur.execute(_subscription_select("WHERE s.user_id = %s AND s.status = 'active'"), (user_id,))
+        subscription_row = cur.fetchone()
+        subscription = dict(subscription_row) if subscription_row else None
+
+        latest = subscription
+        if latest is None:
+            cur.execute(_subscription_select("WHERE s.user_id = %s"), (user_id,))
+            latest_row = cur.fetchone()
+            latest = dict(latest_row) if latest_row else None
+
+        cur.execute(
+            "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
+            (user_id,),
+        )
+        devices = [dict(row) for row in cur.fetchall()]
+
     allowed_limit = _resolve_effective_device_limit(
         (latest or {}).get("device_limit"),
         (user or {}).get("device_limit_override"),
@@ -1234,6 +1252,11 @@ def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
         "device_limit": allowed_limit,
         "device_limit_override": (user or {}).get("device_limit_override"),
     }
+
+
+def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
+    with db() as conn:
+        return _get_user_subscription_view_with_conn(conn, user_id)
 
 
 def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
@@ -1929,7 +1952,6 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
     normalized = (code or "").strip()
     if not normalized:
         return None
-    reuse_grace = max(0, int(settings.AUTH_CODE_REUSE_GRACE_SECONDS or 0))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1945,21 +1967,13 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
             if not row:
                 conn.rollback()
                 return None
-            expires_at = row.get("expires_at")
-            used_at = row.get("used_at")
-            now = now_utc()
-            if expires_at <= now:
+            if row.get("used_at") is not None or row.get("expires_at") <= now_utc():
                 conn.rollback()
                 return None
-            if used_at is not None:
-                if reuse_grace <= 0 or (now - used_at).total_seconds() > reuse_grace:
-                    conn.rollback()
-                    return None
-            else:
-                cur.execute(
-                    "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
-                    (normalized,),
-                )
+            cur.execute(
+                "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
+                (normalized,),
+            )
             cur.execute(
                 "SELECT * FROM users WHERE id = %s",
                 (row["user_id"],),
