@@ -1929,6 +1929,7 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
     normalized = (code or "").strip()
     if not normalized:
         return None
+    reuse_grace = max(0, int(settings.AUTH_CODE_REUSE_GRACE_SECONDS or 0))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1944,13 +1945,21 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
             if not row:
                 conn.rollback()
                 return None
-            if row.get("used_at") is not None or row.get("expires_at") <= now_utc():
+            expires_at = row.get("expires_at")
+            used_at = row.get("used_at")
+            now = now_utc()
+            if expires_at <= now:
                 conn.rollback()
                 return None
-            cur.execute(
-                "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
-                (normalized,),
-            )
+            if used_at is not None:
+                if reuse_grace <= 0 or (now - used_at).total_seconds() > reuse_grace:
+                    conn.rollback()
+                    return None
+            else:
+                cur.execute(
+                    "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
+                    (normalized,),
+                )
             cur.execute(
                 "SELECT * FROM users WHERE id = %s",
                 (row["user_id"],),
