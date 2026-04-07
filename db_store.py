@@ -80,6 +80,10 @@ CREATE TABLE IF NOT EXISTS locations (
     is_reserve BOOLEAN NOT NULL DEFAULT FALSE,
     status TEXT NOT NULL DEFAULT 'online',
     sort_order INTEGER NOT NULL DEFAULT 100,
+    download_mbps DOUBLE PRECISION,
+    upload_mbps DOUBLE PRECISION,
+    ping_ms INTEGER,
+    speed_checked_at TIMESTAMPTZ,
     vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
     location_source TEXT NOT NULL DEFAULT 'catalog',
@@ -194,6 +198,10 @@ MIGRATION_SQL = [
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_reserve BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'online'",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 100",
+    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS download_mbps DOUBLE PRECISION",
+    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS upload_mbps DOUBLE PRECISION",
+    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS ping_ms INTEGER",
+    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS speed_checked_at TIMESTAMPTZ",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS location_source TEXT DEFAULT 'catalog'",
@@ -915,15 +923,20 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     if code == "auto-fastest":
         picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_recommended"))
         if picks:
+            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
         picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
         if picks:
+            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
     if code == "auto-reserve":
         picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online" and row.get("is_reserve"))
         if picks:
+            picks = sorted(picks, key=_location_speed_rank, reverse=True)
             return picks[0]
         picks = candidates(lambda row: row.get("code") not in {"auto-fastest", "auto-reserve"} and row.get("status") == "online")
+        if picks:
+            picks = sorted(picks, key=_location_speed_rank, reverse=True)
         if len(picks) >= 2:
             return picks[1]
         if picks:
@@ -945,11 +958,15 @@ def sync_locations_catalog() -> None:
                 data["is_deleted"] = bool(data.get("is_deleted", False))
                 if not data.get("vpn_payload"):
                     data["vpn_payload"] = _compose_vpn_payload_for_location(data)
+                data["download_mbps"] = _normalize_optional_float(data.get("download_mbps"))
+                data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
+                data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
+                data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
                 data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
                 cur.execute(
                     """
-                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
-                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
+                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, download_mbps, upload_mbps, ping_ms, speed_checked_at, vpn_payload, is_deleted, location_source)
+                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(download_mbps)s, %(upload_mbps)s, %(ping_ms)s, %(speed_checked_at)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
                     ON CONFLICT (code) DO UPDATE SET
                         -- Preserve admin-edited catalog rows across restarts.
                         -- Bootstrap should only backfill missing defaults, not overwrite
@@ -976,6 +993,22 @@ def sync_locations_catalog() -> None:
                         sort_order = CASE
                             WHEN locations.sort_order IS NULL THEN EXCLUDED.sort_order
                             ELSE locations.sort_order
+                        END,
+                        download_mbps = CASE
+                            WHEN locations.download_mbps IS NULL THEN EXCLUDED.download_mbps
+                            ELSE locations.download_mbps
+                        END,
+                        upload_mbps = CASE
+                            WHEN locations.upload_mbps IS NULL THEN EXCLUDED.upload_mbps
+                            ELSE locations.upload_mbps
+                        END,
+                        ping_ms = CASE
+                            WHEN locations.ping_ms IS NULL THEN EXCLUDED.ping_ms
+                            ELSE locations.ping_ms
+                        END,
+                        speed_checked_at = CASE
+                            WHEN locations.speed_checked_at IS NULL THEN EXCLUDED.speed_checked_at
+                            ELSE locations.speed_checked_at
                         END,
                         vpn_payload = CASE
                             WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
@@ -1353,6 +1386,10 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     data["is_active"] = bool(data.get("is_active", True))
     data["is_recommended"] = bool(data.get("is_recommended", False))
     data["is_reserve"] = bool(data.get("is_reserve", False))
+    data["download_mbps"] = _normalize_optional_float(data.get("download_mbps"))
+    data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
+    data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
+    data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
     vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     if data["code"] and not vpn_payload.get("location_code"):
         vpn_payload["location_code"] = data["code"]
@@ -1368,8 +1405,8 @@ def _insert_or_upsert_location(cur: psycopg.Cursor, data: Dict[str, Any]) -> Dic
     db_data["vpn_payload"] = Jsonb(db_data.get("vpn_payload") or {})
     cur.execute(
         """
-        INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, vpn_payload, is_deleted, location_source)
-        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
+        INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, download_mbps, upload_mbps, ping_ms, speed_checked_at, vpn_payload, is_deleted, location_source)
+        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(download_mbps)s, %(upload_mbps)s, %(ping_ms)s, %(speed_checked_at)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
         ON CONFLICT (code) DO UPDATE SET
             name_ru = EXCLUDED.name_ru,
             name_en = EXCLUDED.name_en,
@@ -1379,6 +1416,10 @@ def _insert_or_upsert_location(cur: psycopg.Cursor, data: Dict[str, Any]) -> Dic
             is_reserve = EXCLUDED.is_reserve,
             status = EXCLUDED.status,
             sort_order = EXCLUDED.sort_order,
+            download_mbps = EXCLUDED.download_mbps,
+            upload_mbps = EXCLUDED.upload_mbps,
+            ping_ms = EXCLUDED.ping_ms,
+            speed_checked_at = EXCLUDED.speed_checked_at,
             vpn_payload = EXCLUDED.vpn_payload,
             is_deleted = FALSE,
             location_source = EXCLUDED.location_source,
@@ -1433,7 +1474,7 @@ def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
 def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     updates = []
     values: List[Any] = []
-    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "vpn_payload"}
+    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
     for key, value in payload.items():
         if key not in allowed:
             continue
@@ -1448,6 +1489,12 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                 value = int(value)
             except (TypeError, ValueError):
                 value = 100
+        elif key in {"download_mbps", "upload_mbps"}:
+            value = _normalize_optional_float(value)
+        elif key == "ping_ms":
+            value = _normalize_optional_int(value)
+        elif key == "speed_checked_at":
+            value = _normalize_optional_timestamp(value)
         elif key == "vpn_payload":
             value = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(value or {})))
             if "name_en" in payload and payload.get("name_en") and not value.get("remark"):
