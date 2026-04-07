@@ -392,6 +392,20 @@ def _diagnostic_int(value: Any) -> int:
 
 
 
+def _diagnostic_placeholder(value: Any) -> bool:
+    text = str(value or "").strip()
+    if not text:
+        return True
+    lowered = text.lower()
+    if lowered.startswith(("paste_", "your_", "replace_", "todo", "changeme")):
+        return True
+    if "example.com" in lowered or "example.net" in lowered or "example.org" in lowered:
+        return True
+    if lowered in {"ru_provider_host", "uz_provider_host", "ru_provider_user", "uz_provider_user", "ru_provider_pass", "uz_provider_pass"}:
+        return True
+    return False
+
+
 def _diagnostic_string_list(value: Any) -> List[str]:
     if isinstance(value, list):
         return [str(item).strip() for item in value if str(item).strip()]
@@ -423,32 +437,32 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("vpn_payload is empty")
         fixes.append("Open Edit payload and fill server, port, uuid, and Reality fields.")
 
-    if not server:
-        issues.append("server is missing")
+    if not server or _diagnostic_placeholder(server):
+        issues.append("server is missing or still contains a placeholder")
     if port <= 0:
         issues.append("port is missing")
-    if not uuid:
-        issues.append("uuid is missing")
+    if not uuid or _diagnostic_placeholder(uuid):
+        issues.append("uuid is missing or still contains a placeholder")
 
-    if any(issue in {"server is missing", "port is missing", "uuid is missing"} for issue in issues):
-        fixes.append("Set server/port/uuid in effective payload.")
+    if any(issue in {"server is missing or still contains a placeholder", "port is missing", "uuid is missing or still contains a placeholder"} for issue in issues):
+        fixes.append("Set real server/port/uuid values in effective payload.")
 
     if security == "reality":
-        if not public_key:
-            issues.append("Reality public_key is missing")
-        if not sni:
-            issues.append("Reality server_name / sni is missing")
-        if not short_id:
-            issues.append("Reality short_id is missing")
+        if not public_key or _diagnostic_placeholder(public_key):
+            issues.append("Reality public_key is missing or still contains a placeholder")
+        if not sni or _diagnostic_placeholder(sni):
+            issues.append("Reality server_name / sni is missing or still contains a placeholder")
+        if not short_id or _diagnostic_placeholder(short_id):
+            issues.append("Reality short_id is missing or still contains a placeholder")
         if any(issue.startswith("Reality ") for issue in issues):
-            fixes.append("For Reality fill public_key, short_id, and server_name/sni.")
+            fixes.append("For Reality fill real public_key, short_id, and server_name/sni values.")
 
-    if transport in {"grpc"} and not service_name:
-        issues.append("gRPC service_name is missing")
+    if transport in {"grpc"} and (not service_name or _diagnostic_placeholder(service_name)):
+        issues.append("gRPC service_name is missing or still contains a placeholder")
         fixes.append("Set service_name for gRPC transport.")
 
-    if transport in {"ws", "websocket"} and not path:
-        issues.append("WebSocket path is missing")
+    if transport in {"ws", "websocket"} and (not path or _diagnostic_placeholder(path)):
+        issues.append("WebSocket path is missing or still contains a placeholder")
         fixes.append("Set path for WebSocket transport.")
 
     if connect_mode != "tun":
@@ -459,18 +473,18 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("full_tunnel is disabled")
         fixes.append("Set full_tunnel=true for full-device routing.")
 
-    if not dns_servers:
-        issues.append("dns_servers is empty")
+    if not dns_servers or any(_diagnostic_placeholder(item) for item in dns_servers):
+        issues.append("dns_servers is empty or still contains placeholders")
         fixes.append("Add dns_servers, for example 1.1.1.1 and 8.8.8.8.")
 
     fatal_prefixes = (
         "vpn_payload is empty",
-        "server is missing",
+        "server is missing or still contains a placeholder",
         "port is missing",
-        "uuid is missing",
-        "Reality public_key is missing",
-        "Reality server_name / sni is missing",
-        "Reality short_id is missing",
+        "uuid is missing or still contains a placeholder",
+        "Reality public_key is missing or still contains a placeholder",
+        "Reality server_name / sni is missing or still contains a placeholder",
+        "Reality short_id is missing or still contains a placeholder",
         "connect_mode must be tun",
     )
     fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
