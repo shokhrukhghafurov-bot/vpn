@@ -1141,6 +1141,202 @@ def admin_payments_export(status_filter: str = Query(default="all", alias="statu
     return Response(content=content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=vpn-payments.csv"})
 
 
+def _safe_speed_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (number >= 0):
+        return None
+    return round(number, 2)
+
+
+def _safe_speed_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _location_speed_test_url(row: Dict[str, Any]) -> Optional[str]:
+    payload = _compose_vpn_payload_for_location(dict(row))
+    candidates = [
+        payload.get("speed_test_url"),
+        payload.get("speedtest_url"),
+        payload.get("speed_url"),
+        payload.get("metrics_url"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text.lower().startswith(("http://", "https://")):
+            return text
+
+    server = str(payload.get("speed_test_host") or payload.get("server") or "").strip()
+    if not server or "://" in server:
+        return None
+    scheme = str(payload.get("speed_test_scheme") or "https").strip() or "https"
+    path = str(payload.get("speed_test_path") or "/speed").strip() or "/speed"
+    if not path.startswith("/"):
+        path = "/" + path
+    try:
+        port = int(payload.get("speed_test_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    base = f"{scheme}://{server}"
+    if port > 0 and not ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        base += f":{port}"
+    return base + path
+
+
+def _extract_speed_metrics(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Speed test response must be a JSON object")
+
+    source = data
+    for key in ("data", "result", "speed", "metrics"):
+        nested = source.get(key)
+        if isinstance(nested, dict):
+            source = nested
+            break
+
+    download = _safe_speed_float(
+        source.get("download_mbps")
+        or source.get("downloadMbps")
+        or source.get("download")
+        or data.get("download_mbps")
+        or data.get("downloadMbps")
+        or data.get("download")
+    )
+    upload = _safe_speed_float(
+        source.get("upload_mbps")
+        or source.get("uploadMbps")
+        or source.get("upload")
+        or data.get("upload_mbps")
+        or data.get("uploadMbps")
+        or data.get("upload")
+    )
+    ping = _safe_speed_int(
+        source.get("ping_ms")
+        or source.get("pingMs")
+        or source.get("ping")
+        or data.get("ping_ms")
+        or data.get("pingMs")
+        or data.get("ping")
+    )
+    checked_at = (
+        source.get("checked_at")
+        or source.get("checkedAt")
+        or source.get("timestamp")
+        or data.get("checked_at")
+        or data.get("checkedAt")
+        or data.get("timestamp")
+    )
+
+    if download is None and upload is None and ping is None:
+        raise ValueError("Response has no speed fields")
+
+    if checked_at:
+        checked_text = str(checked_at).strip()
+        try:
+            checked_iso = datetime.fromisoformat(checked_text.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            checked_iso = datetime.now(timezone.utc).isoformat()
+    else:
+        checked_iso = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "download_mbps": download,
+        "upload_mbps": upload,
+        "ping_ms": ping,
+        "speed_checked_at": checked_iso,
+    }
+
+
+def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(row.get("code") or "")
+    status = str(row.get("status") or "").lower()
+    is_active = bool(row.get("is_active"))
+    result: Dict[str, Any] = {
+        "id": row.get("id"),
+        "code": code,
+        "name_ru": row.get("name_ru"),
+        "status": "skipped",
+    }
+
+    if code in {"auto-fastest", "auto-reserve"}:
+        result["reason"] = "virtual_location"
+        return result
+    if not is_active:
+        result["reason"] = "inactive"
+        return result
+    if status != "online":
+        result["reason"] = "not_online"
+        return result
+
+    payload = _compose_vpn_payload_for_location(dict(row))
+    if not payload or not _config_is_complete(payload):
+        result["reason"] = "payload_incomplete"
+        return result
+
+    url = _location_speed_test_url(row)
+    if not url:
+        result["reason"] = "speed_test_url_missing"
+        result["hint"] = "Set vpn_payload.speed_test_url or speed_test_host/scheme/path."
+        return result
+
+    try:
+        response = requests.get(url, timeout=12, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        metrics = _extract_speed_metrics(response.json())
+        item = patch_location(int(row.get("id")), metrics)
+        result.update({
+            "status": "ok",
+            "url": url,
+            "metrics": {
+                "download_mbps": item.get("download_mbps"),
+                "upload_mbps": item.get("upload_mbps"),
+                "ping_ms": item.get("ping_ms"),
+                "speed_checked_at": (
+                    item.get("speed_checked_at").astimezone(timezone.utc).isoformat()
+                    if isinstance(item.get("speed_checked_at"), datetime)
+                    else item.get("speed_checked_at")
+                ),
+            },
+        })
+        return result
+    except requests.RequestException as exc:
+        result.update({"status": "error", "url": url, "reason": str(exc)})
+        return result
+    except ValueError as exc:
+        result.update({"status": "error", "url": url, "reason": str(exc)})
+        return result
+
+
+@app.post("/api/infra/admin/vpn/locations/speed-test")
+def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    rows = list_locations(active_only=False)
+    results = [_run_location_speed_test(row) for row in rows]
+    ok_count = sum(1 for item in results if item.get("status") == "ok")
+    error_count = sum(1 for item in results if item.get("status") == "error")
+    skipped_count = sum(1 for item in results if item.get("status") == "skipped")
+    return {
+        "ok": True,
+        "tested": len(results),
+        "updated": ok_count,
+        "errors": error_count,
+        "skipped": skipped_count,
+        "items": results,
+    }
+
+
 @app.get("/api/infra/admin/vpn/locations")
 def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
