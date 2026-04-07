@@ -1,6 +1,7 @@
 from datetime import datetime, timedelta, timezone
-from typing import Any, Dict, List, Optional
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
+import base64
 import html
 import json
 import secrets
@@ -14,7 +15,7 @@ from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse, PlainTextResponse
+from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -29,6 +30,7 @@ from db_store import (
     delete_location,
     export_payments_csv,
     _compose_vpn_payload_for_location,
+    _normalize_vpn_payload_keys,
     _config_is_complete,
     _pick_virtual_location,
     get_active_plans,
@@ -217,9 +219,204 @@ class AdminVpnSettingsIn(BaseModel):
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
 
+RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2")
+
+
+def _read_text_from_source(source: str) -> str:
+    raw = str(source or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith(("http://", "https://")):
+        response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
+        response.raise_for_status()
+        return response.text
+    with open(raw, "r", encoding="utf-8") as fh:
+        return fh.read()
+
+
+def _decode_vless_name(fragment: str) -> str:
+    return unquote(fragment or "").strip()
+
+
+def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
+    raw = str(line or "").strip()
+    if not raw.startswith("vless://"):
+        return None
+    base, _, fragment = raw.partition("#")
+    parsed = urlsplit(base)
+    if parsed.scheme.lower() != "vless":
+        return None
+    uuid = unquote(parsed.username or "").strip()
+    server = (parsed.hostname or "").strip()
+    try:
+        port = int(parsed.port or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not uuid or not server or port <= 0:
+        return None
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    transport = (query.get("type") or query.get("transport") or query.get("network") or "tcp").strip() or "tcp"
+    payload: Dict[str, Any] = {
+        "engine": "sing-box",
+        "protocol": "vless",
+        "server": server,
+        "port": port,
+        "uuid": uuid,
+        "transport": transport,
+        "network": transport,
+        "security": (query.get("security") or "reality").strip() or "reality",
+        "flow": (query.get("flow") or "").strip(),
+        "sni": (query.get("sni") or query.get("serverName") or query.get("host") or "").strip(),
+        "server_name": (query.get("sni") or query.get("serverName") or query.get("host") or "").strip(),
+        "public_key": (query.get("pbk") or query.get("public_key") or query.get("publicKey") or "").strip(),
+        "short_id": (query.get("sid") or query.get("short_id") or query.get("shortId") or "").strip(),
+        "fingerprint": (query.get("fp") or query.get("fingerprint") or "chrome").strip() or "chrome",
+        "service_name": (query.get("serviceName") or query.get("service_name") or "").strip(),
+        "path": (query.get("path") or query.get("spx") or "").strip(),
+        "packet_encoding": (query.get("packetEncoding") or query.get("packet_encoding") or query.get("packet-encoding") or "xudp").strip() or "xudp",
+        "remark": _decode_vless_name(fragment),
+        "dns_servers": ["1.1.1.1", "8.8.8.8"],
+        "connect_mode": "tun",
+        "full_tunnel": True,
+    }
+    if query.get("mode"):
+        payload["mode"] = query.get("mode")
+    if query.get("host"):
+        payload["host"] = query.get("host")
+    if query.get("alpn"):
+        payload["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
+    return _normalize_vpn_payload_keys(payload)
+
+
+def _ru_lte_transport_bonus(payload: Dict[str, Any]) -> int:
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    if transport == "xhttp":
+        return 40
+    if transport == "grpc":
+        return 30
+    if transport in {"ws", "websocket"}:
+        return 25
+    if transport == "tcp":
+        return 15
+    return 0
+
+
+def _ru_lte_payload_score(payload: Dict[str, Any]) -> int:
+    score = 0
+    score += _ru_lte_transport_bonus(payload)
+    if str(payload.get("security") or "").strip().lower() == "reality":
+        score += 30
+    if str(payload.get("flow") or "").strip().lower() == "xtls-rprx-vision":
+        score += 15
+    remark = str(payload.get("remark") or "").lower()
+    if "cidr" in remark:
+        score += 20
+    if payload.get("server_name"):
+        score += 5
+    if payload.get("public_key") and payload.get("short_id"):
+        score += 5
+    return score
+
+
+def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for row in list_locations(active_only=False):
+        if str(row.get("code") or "") == code:
+            return patch_location(int(row.get("id")), updates)
+    return None
+
+
+def refresh_ru_lte_locations() -> Dict[str, Any]:
+    sources = [item for item in (settings.RU_LTE_SOURCE_URLS or []) if str(item or "").strip()]
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    source_stats: List[Dict[str, Any]] = []
+
+    for source in sources:
+        stat = {"source": source, "lines": 0, "accepted": 0, "error": None}
+        try:
+            content = _read_text_from_source(source)
+            for line in content.splitlines():
+                stat["lines"] += 1
+                payload = _parse_vless_subscription_line(line)
+                if not payload:
+                    continue
+                if str(payload.get("security") or "").strip().lower() != "reality":
+                    continue
+                normalized = _normalize_vpn_payload_keys(payload)
+                if not _config_is_complete(normalized):
+                    continue
+                key = "|".join([
+                    str(normalized.get("server") or ""),
+                    str(normalized.get("port") or ""),
+                    str(normalized.get("uuid") or ""),
+                    str(normalized.get("public_key") or ""),
+                    str(normalized.get("short_id") or ""),
+                    str(normalized.get("server_name") or normalized.get("sni") or ""),
+                ])
+                if key in seen:
+                    continue
+                seen.add(key)
+                normalized["_score"] = _ru_lte_payload_score(normalized)
+                normalized["_source"] = source
+                candidates.append(normalized)
+                stat["accepted"] += 1
+        except Exception as exc:
+            stat["error"] = str(exc)
+        source_stats.append(stat)
+
+    candidates.sort(key=lambda item: (int(item.get("_score") or 0), str(item.get("remark") or "")), reverse=True)
+    top = candidates[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 3))]
+
+    assigned: List[Dict[str, Any]] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    for idx, code in enumerate(RU_LTE_LOCATION_CODES):
+        payload = dict(top[idx]) if idx < len(top) else {}
+        if payload:
+            payload.pop("_score", None)
+            payload.pop("_source", None)
+            payload["location_code"] = code
+            payload["remark"] = {"ru-lte": "Russia LTE", "ru-lte-reserve-1": "Russia LTE | Reserve 1", "ru-lte-reserve-2": "Russia LTE | Reserve 2"}.get(code, code)
+            updates = {
+                "vpn_payload": payload,
+                "status": "online",
+                "is_active": True,
+                "is_recommended": code == "ru-lte",
+                "is_reserve": code != "ru-lte",
+                "speed_checked_at": now_iso,
+            }
+            row = _patch_location_by_code(code, updates)
+            assigned.append({
+                "code": code,
+                "server": payload.get("server"),
+                "transport": payload.get("transport"),
+                "remark": payload.get("remark"),
+                "updated": bool(row),
+            })
+        else:
+            row = _patch_location_by_code(code, {
+                "status": "offline",
+                "is_active": True,
+                "is_recommended": False,
+                "is_reserve": code != "ru-lte",
+            })
+            assigned.append({"code": code, "server": None, "transport": None, "remark": None, "updated": bool(row)})
+
+    return {
+        "ok": bool(top),
+        "sources": source_stats,
+        "candidates_total": len(candidates),
+        "selected": assigned,
+    }
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     bootstrap()
+    if settings.RU_LTE_REFRESH_ON_STARTUP:
+        try:
+            refresh_ru_lte_locations()
+        except Exception:
+            pass
 
 
 app.add_middleware(
@@ -926,90 +1123,7 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
     if not item:
         raise HTTPException(status_code=404, detail="Device not found")
     return {"ok": True, "device": item}
-    
-def _quote_url_value(value: Any) -> str:
-    from urllib.parse import quote
-    return quote(str(value or "").strip(), safe="")
 
-def _build_vless_link(payload: Dict[str, Any]) -> str:
-    uuid = str(payload.get("uuid") or "").strip()
-    server = str(payload.get("server") or "").strip()
-    port = int(payload.get("port") or 443)
-
-    if not uuid or not server:
-        raise ValueError("Missing uuid or server")
-
-    security = str(payload.get("security") or "reality").strip() or "reality"
-    flow = str(payload.get("flow") or "").strip()
-    sni = str(payload.get("sni") or payload.get("server_name") or "").strip()
-    fp = str(payload.get("fingerprint") or "chrome").strip()
-    pbk = str(payload.get("public_key") or payload.get("publicKey") or "").strip()
-    sid = str(payload.get("short_id") or payload.get("shortId") or "").strip()
-    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip() or "tcp"
-    host = str(payload.get("host") or "").strip()
-    path = str(payload.get("path") or "").strip()
-    service_name = str(payload.get("service_name") or payload.get("serviceName") or "").strip()
-    remark = str(
-        payload.get("remark")
-        or payload.get("display_name")
-        or payload.get("location_code")
-        or "node"
-    ).strip()
-
-    params = ["encryption=none"]
-
-    if flow:
-        params.append(f"flow={_quote_url_value(flow)}")
-    if security:
-        params.append(f"security={_quote_url_value(security)}")
-    if sni:
-        params.append(f"sni={_quote_url_value(sni)}")
-    if fp:
-        params.append(f"fp={_quote_url_value(fp)}")
-    if pbk:
-        params.append(f"pbk={_quote_url_value(pbk)}")
-    if sid:
-        params.append(f"sid={_quote_url_value(sid)}")
-    if transport:
-        params.append(f"type={_quote_url_value(transport)}")
-
-    if transport in {"ws", "websocket"}:
-        if host:
-            params.append(f"host={_quote_url_value(host)}")
-        if path:
-            params.append(f"path={_quote_url_value(path)}")
-
-    if transport == "grpc" and service_name:
-        params.append(f"serviceName={_quote_url_value(service_name)}")
-
-    return f"vless://{uuid}@{server}:{port}?{'&'.join(params)}#{_quote_url_value(remark)}"
-
-
-def _subscription_lines_for_locations(location_code: Optional[str] = None) -> List[str]:
-    rows = list_locations(active_only=True)
-    lines: List[str] = []
-
-    for row in rows:
-        code = str(row.get("code") or "").strip()
-
-        if code in {"auto-fastest", "auto-reserve"}:
-            continue
-
-        if location_code and code != location_code:
-            continue
-
-        payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=code)
-        if not payload:
-            continue
-        if not _config_is_complete(payload):
-            continue
-
-        try:
-            lines.append(_build_vless_link(payload))
-        except Exception:
-            continue
-
-    return lines
 
 @app.get("/locations")
 def locations() -> Dict[str, Any]:
@@ -1020,30 +1134,7 @@ def locations() -> Dict[str, Any]:
 def locations_status() -> Dict[str, Any]:
     items = _cached_locations_payload()
     return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
-@app.get("/sub/{token}", response_class=PlainTextResponse)
-def subscription_all(token: str) -> str:
-    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
-    if not expected or token != expected:
-        raise HTTPException(status_code=404, detail="Not found")
 
-    lines = _subscription_lines_for_locations()
-    if not lines:
-        raise HTTPException(status_code=404, detail="No subscription nodes available")
-
-    return "\n".join(lines) + "\n"
-
-
-@app.get("/sub/{token}/{location_code}", response_class=PlainTextResponse)
-def subscription_one_location(token: str, location_code: str) -> str:
-    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
-    if not expected or token != expected:
-        raise HTTPException(status_code=404, detail="Not found")
-
-    lines = _subscription_lines_for_locations(location_code=location_code)
-    if not lines:
-        raise HTTPException(status_code=404, detail="No subscription nodes available for this location")
-
-    return "\n".join(lines) + "\n"
 
 @app.get("/vpn/config/{location_code}")
 def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
@@ -1441,6 +1532,11 @@ def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict
         "skipped": skipped_count,
         "items": results,
     }
+
+@app.post("/api/infra/admin/vpn/locations/refresh-ru-lte")
+def admin_refresh_ru_lte(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return refresh_ru_lte_locations()
 
 
 @app.get("/api/infra/admin/vpn/locations")
