@@ -11,6 +11,7 @@ import requests
 import psycopg
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import HTMLResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from pydantic import BaseModel, Field
@@ -217,6 +218,7 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+app.add_middleware(GZipMiddleware, minimum_size=512)
 
 
 def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
@@ -600,8 +602,13 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
-    resolved_payload = _compose_vpn_payload_for_location(dict(row))
+
+    requested_code = str(item.get("code") or "").strip()
+    resolved_row = _pick_virtual_location(requested_code) if requested_code in {"auto-fastest", "auto-reserve"} else dict(row)
+    resolved_payload = _compose_vpn_payload_for_location(dict(resolved_row), requested_location_code=requested_code) if resolved_row else {}
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
+    item["selectable"] = bool(item["vpn_payload_complete"])
+    item["resolved_location_code"] = resolved_payload.get("resolved_location_code") if resolved_payload else None
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
@@ -730,9 +737,28 @@ def open_app_bridge(
     </div>
   </div>
   <script>
-    window.setTimeout(function () {{
-      window.location.href = {native_url_js};
-    }}, 120);
+    (function () {{
+      var nativeUrl = {native_url_js};
+      var opened = false;
+      function openNative() {{
+        if (opened) return;
+        opened = true;
+        window.location.href = nativeUrl;
+        window.setTimeout(function () {{
+          window.location.replace(nativeUrl);
+        }}, 250);
+      }}
+      document.addEventListener('visibilitychange', function () {{
+        if (document.visibilityState === 'hidden') {{
+          opened = true;
+        }}
+      }});
+      window.addEventListener('pagehide', function () {{
+        opened = true;
+      }});
+      openNative();
+      window.setTimeout(openNative, 120);
+    }})();
   </script>
 </body>
 </html>"""
@@ -746,6 +772,11 @@ def open_app_bridge(
 @app.get("/health")
 def health() -> Dict[str, Any]:
     return {"ok": True, "service": settings.APP_NAME}
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
 
 
 @app.post("/auth/telegram")
@@ -840,14 +871,23 @@ def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_curre
 
 
 @app.get("/app/config")
-def app_config() -> Dict[str, Any]:
+def app_config(request: Request) -> Dict[str, Any]:
     return {
         "app_name": settings.APP_NAME,
         "support_url": settings.SUPPORT_TELEGRAM_URL,
         "bot_url": _bot_public_url(),
+        "backend_base_url": settings.BACKEND_BASE_URL,
+        "open_app_url": settings.OPEN_APP_URL,
+        "open_app_bridge_url": _build_open_app_bridge_url(request),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "payments_enabled": settings.PAYMENTS_ENABLED,
         "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
+        "auth": {
+            "code_ttl_minutes": settings.AUTH_CODE_TTL_MINUTES,
+            "code_reuse_grace_seconds": settings.AUTH_CODE_REUSE_GRACE_SECONDS,
+            "refresh_enabled": True,
+            "logout_enabled": True,
+        },
         "feature_flags": {
             "auth_refresh": True,
             "auth_logout": True,
