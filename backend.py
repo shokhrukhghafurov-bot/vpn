@@ -27,6 +27,7 @@ from db_store import (
     export_payments_csv,
     _compose_vpn_payload_for_location,
     _config_is_complete,
+    _pick_virtual_location,
     get_active_plans,
     get_payment_by_internal_or_external,
     get_payment_for_user,
@@ -415,16 +416,6 @@ def _diagnostic_string_list(value: Any) -> List[str]:
 
 
 
-def _resolve_effective_payload_for_location(row: Dict[str, Any]) -> Dict[str, Any]:
-    code = str(row.get("code") or "").strip()
-    if code in {"auto-fastest", "auto-reserve"}:
-        target = _pick_virtual_location(code)
-        if target:
-            return _compose_vpn_payload_for_location(dict(target), requested_location_code=code)
-        return {}
-    return _compose_vpn_payload_for_location(dict(row))
-
-
 def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str) -> Dict[str, Any]:
     issues: List[str] = []
     fixes: List[str] = []
@@ -526,56 +517,7 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
 
 
 def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    code = str(row.get("code") or "").strip()
-    payload = resolved_payload if isinstance(resolved_payload, dict) else _resolve_effective_payload_for_location(dict(row))
-
-    if code in {"auto-fastest", "auto-reserve"}:
-        if payload and _config_is_complete(payload):
-            platform_label = "virtual route ready"
-            android = {
-                "status": "ready",
-                "label": f"Android: {platform_label}",
-                "issues": [],
-                "fixes": [],
-            }
-            ios = {
-                "status": "ready",
-                "label": f"iOS: {platform_label}",
-                "issues": [],
-                "fixes": [],
-            }
-            return {
-                "summary_status": "ready",
-                "summary_text": "Virtual auto-location resolves to a live node.",
-                "issues": [],
-                "fixes": [],
-                "android": android,
-                "ios": ios,
-            }
-
-        issue = "No active VLESS node is available for auto selection."
-        fix = "Bring at least one real online location back or mark a real node as recommended/reserve."
-        android = {
-            "status": "warning",
-            "label": "Android: virtual route unavailable",
-            "issues": [issue],
-            "fixes": [fix],
-        }
-        ios = {
-            "status": "warning",
-            "label": "iOS: virtual route unavailable",
-            "issues": [issue],
-            "fixes": [fix],
-        }
-        return {
-            "summary_status": "warning",
-            "summary_text": issue,
-            "issues": [issue],
-            "fixes": [fix],
-            "android": android,
-            "ios": ios,
-        }
-
+    payload = resolved_payload if isinstance(resolved_payload, dict) else _compose_vpn_payload_for_location(dict(row))
     android = _build_tun_platform_diagnostics(payload, "Android")
     ios = _build_tun_platform_diagnostics(payload, "iOS")
 
@@ -652,7 +594,7 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
-    resolved_payload = _resolve_effective_payload_for_location(dict(row))
+    resolved_payload = _compose_vpn_payload_for_location(dict(row))
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
     if include_payload:
         item["vpn_payload"] = normalized_payload
