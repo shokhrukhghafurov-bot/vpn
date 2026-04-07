@@ -232,7 +232,7 @@ def issue_token(user_id: int, *, expires_delta: timedelta, token_type: str = "ac
         "typ": token_type,
         "iat": now,
         "exp": now + expires_delta,
-        "jti": uuid.uuid4().hex,
+        "jti": uuid4().hex,
     }
     return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
 
