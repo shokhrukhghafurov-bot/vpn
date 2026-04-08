@@ -1,5 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+import socket
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
 import base64
 import html
@@ -220,7 +221,7 @@ class AdminVpnSettingsIn(BaseModel):
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
 
-RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2")
+RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
 
 
 def _read_text_from_source(source: str) -> str:
@@ -326,6 +327,58 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
     return None
 
 
+def _get_location_by_code(code: str) -> Optional[Dict[str, Any]]:
+    for row in list_locations(active_only=False):
+        if str(row.get("code") or "") == code:
+            return dict(row)
+    return None
+
+
+def _ru_lte_latency_bonus(latency_ms: Optional[int]) -> int:
+    if latency_ms is None:
+        return 0
+    if latency_ms <= 150:
+        return 40
+    if latency_ms <= 300:
+        return 25
+    if latency_ms <= 700:
+        return 10
+    return 0
+
+
+def _ru_lte_probe_candidate(payload: Dict[str, Any], timeout_sec: int = 4) -> Dict[str, Any]:
+    server = str(payload.get("server") or "").strip()
+    port = int(payload.get("port") or 0)
+    result: Dict[str, Any] = {
+        "ok": False,
+        "latency_ms": None,
+        "error": None,
+        "resolved_ip": None,
+    }
+    if not server or port <= 0:
+        result["error"] = "server_or_port_missing"
+        return result
+
+    started = time.perf_counter()
+    try:
+        addrinfos = socket.getaddrinfo(server, port, type=socket.SOCK_STREAM)
+        if addrinfos:
+            result["resolved_ip"] = addrinfos[0][4][0]
+    except Exception as exc:
+        result["error"] = f"dns_error: {exc}"
+        return result
+
+    try:
+        with socket.create_connection((server, port), timeout=max(1, int(timeout_sec or 4))):
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            result["ok"] = True
+            result["latency_ms"] = latency_ms
+            return result
+    except Exception as exc:
+        result["error"] = f"connect_error: {exc}"
+        return result
+
+
 def refresh_ru_lte_locations() -> Dict[str, Any]:
     sources = [item for item in (settings.RU_LTE_SOURCE_URLS or []) if str(item or "").strip()]
     candidates: List[Dict[str, Any]] = []
@@ -366,23 +419,63 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         source_stats.append(stat)
 
     candidates.sort(key=lambda item: (int(item.get("_score") or 0), str(item.get("remark") or "")), reverse=True)
-    top = candidates[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 3))]
+
+    test_limit = max(int(settings.RU_LTE_MAX_CANDIDATES or 4), int(settings.RU_LTE_TEST_LIMIT or 40), 1)
+    tested_candidates = candidates[:test_limit]
+    live_candidates: List[Dict[str, Any]] = []
+    failed_checks: List[Dict[str, Any]] = []
+
+    for candidate in tested_candidates:
+        probe = _ru_lte_probe_candidate(candidate, timeout_sec=int(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
+        candidate["_probe"] = probe
+        if probe.get("ok"):
+            candidate["_live_score"] = int(candidate.get("_score") or 0) + _ru_lte_latency_bonus(probe.get("latency_ms"))
+            live_candidates.append(candidate)
+        else:
+            failed_checks.append({
+                "server": candidate.get("server"),
+                "transport": candidate.get("transport"),
+                "source": candidate.get("_source"),
+                "error": probe.get("error"),
+            })
+
+    live_candidates.sort(
+        key=lambda item: (
+            int(item.get("_live_score") or 0),
+            -int(item.get("_probe", {}).get("latency_ms") or 999999),
+            str(item.get("remark") or ""),
+        ),
+        reverse=True,
+    )
+
+    top = live_candidates[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))]
 
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
+    remark_by_code = {
+        "ru-lte": "Russia LTE",
+        "ru-lte-reserve-1": "Russia LTE | Reserve 1",
+        "ru-lte-reserve-2": "Russia LTE | Reserve 2",
+        "ru-lte-reserve-3": "Russia LTE | Reserve 3",
+    }
+
     for idx, code in enumerate(RU_LTE_LOCATION_CODES):
         payload = dict(top[idx]) if idx < len(top) else {}
         if payload:
+            probe = dict(payload.get("_probe") or {})
             payload.pop("_score", None)
             payload.pop("_source", None)
+            payload.pop("_live_score", None)
+            payload.pop("_probe", None)
             payload["location_code"] = code
-            payload["remark"] = {"ru-lte": "Russia LTE", "ru-lte-reserve-1": "Russia LTE | Reserve 1", "ru-lte-reserve-2": "Russia LTE | Reserve 2"}.get(code, code)
+            payload["remark"] = remark_by_code.get(code, code)
             updates = {
                 "vpn_payload": payload,
                 "status": "online",
                 "is_active": True,
                 "is_recommended": code == "ru-lte",
                 "is_reserve": code != "ru-lte",
+                "ping_ms": probe.get("latency_ms"),
                 "speed_checked_at": now_iso,
             }
             row = _patch_location_by_code(code, updates)
@@ -391,24 +484,45 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "server": payload.get("server"),
                 "transport": payload.get("transport"),
                 "remark": payload.get("remark"),
+                "latency_ms": probe.get("latency_ms"),
                 "updated": bool(row),
+                "kept_old": False,
             })
         else:
-            row = _patch_location_by_code(code, {
-                "status": "offline",
-                "is_active": True,
-                "is_recommended": False,
-                "is_reserve": code != "ru-lte",
-            })
-            assigned.append({"code": code, "server": None, "transport": None, "remark": None, "updated": bool(row)})
+            current = _get_location_by_code(code)
+            if current:
+                reserve_updates = {
+                    "is_active": True,
+                    "is_recommended": code == "ru-lte",
+                    "is_reserve": code != "ru-lte",
+                }
+                row = _patch_location_by_code(code, reserve_updates)
+                current_payload = _compose_vpn_payload_for_location(current)
+                assigned.append({
+                    "code": code,
+                    "server": (current_payload or {}).get("server"),
+                    "transport": (current_payload or {}).get("transport"),
+                    "remark": (current_payload or {}).get("remark") or remark_by_code.get(code, code),
+                    "latency_ms": current.get("ping_ms"),
+                    "updated": bool(row),
+                    "kept_old": True,
+                })
+            else:
+                assigned.append({"code": code, "server": None, "transport": None, "remark": None, "latency_ms": None, "updated": False, "kept_old": True})
 
     return {
         "ok": bool(top),
         "sources": source_stats,
         "candidates_total": len(candidates),
+        "tested_total": len(tested_candidates),
+        "live_total": len(live_candidates),
+        "failed_total": len(failed_checks),
+        "failed_sample": failed_checks[:10],
         "selected": assigned,
+        "kept_old_total": sum(1 for item in assigned if item.get("kept_old")),
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
+        "probe_mode": "tcp_connect",
     }
 
 
@@ -964,7 +1078,8 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
         "ru-lte": 0,
         "ru-lte-reserve-1": 1,
         "ru-lte-reserve-2": 2,
-        "se": 3,
+        "ru-lte-reserve-3": 3,
+        "se": 4,
     }
     concrete.sort(key=lambda row: (priority.get(str(row.get("code") or ""), 1000), int(row.get("sort_order") or 9999), str(row.get("name_en") or row.get("code") or "")))
     return concrete
