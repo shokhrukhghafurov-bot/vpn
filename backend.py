@@ -2,6 +2,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
 import base64
+import hashlib
 import html
 import json
 import secrets
@@ -47,6 +48,7 @@ from db_store import (
     get_user_by_telegram_id,
     get_user_snapshot_by_telegram,
     get_user_subscription_view,
+    get_subscription_device_gate_by_token,
     ensure_user_subscription_token,
     issue_auth_code,
     consume_auth_code,
@@ -59,6 +61,7 @@ from db_store import (
     record_bot_error,
     refresh_subscription_statuses,
     register_device,
+    touch_subscription_device_by_token,
     reset_user_devices_by_telegram,
     set_user_device_limit_override_by_telegram,
     set_user_language,
@@ -1127,6 +1130,116 @@ def _subscription_token_is_active(token: Optional[str]) -> bool:
 
 
 
+def _sanitize_tracking_value(value: Optional[str], *, max_len: int = 160) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in {'-', '_', '.', ':', '@'})
+    return cleaned[:max_len]
+
+
+
+def _detect_device_platform_and_name(request: Request) -> Tuple[str, str]:
+    user_agent = str(request.headers.get("user-agent") or "").strip()
+    ua = user_agent.lower()
+    sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip().strip('"').lower()
+    platform = "client"
+    if "android" in ua or sec_platform == "android":
+        platform = "android"
+    elif any(token in ua for token in ("iphone", "ipad", "ios")) or sec_platform in {"ios", "iphone", "ipad"}:
+        platform = "ios"
+    elif "windows" in ua:
+        platform = "windows"
+    elif any(token in ua for token in ("mac os", "macos", "darwin")):
+        platform = "macos"
+    elif "linux" in ua:
+        platform = "linux"
+
+    client_name = "VPN client"
+    if "hiddify" in ua:
+        client_name = "Hiddify"
+    elif "nekobox" in ua:
+        client_name = "NekoBox"
+    elif "nekoray" in ua:
+        client_name = "NekoRay"
+    elif "sing-box" in ua or "singbox" in ua:
+        client_name = "sing-box"
+
+    platform_title = {
+        "android": "Android",
+        "ios": "iOS",
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+    }.get(platform)
+    device_name = f"{client_name} {platform_title}" if platform_title else client_name
+    return platform, device_name
+
+
+
+def _client_ip_from_request(request: Request) -> str:
+    for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        raw = str(request.headers.get(header_name) or "").strip()
+        if raw:
+            return raw.split(",", 1)[0].strip()
+    client = getattr(request, "client", None)
+    host = getattr(client, "host", None)
+    return str(host or "").strip()
+
+
+
+def _build_subscription_device_fingerprint(request: Request, token: str, client_id: Optional[str] = None) -> Optional[str]:
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    if normalized_client_id:
+        source = f"cid:{normalized_client_id}"
+    else:
+        user_agent = str(request.headers.get("user-agent") or "").strip()
+        accept_language = str(request.headers.get("accept-language") or "").strip()
+        sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
+        client_ip = _client_ip_from_request(request)
+        parts = [user_agent, accept_language, sec_platform, client_ip]
+        if not any(part.strip() for part in parts):
+            return None
+        source = "fallback:" + "|".join(part.strip() for part in parts)
+    return hashlib.sha256(f"sub-device:v2:{token}:{source}".encode("utf-8")).hexdigest()
+
+
+
+def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> None:
+    if not access or access.get("kind") != "user":
+        return
+    user = access.get("user") or {}
+    if not user or user.get("status") == "blocked":
+        return
+    client_id = request.query_params.get("cid") or request.headers.get("x-client-id")
+    fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
+    if not fingerprint:
+        return
+    platform, device_name = _detect_device_platform_and_name(request)
+    try:
+        touch_subscription_device_by_token(token, platform=platform, device_name=device_name, device_fingerprint=fingerprint)
+    except Exception:
+        pass
+
+
+
+def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not access or access.get("kind") != "user":
+        return None
+    user = access.get("user") or {}
+    if not user or user.get("status") == "blocked":
+        return None
+    client_id = request.query_params.get("cid") or request.headers.get("x-client-id")
+    fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
+    if not fingerprint:
+        return None
+    try:
+        return get_subscription_device_gate_by_token(token, fingerprint)
+    except Exception:
+        return None
+
+
+
 def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
     normalized = _normalize_vpn_payload_keys(payload)
     if not normalized or not _config_is_complete(normalized):
@@ -1185,7 +1298,8 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
 
 
 @app.get("/sub/{token}")
-def public_subscription(token: str) -> Response:
+def public_subscription(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
+    del cid
     access = _subscription_access_context(token)
     if not access:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -1209,6 +1323,18 @@ def public_subscription(token: str) -> Response:
             except Exception:
                 pass
         profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
+
+        gate = _subscription_device_gate(request, token, access)
+        if gate and not gate.get("allowed"):
+            used = int(gate.get("devices_used") or 0)
+            limit = int(gate.get("device_limit") or 0)
+            content = (
+                f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
+                f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
+            )
+            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+
+    _track_subscription_device_access(request, token, access)
 
     rows = _subscription_location_rows()
     lines: List[str] = []
@@ -1287,9 +1413,11 @@ def open_app_bridge(
     }[norm_lang]
     copy_block = ""
     if subscription_url:
-        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code>{html.escape(subscription_url)}</code></div>'
+        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(subscription_url)}</code></div>'
     native_url_attr = html.escape(native_url or subscription_url or "", quote=True)
     native_url_js = json.dumps(native_url)
+    subscription_url_js = json.dumps(subscription_url or "")
+    import_name_js = json.dumps(str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip())
     android_intent_url = _build_android_intent_url(native_url)
     android_intent_url_js = json.dumps(android_intent_url)
     android_url = html.escape(str(settings.ANDROID_APP_URL or ""), quote=True)
@@ -1349,10 +1477,13 @@ def open_app_bridge(
   </div>
   <script>
     (function () {{
-      const nativeUrl = {native_url_js};
-      const androidIntentUrl = {android_intent_url_js};
+      const initialNativeUrl = {native_url_js};
+      const baseSubscriptionUrl = {subscription_url_js};
+      const importName = {import_name_js};
       const androidStoreUrl = {android_url_js};
       const iosStoreUrl = {ios_url_js};
+      const primaryButton = document.querySelector('.btn-primary');
+      const subscriptionCode = document.getElementById('subscription-link-value');
       const userAgent = navigator.userAgent || '';
       const isAndroid = /Android/i.test(userAgent);
       const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
@@ -1368,6 +1499,56 @@ def open_app_bridge(
       }});
       window.addEventListener('pagehide', markHidden);
       window.addEventListener('blur', markHidden);
+
+      const getClientId = function () {{
+        try {{
+          const key = 'inet-subscription-client-id';
+          let existing = window.localStorage.getItem(key);
+          if (existing) return existing;
+          const generated = 'cid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+          window.localStorage.setItem(key, generated);
+          return generated;
+        }} catch (error) {{
+          return 'cid-' + Date.now().toString(36);
+        }}
+      }};
+
+      const buildTrackedSubscriptionUrl = function () {{
+        if (!baseSubscriptionUrl) return '';
+        try {{
+          const url = new URL(baseSubscriptionUrl);
+          url.searchParams.set('cid', getClientId());
+          return url.toString();
+        }} catch (error) {{
+          return baseSubscriptionUrl;
+        }}
+      }};
+
+      const buildNativeUrl = function () {{
+        const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
+        if (!trackedSubscriptionUrl) return initialNativeUrl || '';
+        return 'hiddify://import/' + encodeURIComponent(trackedSubscriptionUrl) + '#' + encodeURIComponent(importName || 'Subscription');
+      }};
+
+      const currentNativeUrl = function () {{
+        return buildNativeUrl() || initialNativeUrl || '';
+      }};
+
+      const currentAndroidIntentUrl = function () {{
+        const nativeUrl = currentNativeUrl();
+        if (!nativeUrl || !isAndroid) return '';
+        const packageId = {json.dumps(_detect_android_app_package())};
+        if (!packageId) return '';
+        try {{
+          const parsed = new URL(nativeUrl);
+          const path = (parsed.host ? '//' + parsed.host : '') + (parsed.pathname || '');
+          const query = parsed.search || '';
+          const hash = parsed.hash || '';
+          return 'intent:' + path + query + hash + '#Intent;scheme=' + parsed.protocol.replace(':', '') + ';package=' + packageId + ';end';
+        }} catch (error) {{
+          return '';
+        }}
+      }};
 
       const launchByAnchor = function (url) {{
         if (!url) return;
@@ -1392,7 +1573,12 @@ def open_app_bridge(
       }};
 
       const tryOpen = function () {{
+        const nativeUrl = currentNativeUrl();
         if (!nativeUrl) return;
+        if (primaryButton) {{
+          primaryButton.href = nativeUrl;
+        }}
+        const androidIntentUrl = currentAndroidIntentUrl();
         if (isAndroid && androidIntentUrl) {{
           launchByAnchor(androidIntentUrl);
           window.setTimeout(function () {{
@@ -1415,8 +1601,14 @@ def open_app_bridge(
         window.setTimeout(openStoreIfNeeded, 1800);
       }};
 
+      if (subscriptionCode) {{
+        subscriptionCode.textContent = buildTrackedSubscriptionUrl() || subscriptionCode.textContent || '';
+      }}
+      if (primaryButton) {{
+        primaryButton.href = currentNativeUrl() || primaryButton.href;
+      }}
       window.setTimeout(tryOpen, 80);
-      document.querySelector('.btn-primary')?.addEventListener('click', function (event) {{
+      primaryButton?.addEventListener('click', function (event) {{
         event.preventDefault();
         tryOpen();
       }});
