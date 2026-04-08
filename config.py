@@ -52,6 +52,39 @@ def _parse_json_object(raw: str) -> Dict[str, Any]:
     return value if isinstance(value, dict) else {}
 
 
+def _normalize_store_url(value: str, platform: str) -> str:
+    raw = (value or "").strip()
+    defaults = {
+        "android": "https://app.hiddify.com/play",
+        "ios": "https://app.hiddify.com/ios",
+        "windows": "https://app.hiddify.com/windows",
+        "macos": "https://app.hiddify.com/mac",
+    }
+    fallback = defaults.get(platform, "")
+    if not raw:
+        return fallback
+    lowered = raw.lower()
+    legacy_markers = (
+        "/static/inet.apk",
+        "com.example.inet",
+        "com.inet.app",
+        "inet.apk",
+    )
+    if any(marker in lowered for marker in legacy_markers):
+        return fallback
+    return raw
+
+
+def _normalize_android_package(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return "app.hiddify.com"
+    lowered = raw.lower()
+    if lowered in {"com.example.inet", "com.inet.app"}:
+        return "app.hiddify.com"
+    return raw
+
+
 @dataclass
 class Settings:
     PORT: int = _env_int("PORT", 3000)
@@ -185,6 +218,11 @@ class Settings:
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
 
     def __post_init__(self) -> None:
+        self.ANDROID_APP_URL = _normalize_store_url(self.ANDROID_APP_URL, "android")
+        self.IOS_APP_URL = _normalize_store_url(self.IOS_APP_URL, "ios")
+        self.WINDOWS_APP_URL = _normalize_store_url(self.WINDOWS_APP_URL, "windows")
+        self.MACOS_APP_URL = _normalize_store_url(self.MACOS_APP_URL, "macos")
+        self.ANDROID_APP_PACKAGE = _normalize_android_package(self.ANDROID_APP_PACKAGE)
         if self.CORS_ORIGINS is None:
             self.CORS_ORIGINS = _env_list("CORS_ORIGINS", "*")
         if self.APP_LANGS is None:
