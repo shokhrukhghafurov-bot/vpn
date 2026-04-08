@@ -1,5 +1,5 @@
 {
-  "engine": "sing-box",
+  "engine": "nekobox",
   "protocol": "vless",
   "location_code": "ru-9-2",
   "remark": "Russia LTE 9/2",
@@ -21,3 +21,4 @@
   "domain_resolver": "dns-remote",
   "dns_servers": ["1.1.1.1", "8.8.8.8"]
 }
+
