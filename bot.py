@@ -259,12 +259,11 @@ async def issue_login_code_for_telegram_id(telegram_id: int, language: str = "ru
 def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
     if not token:
         return text
-    label = TEXT[lang].get('token_label', 'Login code')
-    device_text = ''
-    if device_limit and int(device_limit) > 0:
-        limit_label = TEXT[lang].get('devices_limit_hint', 'Devices')
-        device_text = f"\n{limit_label}: {int(device_limit)}"
-    return f"{text}\n\n{label}:\n{token}{device_text}"
+    token_label = TEXT[lang]["token_label"]
+    lines = [text, "", f"{token_label}: {token}"]
+    if device_limit:
+        lines.append(f"Устройства: 1 / {device_limit}" if lang == "ru" else f"Devices: 1 / {device_limit}")
+    return "\n".join(lines)
 
 
 def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
