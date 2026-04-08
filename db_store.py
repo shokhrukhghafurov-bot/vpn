@@ -767,7 +767,7 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     converted: Dict[str, Any] = {
         "protocol": "vless",
-        "engine": "sing-box",
+        "engine": "nekobox",
         "server": str(upstream.get("address") or "").strip(),
         "port": upstream.get("port"),
         "uuid": str(user.get("id") or "").strip(),
@@ -824,8 +824,8 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
                 normalized[key] = value
 
     engine = str(normalized.get("engine") or "").strip().lower()
-    if engine in {"", "xray", "xray-core"}:
-        normalized["engine"] = "sing-box"
+    if engine in {"", "xray", "xray-core", "sing-box", "singbox", "nekobox", "neko-box"}:
+        normalized["engine"] = "nekobox"
 
     normalized.setdefault("protocol", "vless")
     normalized.setdefault("transport", normalized.get("network") or "tcp")
