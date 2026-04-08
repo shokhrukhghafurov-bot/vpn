@@ -8,7 +8,7 @@ from pathlib import Path
 
 def build_mobile_payload(args: argparse.Namespace) -> dict:
     payload = {
-        "engine": "sing-box",
+        "engine": "nekobox",
         "protocol": "vless",
         "location_code": args.location_code,
         "remark": args.remark,
@@ -96,7 +96,7 @@ def build_bridge_config(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate both mobile vpn_payload and sing-box bridge config for a VLESS/REALITY location.")
+    parser = argparse.ArgumentParser(description="Generate both mobile vpn_payload for NekoBox and sing-box bridge config for a VLESS/REALITY location.")
     parser.add_argument('--location-code', required=True)
     parser.add_argument('--remark', required=True)
     parser.add_argument('--server', required=True, help='Public bridge host/IP the app connects to')
