@@ -371,6 +371,27 @@ def _ru_lte_transport_allowed(payload: Dict[str, Any]) -> bool:
     return transport in allowed
 
 
+def _black_source_priority(source: str) -> int:
+    raw = str(source or "").strip().lower()
+    if raw.endswith('/black_vless_rus_mobile.txt') or raw.endswith('black_vless_rus_mobile.txt'):
+        return 40
+    if raw.endswith('/black_vless_rus.txt') or raw.endswith('black_vless_rus.txt'):
+        return 30
+    if raw.endswith('/black_ss+all_rus.txt') or raw.endswith('black_ss+all_rus.txt'):
+        return 10
+    return 0
+
+
+def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
+    allowed = {item.strip().lower() for item in (settings.BLACK_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws", "xhttp"]) if str(item or "").strip()}
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    return transport in allowed if allowed else True
+
+
+def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _probe_candidate_with_timeout(payload, float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
+
+
 def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
     server = str(payload.get("server") or "").strip()
     port = int(payload.get("port") or 0)
@@ -605,6 +626,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "live_total": len(tested),
         "probe_errors": probe_errors,
         "selected": assigned,
+        "selected_live_total": len([item for item in assigned if item.get("server")]),
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
     }
@@ -656,7 +678,14 @@ def refresh_black_locations() -> Dict[str, Any]:
     test_limit = max(1, int(settings.BLACK_TEST_LIMIT or 40))
     tested: List[Dict[str, Any]] = []
     probe_errors = 0
+    max_candidates = max(1, int(settings.BLACK_MAX_CANDIDATES or 4))
+    probe_budget_seconds = max(8.0, min(float(settings.BLACK_AUTO_REFRESH_TIMEOUT_SEC or 600), 25.0))
+    probe_started = time.perf_counter()
     for candidate in candidates[:test_limit]:
+        if tested and len(tested) >= max_candidates and (time.perf_counter() - probe_started) >= 2.0:
+            break
+        if (time.perf_counter() - probe_started) >= probe_budget_seconds:
+            break
         probe = _black_probe_candidate(candidate)
         if not probe.get("ok"):
             probe_errors += 1
@@ -668,7 +697,7 @@ def refresh_black_locations() -> Dict[str, Any]:
         tested.append(normalized)
 
     tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
-    top = tested[: max(1, int(settings.BLACK_MAX_CANDIDATES or 4))]
+    top = tested[:max_candidates]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
     assigned: List[Dict[str, Any]] = []
@@ -754,6 +783,7 @@ def refresh_black_locations() -> Dict[str, Any]:
         "live_total": len(tested),
         "probe_errors": probe_errors,
         "selected": assigned,
+        "selected_live_total": len([item for item in assigned if item.get("server")]),
         "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
     }
