@@ -1012,6 +1012,33 @@ def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[st
     return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
 
 
+def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    bridge = (settings.OPEN_APP_BRIDGE_URL or "").strip()
+    if bridge:
+        parts = urlsplit(bridge)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if code:
+            query["code"] = code
+        elif token:
+            query["token"] = token
+        if lang:
+            query["lang"] = lang
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    try:
+        return str(request.url_for("open_app_bridge", code=code or "", token=token or "", lang=lang or "ru"))
+    except Exception:
+        base = str(request.base_url).rstrip("/")
+        query = {}
+        if code:
+            query["code"] = code
+        elif token:
+            query["token"] = token
+        if lang:
+            query["lang"] = lang
+        return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
+
+
 def _subscription_authorized(token: str) -> bool:
     expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
     provided = str(token or "").strip()
