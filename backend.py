@@ -42,9 +42,12 @@ from db_store import (
     get_plan_by_code,
     get_vpn_config_for_user,
     get_user_by_id,
+    get_user_by_subscription_token,
+    get_user_by_active_auth_code,
     get_user_by_telegram_id,
     get_user_snapshot_by_telegram,
     get_user_subscription_view,
+    ensure_user_subscription_token,
     issue_auth_code,
     consume_auth_code,
     list_admin_users,
@@ -996,20 +999,46 @@ def _bot_public_url() -> str:
     return settings.SUPPORT_TELEGRAM_URL
 
 
-def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
-    base = settings.OPEN_APP_URL or "inet://login"
-    parts = urlsplit(base)
-    path = parts.path
-    if parts.scheme and parts.scheme not in {"http", "https"} and path == "/":
-        path = ""
-    query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    if code:
-        query["code"] = code
-    elif token:
-        query["token"] = token
-    if lang:
-        query["lang"] = lang
-    return urlunsplit((parts.scheme, parts.netloc, path, urlencode(query), parts.fragment))
+def _subscription_public_url_from_base(base_url: str, token: Optional[str]) -> Optional[str]:
+    base = str(base_url or "").strip().rstrip("/")
+    clean_token = str(token or "").strip()
+    if not base or not clean_token:
+        return None
+    return f"{base}/sub/{quote(clean_token, safe='')}"
+
+
+def _resolve_subscription_token(*, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
+    clean_token = str(token or "").strip()
+    if clean_token:
+        return clean_token
+    clean_code = str(code or "").strip()
+    if not clean_code:
+        return None
+    user = get_user_by_active_auth_code(clean_code)
+    if not user:
+        return None
+    return ensure_user_subscription_token(int(user["id"]))
+
+
+def _subscription_public_url(request: Optional[Request] = None, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
+    clean_token = _resolve_subscription_token(token=token, code=code)
+    if not clean_token:
+        return None
+    if request is not None:
+        try:
+            return str(request.url_for("public_subscription", token=clean_token))
+        except Exception:
+            pass
+    return _subscription_public_url_from_base(settings.BACKEND_BASE_URL, clean_token)
+
+
+def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    del lang
+    subscription_url = _subscription_public_url(request, token=token, code=code)
+    if not subscription_url:
+        return ""
+    import_name = str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip()
+    return f"hiddify://import/{quote(subscription_url, safe=':/?&=%')}#{quote(import_name, safe='')}"
 
 
 def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
@@ -1070,10 +1099,17 @@ def _build_android_intent_url(native_url: str) -> str:
     )
 
 
-def _subscription_authorized(token: str) -> bool:
-    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+def _subscription_access_context(token: str) -> Optional[Dict[str, Any]]:
     provided = str(token or "").strip()
-    return bool(expected and provided and secrets.compare_digest(provided, expected))
+    if not provided:
+        return None
+    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+    if settings.LEGACY_GLOBAL_SUBSCRIPTION_TOKEN_ENABLED and expected and secrets.compare_digest(provided, expected):
+        return {"kind": "global", "user": None}
+    user = get_user_by_subscription_token(provided)
+    if user:
+        return {"kind": "user", "user": user}
+    return None
 
 
 
@@ -1136,8 +1172,29 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
 
 @app.get("/sub/{token}")
 def public_subscription(token: str) -> Response:
-    if not _subscription_authorized(token):
+    access = _subscription_access_context(token)
+    if not access:
         raise HTTPException(status_code=404, detail="Subscription not found")
+
+    expires_ts = int(time.time()) + 86400 * 3650
+    profile_title = f"{settings.APP_NAME} Subscription"
+    if access["kind"] == "user":
+        user = access["user"]
+        if not user or user.get("status") == "blocked":
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        view = get_user_subscription_view(int(user["id"]))
+        if not view.get("is_active") or not view.get("subscription"):
+            raise HTTPException(status_code=403, detail="Active subscription required")
+        subscription = view["subscription"] or {}
+        expires_at = subscription.get("expires_at")
+        if isinstance(expires_at, datetime):
+            expires_ts = int(expires_at.timestamp())
+        elif isinstance(expires_at, str):
+            try:
+                expires_ts = int(datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                pass
+        profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
 
     rows = _subscription_location_rows()
     lines: List[str] = []
@@ -1154,8 +1211,8 @@ def public_subscription(token: str) -> Response:
     content = "\n".join(lines) + "\n"
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
-        "Profile-Title": quote(f"base64:{base64.b64encode(f'{settings.APP_NAME} Subscription'.encode('utf-8')).decode('ascii')}", safe=':='),
-        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={int(time.time()) + 86400 * 3650}",
+        "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
+        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
     }
     return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
 
@@ -1164,7 +1221,7 @@ def public_subscription(token: str) -> Response:
 def public_subscription_hint() -> Dict[str, Any]:
     return {
         "ok": True,
-        "message": "Use /sub/<SUBSCRIPTION_TOKEN>",
+        "message": "Use /sub/<personal_subscription_token>",
     }
 
 
@@ -1176,48 +1233,61 @@ def open_app_bridge(
     lang: str = Query(default="ru"),
 ) -> HTMLResponse:
     norm_lang = "en" if lang == "en" else "ru"
-    native_url = _build_native_open_app_url(code=code, token=token, lang=norm_lang)
+    resolved_token = _resolve_subscription_token(token=token, code=code)
+    native_url = _build_native_open_app_url(request=request, code=code, token=resolved_token, lang=norm_lang)
+    subscription_url = _subscription_public_url(request, token=resolved_token)
     bot_url = _bot_public_url()
     page_text = {
         "ru": {
-            "title": "Открываем INET",
-            "headline": "Открываем приложение…",
-            "body": "Приложение должно открыться автоматически. Если этого не произошло, нажмите кнопку ниже.",
-            "open_button": "Открыть приложение",
-            "android_button": "Скачать Android",
-            "ios_button": "Скачать iPhone / iPad",
+            "title": "Подключение через Hiddify",
+            "headline": "Открываем Hiddify…",
+            "body": "Hiddify должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
+            "invalid_link": "Ссылка недействительна или истекла. Вернитесь в бота и запросите новую персональную ссылку.",
+            "open_button": "Открыть в Hiddify",
+            "android_button": "Скачать Hiddify для Android",
+            "ios_button": "Скачать Hiddify для iPhone / iPad",
+            "windows_button": "Скачать Hiddify для Windows",
+            "macos_button": "Скачать Hiddify для macOS",
+            "copy_label": "Персональная ссылка подписки",
             "bot_button": "Вернуться в бота",
-            "code_label": "Код для входа",
         },
         "en": {
-            "title": "Opening INET",
-            "headline": "Opening the app…",
-            "body": "The app should open automatically. If it does not, use the button below.",
-            "open_button": "Open app",
-            "android_button": "Download Android",
-            "ios_button": "Download iPhone / iPad",
+            "title": "Connect with Hiddify",
+            "headline": "Opening Hiddify…",
+            "body": "Hiddify should open automatically and import your personal subscription. If it does not, use the buttons below.",
+            "invalid_link": "This link is invalid or expired. Return to the bot and request a new personal link.",
+            "open_button": "Open in Hiddify",
+            "android_button": "Download Hiddify for Android",
+            "ios_button": "Download Hiddify for iPhone / iPad",
+            "windows_button": "Download Hiddify for Windows",
+            "macos_button": "Download Hiddify for macOS",
+            "copy_label": "Personal subscription link",
             "bot_button": "Back to bot",
-            "code_label": "Login code",
         },
     }[norm_lang]
-    code_block = ""
-    if code:
-        code_block = f'<div class="code"><div class="label">{html.escape(page_text["code_label"])}</div><code>{html.escape(code)}</code></div>'
-    native_url_attr = html.escape(native_url, quote=True)
+    copy_block = ""
+    if subscription_url:
+        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code>{html.escape(subscription_url)}</code></div>'
+    native_url_attr = html.escape(native_url or subscription_url or "", quote=True)
     native_url_js = json.dumps(native_url)
     android_intent_url = _build_android_intent_url(native_url)
     android_intent_url_js = json.dumps(android_intent_url)
-    android_url = html.escape(settings.ANDROID_APP_URL, quote=True)
+    android_url = html.escape(str(settings.ANDROID_APP_URL or ""), quote=True)
     android_url_js = json.dumps(str(settings.ANDROID_APP_URL or ""))
-    ios_url = html.escape(settings.IOS_APP_URL, quote=True)
+    ios_url = html.escape(str(settings.IOS_APP_URL or ""), quote=True)
     ios_url_js = json.dumps(str(settings.IOS_APP_URL or ""))
+    windows_url = html.escape(str(getattr(settings, "WINDOWS_APP_URL", "") or ""), quote=True)
+    macos_url = html.escape(str(getattr(settings, "MACOS_APP_URL", "") or ""), quote=True)
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
-    body = html.escape(page_text["body"])
+    body_value = page_text["body"] if subscription_url else page_text["invalid_link"]
+    body = html.escape(body_value)
     open_button = html.escape(page_text["open_button"])
     android_button = html.escape(page_text["android_button"])
     ios_button = html.escape(page_text["ios_button"])
+    windows_button = html.escape(page_text["windows_button"])
+    macos_button = html.escape(page_text["macos_button"])
     bot_button = html.escape(page_text["bot_button"])
     html_page = f"""<!doctype html>
 <html lang="{norm_lang}">
@@ -1238,7 +1308,7 @@ def open_app_bridge(
     .btn-secondary {{ background: #1f2937; color: #f3f4f6; }}
     .code {{ margin: 0 0 20px; padding: 16px; border-radius: 16px; background: #0f172a; border: 1px solid #1e293b; }}
     .label {{ font-size: 13px; color: #94a3b8; margin-bottom: 8px; }}
-    code {{ display: block; font-size: 18px; font-weight: 700; word-break: break-all; }}
+    code {{ display: block; font-size: 15px; font-weight: 700; word-break: break-all; }}
   </style>
 </head>
 <body>
@@ -1246,11 +1316,13 @@ def open_app_bridge(
     <div class="card">
       <h1>{headline}</h1>
       <p>{body}</p>
-      {code_block}
+      {copy_block}
       <div class="actions">
         <a class="btn btn-primary" href="{native_url_attr}">{open_button}</a>
         <a class="btn btn-secondary" href="{android_url}">{android_button}</a>
         <a class="btn btn-secondary" href="{ios_url}">{ios_button}</a>
+        <a class="btn btn-secondary" href="{windows_url}">{windows_button}</a>
+        <a class="btn btn-secondary" href="{macos_url}">{macos_button}</a>
         <a class="btn btn-secondary" href="{bot_url_attr}">{bot_button}</a>
       </div>
     </div>
@@ -1300,6 +1372,7 @@ def open_app_bridge(
       }};
 
       const tryOpen = function () {{
+        if (!nativeUrl) return;
         if (isAndroid && androidIntentUrl) {{
           launchByAnchor(androidIntentUrl);
           window.setTimeout(function () {{
@@ -1442,6 +1515,10 @@ def app_config() -> Dict[str, Any]:
         "bot_url": _bot_public_url(),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "payments_enabled": settings.PAYMENTS_ENABLED,
+        "android_app_url": settings.ANDROID_APP_URL,
+        "ios_app_url": settings.IOS_APP_URL,
+        "windows_app_url": getattr(settings, "WINDOWS_APP_URL", ""),
+        "macos_app_url": getattr(settings, "MACOS_APP_URL", ""),
         "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
         "feature_flags": {
             "auth_refresh": True,
@@ -1464,7 +1541,9 @@ def plans() -> Dict[str, Any]:
 def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
-    return {"ok": True, **view}
+    subscription_token = view.get("subscription_token") or ensure_user_subscription_token(int(user["id"]))
+    subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, subscription_token)
+    return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url}
 
 
 @app.get("/devices")
