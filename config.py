@@ -221,6 +221,8 @@ class Settings:
     RU_LTE_TEST_LIMIT: int = _env_int("RU_LTE_TEST_LIMIT", 40)
     RU_LTE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_CONNECT_TIMEOUT_SEC", 4)
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
+    HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS: List[str] = None
+    HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS: int = _env_int("HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1)
 
     BLACK_SOURCE_URLS: List[str] = None
     BLACK_REFRESH_ON_STARTUP: bool = _env_bool("BLACK_REFRESH_ON_STARTUP", False)
@@ -231,9 +233,6 @@ class Settings:
     BLACK_TEST_LIMIT: int = _env_int("BLACK_TEST_LIMIT", 40)
     BLACK_CONNECT_TIMEOUT_SEC: int = _env_int("BLACK_CONNECT_TIMEOUT_SEC", 4)
     BLACK_ALLOWED_TRANSPORTS: List[str] = None
-
-    APP_SYNC_POLL_SEC: int = _env_int("APP_SYNC_POLL_SEC", 60)
-    APP_SYNC_MIN_POLL_SEC: int = _env_int("APP_SYNC_MIN_POLL_SEC", 15)
 
     def __post_init__(self) -> None:
         self.ANDROID_APP_URL = _normalize_store_url(self.ANDROID_APP_URL, "android")
@@ -250,14 +249,16 @@ class Settings:
         if self.VLESS_ALPN is None:
             self.VLESS_ALPN = _env_list("VLESS_ALPN", "")
         if self.RU_LTE_ALLOWED_TRANSPORTS is None:
-            self.RU_LTE_ALLOWED_TRANSPORTS = _env_list("RU_LTE_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
+            self.RU_LTE_ALLOWED_TRANSPORTS = _env_list("RU_LTE_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
+        if self.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS is None:
+            self.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS = _env_list("HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
         if self.RU_LTE_SOURCE_URLS is None:
             self.RU_LTE_SOURCE_URLS = _env_list(
                 "RU_LTE_SOURCE_URLS",
                 "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
             )
         if self.BLACK_ALLOWED_TRANSPORTS is None:
-            self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
+            self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
         if self.BLACK_SOURCE_URLS is None:
             self.BLACK_SOURCE_URLS = _env_list(
                 "BLACK_SOURCE_URLS",
