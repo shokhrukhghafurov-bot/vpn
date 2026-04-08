@@ -260,7 +260,7 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     transport = (query.get("type") or query.get("transport") or query.get("network") or "tcp").strip() or "tcp"
     payload: Dict[str, Any] = {
-        "engine": "sing-box",
+        "engine": "nekobox",
         "protocol": "vless",
         "server": server,
         "port": port,
@@ -1106,7 +1106,7 @@ def public_subscription(token: str) -> Response:
 def public_subscription_hint() -> Dict[str, Any]:
     return {
         "ok": True,
-        "message": "Use /sub/<SUBSCRIPTION_TOKEN>",
+        "message": "Use /sub/<SUBSCRIPTION_TOKEN> and import it into NekoBox as a subscription",
     }
 
 
