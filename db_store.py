@@ -824,7 +824,7 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
                 normalized[key] = value
 
     engine = str(normalized.get("engine") or "").strip().lower()
-    if engine in {"", "xray", "xray-core", "sing-box", "singbox", "nekobox", "neko-box"}:
+    if engine in {"", "xray", "xray-core"}:
         normalized["engine"] = "nekobox"
 
     normalized.setdefault("protocol", "vless")
