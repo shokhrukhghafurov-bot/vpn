@@ -820,6 +820,8 @@ _LOCATIONS_CACHE_TTL_SEC = 15
 _locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
 _ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
 _black_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+_APP_BOOTED_AT = datetime.now(timezone.utc)
+_APP_BOOTED_AT_ISO = _APP_BOOTED_AT.isoformat()
 
 
 def _invalidate_locations_cache() -> None:
@@ -901,16 +903,167 @@ def _start_black_auto_refresh_loop() -> None:
     thread.start()
 
 
-def _cached_locations_payload() -> List[Dict[str, Any]]:
+def _cached_locations_payload(*, force_refresh: bool = False) -> List[Dict[str, Any]]:
     now = time.monotonic()
     cached_items = _locations_cache.get("items")
     expires_at = float(_locations_cache.get("expires_at") or 0.0)
-    if cached_items is not None and expires_at > now:
+    if not force_refresh and cached_items is not None and expires_at > now:
         return cached_items
     items = [serialize_location(row) for row in list_locations(active_only=True)]
     _locations_cache["items"] = items
     _locations_cache["expires_at"] = now + _LOCATIONS_CACHE_TTL_SEC
     return items
+
+
+
+def _json_default(value: Any) -> Any:
+    if isinstance(value, datetime):
+        if value.tzinfo is None:
+            value = value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc).isoformat()
+    return str(value)
+
+
+
+def _stable_json(value: Any) -> str:
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=_json_default)
+
+
+
+def _parse_iso_datetime(value: Any) -> Optional[datetime]:
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        except Exception:
+            return None
+    return None
+
+
+
+def _latest_iso_timestamp(*values: Any) -> str:
+    latest = _APP_BOOTED_AT
+    for value in values:
+        if isinstance(value, list):
+            for item in value:
+                parsed = _parse_iso_datetime(item)
+                if parsed and parsed > latest:
+                    latest = parsed
+            continue
+        parsed = _parse_iso_datetime(value)
+        if parsed and parsed > latest:
+            latest = parsed
+    return latest.astimezone(timezone.utc).isoformat()
+
+
+
+def _apply_no_cache_headers(response: Response, *, version: Optional[str] = None, updated_at: Optional[str] = None, etag: Optional[str] = None) -> None:
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    if version:
+        response.headers["X-Config-Version"] = str(version)
+    if updated_at:
+        response.headers["X-Config-Updated-At"] = str(updated_at)
+        response.headers["Last-Modified"] = str(updated_at)
+    if etag:
+        response.headers["ETag"] = etag
+
+
+
+def _locations_snapshot(*, force_refresh: bool = False) -> Dict[str, Any]:
+    items = _cached_locations_payload(force_refresh=force_refresh)
+    updated_at_values = [item.get("updated_at") for item in items if item.get("updated_at")]
+    updated_at_values.extend(item.get("speed_checked_at") for item in items if item.get("speed_checked_at"))
+    updated_at = _latest_iso_timestamp(updated_at_values)
+    version_payload = {
+        "items": [
+            {
+                "id": item.get("id"),
+                "code": item.get("code"),
+                "status": item.get("status"),
+                "is_active": item.get("is_active"),
+                "is_recommended": item.get("is_recommended"),
+                "is_reserve": item.get("is_reserve"),
+                "sort_order": item.get("sort_order"),
+                "ping_ms": item.get("ping_ms"),
+                "download_mbps": item.get("download_mbps"),
+                "upload_mbps": item.get("upload_mbps"),
+                "vpn_payload_complete": item.get("vpn_payload_complete"),
+                "updated_at": item.get("updated_at"),
+                "speed_checked_at": item.get("speed_checked_at"),
+            }
+            for item in items
+        ],
+        "cache_ttl_sec": _LOCATIONS_CACHE_TTL_SEC,
+    }
+    version = hashlib.sha1(_stable_json(version_payload).encode("utf-8")).hexdigest()[:16]
+    return {"items": items, "version": version, "updated_at": updated_at}
+
+
+
+def _app_config_payload() -> Dict[str, Any]:
+    return {
+        "app_name": settings.APP_NAME,
+        "support_url": settings.SUPPORT_TELEGRAM_URL,
+        "bot_url": _bot_public_url(),
+        "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
+        "payments_enabled": settings.PAYMENTS_ENABLED,
+        "android_app_url": settings.ANDROID_APP_URL,
+        "ios_app_url": settings.IOS_APP_URL,
+        "windows_app_url": getattr(settings, "WINDOWS_APP_URL", ""),
+        "macos_app_url": getattr(settings, "MACOS_APP_URL", ""),
+        "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
+        "sync": {
+            "poll_sec": max(5, int(settings.APP_SYNC_POLL_SEC or 60)),
+            "min_poll_sec": max(5, int(settings.APP_SYNC_MIN_POLL_SEC or 15)),
+            "locations_cache_ttl_sec": _LOCATIONS_CACHE_TTL_SEC,
+            "subscription_path": "/sub/{token}",
+            "version_path": "/config/version",
+            "sync_path": "/sync",
+        },
+        "feature_flags": {
+            "auth_refresh": True,
+            "auth_logout": True,
+            "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
+            "payments_enabled": settings.PAYMENTS_ENABLED,
+            "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
+            "settings_editable": True,
+            "live_sync": True,
+            "fresh_payload_before_connect": True,
+        },
+    }
+
+
+
+def _app_config_snapshot(*, locations_snapshot: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload = _app_config_payload()
+    payload["booted_at"] = _APP_BOOTED_AT_ISO
+    settings_version = hashlib.sha1(_stable_json(payload).encode("utf-8")).hexdigest()[:16]
+    location_state = locations_snapshot or _locations_snapshot()
+    version = hashlib.sha1(f"{settings_version}:{location_state['version']}".encode("utf-8")).hexdigest()[:16]
+    updated_at = _latest_iso_timestamp(_APP_BOOTED_AT_ISO, location_state.get("updated_at"))
+    payload["config_version"] = version
+    payload["config_updated_at"] = updated_at
+    payload["locations_version"] = location_state["version"]
+    return {"payload": payload, "version": version, "updated_at": updated_at}
+
+
+
+def _sync_snapshot(*, force_refresh: bool = False) -> Dict[str, Any]:
+    location_state = _locations_snapshot(force_refresh=force_refresh)
+    app_state = _app_config_snapshot(locations_snapshot=location_state)
+    version = hashlib.sha1(f"{app_state['version']}:{location_state['version']}".encode("utf-8")).hexdigest()[:16]
+    updated_at = _latest_iso_timestamp(app_state.get("updated_at"), location_state.get("updated_at"))
+    return {
+        "version": version,
+        "updated_at": updated_at,
+        "app_config": app_state["payload"],
+        "locations": location_state["items"],
+        "locations_version": location_state["version"],
+    }
 
 
 
@@ -970,6 +1123,7 @@ def _issue_auth_payload(user: Dict[str, Any], *, is_new: bool = False) -> Dict[s
     access_token = issue_access_token(user_id)
     refresh_token = issue_refresh_token(user_id)
     view = get_user_subscription_view(user_id)
+    sync_state = _sync_snapshot()
     return {
         "ok": True,
         "token": access_token,
@@ -979,6 +1133,7 @@ def _issue_auth_payload(user: Dict[str, Any], *, is_new: bool = False) -> Dict[s
         "subscription": view.get("subscription"),
         "language": fresh_user.get("language") or "ru",
         "is_new": is_new,
+        "config_version": sync_state["version"],
     }
 
 
@@ -1609,7 +1764,7 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
 
 @app.get("/sub/{token}")
 def public_subscription(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
-    del cid
+    _ = cid
     access = _subscription_access_context(token)
     if not access:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -1659,10 +1814,19 @@ def public_subscription(request: Request, token: str, cid: Optional[str] = Query
         raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
 
     content = "\n".join(lines) + "\n"
+    subscription_version = hashlib.sha1(content.encode("utf-8")).hexdigest()[:16]
+    latest_updated_at = _latest_iso_timestamp([row.get("updated_at") for row in rows], [row.get("speed_checked_at") for row in rows])
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
         "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
         "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
+        "ETag": f'W/"sub-{subscription_version}"',
+        "X-Config-Version": subscription_version,
+        "X-Config-Updated-At": latest_updated_at,
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "Last-Modified": latest_updated_at,
     }
     return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
 
@@ -2029,28 +2193,41 @@ def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_curre
     return {"ok": True, "user": updated}
 
 
-@app.get("/app/config")
-def app_config() -> Dict[str, Any]:
+@app.get("/config/version")
+def config_version(response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
+    snapshot = _sync_snapshot(force_refresh=force)
+    _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"], etag=f'W/"sync-{snapshot["version"]}"')
     return {
-        "app_name": settings.APP_NAME,
-        "support_url": settings.SUPPORT_TELEGRAM_URL,
-        "bot_url": _bot_public_url(),
-        "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
-        "payments_enabled": settings.PAYMENTS_ENABLED,
-        "android_app_url": settings.ANDROID_APP_URL,
-        "ios_app_url": settings.IOS_APP_URL,
-        "windows_app_url": getattr(settings, "WINDOWS_APP_URL", ""),
-        "macos_app_url": getattr(settings, "MACOS_APP_URL", ""),
-        "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
-        "feature_flags": {
-            "auth_refresh": True,
-            "auth_logout": True,
-            "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
-            "payments_enabled": settings.PAYMENTS_ENABLED,
-            "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
-            "settings_editable": True,
-        },
+        "ok": True,
+        "version": snapshot["version"],
+        "updated_at": snapshot["updated_at"],
+        "locations_version": snapshot["locations_version"],
+        "poll_sec": max(5, int(settings.APP_SYNC_POLL_SEC or 60)),
+        "min_poll_sec": max(5, int(settings.APP_SYNC_MIN_POLL_SEC or 15)),
     }
+
+
+@app.get("/sync")
+def sync_state(response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
+    snapshot = _sync_snapshot(force_refresh=force)
+    _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"], etag=f'W/"sync-{snapshot["version"]}"')
+    return {
+        "ok": True,
+        "version": snapshot["version"],
+        "updated_at": snapshot["updated_at"],
+        "app_config": snapshot["app_config"],
+        "locations": snapshot["locations"],
+        "locations_version": snapshot["locations_version"],
+    }
+
+
+@app.get("/app/config")
+def app_config(response: Response) -> Dict[str, Any]:
+    snapshot = _app_config_snapshot()
+    _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"], etag=f'W/"app-{snapshot["version"]}"')
+    payload = dict(snapshot["payload"])
+    payload["ok"] = True
+    return payload
 
 
 @app.get("/plans")
@@ -2060,7 +2237,7 @@ def plans() -> Dict[str, Any]:
 
 
 @app.get("/subscriptions/me")
-def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+def subscription_me(response: Response, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
     if view.get("is_active") and view.get("subscription"):
@@ -2069,7 +2246,9 @@ def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[st
     else:
         subscription_token = None
         subscription_url = None
-    return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url}
+    sync_snapshot = _sync_snapshot()
+    _apply_no_cache_headers(response, version=sync_snapshot["version"], updated_at=sync_snapshot["updated_at"])
+    return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url, "config_version": sync_snapshot["version"]}
 
 
 @app.get("/devices")
@@ -2099,21 +2278,38 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
 
 
 @app.get("/locations")
-def locations() -> Dict[str, Any]:
-    return {"ok": True, "items": _cached_locations_payload()}
+def locations(response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
+    snapshot = _locations_snapshot(force_refresh=force)
+    _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"], etag=f'W/"locations-{snapshot["version"]}"')
+    return {"ok": True, "version": snapshot["version"], "updated_at": snapshot["updated_at"], "items": snapshot["items"]}
 
 
 @app.get("/locations/status")
-def locations_status() -> Dict[str, Any]:
-    items = _cached_locations_payload()
-    return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
+def locations_status(response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
+    snapshot = _locations_snapshot(force_refresh=force)
+    _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"], etag=f'W/"locations-{snapshot["version"]}"')
+    items = snapshot["items"]
+    return {"ok": True, "version": snapshot["version"], "updated_at": snapshot["updated_at"], "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
+
+
+@app.get("/locations/{location_code}")
+def location_detail(location_code: str, response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
+    snapshot = _locations_snapshot(force_refresh=force)
+    for row in snapshot["items"]:
+        if str(row.get("code") or "") == location_code:
+            _apply_no_cache_headers(response, version=snapshot["version"], updated_at=snapshot["updated_at"])
+            return {"ok": True, "version": snapshot["version"], "updated_at": snapshot["updated_at"], "item": row}
+    raise HTTPException(status_code=404, detail="Location not found")
 
 
 @app.get("/vpn/config/{location_code}")
-def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+def vpn_config(location_code: str, response: Response, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     try:
         config = get_vpn_config_for_user(user["id"], location_code)
-        return {"ok": True, "config": config}
+        payload_version = hashlib.sha1(_stable_json(config).encode("utf-8")).hexdigest()[:16]
+        sync_snapshot = _sync_snapshot()
+        _apply_no_cache_headers(response, version=payload_version, updated_at=sync_snapshot["updated_at"], etag=f'W/"vpn-{location_code}-{payload_version}"')
+        return {"ok": True, "config": config, "config_version": payload_version, "locations_version": sync_snapshot["locations_version"]}
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
@@ -2539,6 +2735,7 @@ def admin_locations_create(payload: LocationIn, admin_name: str = Depends(requir
     _ = admin_name
     try:
         item = create_location(payload.model_dump())
+        _invalidate_locations_cache()
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2553,6 +2750,7 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     data = {key: value for key, value in payload.model_dump().items() if value is not None}
     try:
         item = patch_location(location_id, data)
+        _invalidate_locations_cache()
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -2563,6 +2761,7 @@ def admin_locations_delete(location_id: int, admin_name: str = Depends(require_a
     _ = admin_name
     try:
         item = delete_location(location_id)
+        _invalidate_locations_cache()
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
