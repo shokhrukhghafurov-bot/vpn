@@ -38,12 +38,12 @@ TEXT: Dict[str, Dict[str, str]] = {
         "buy": "💳 Купить подписку",
         "sub": "📄 Моя подписка",
         "devices": "📱 Мои устройства",
-        "download": "⬇️ Скачать приложение",
+        "download": "⬇️ Hiddify / Подключение",
         "support": "🛟 Поддержка",
         "language": "🌐 Язык",
         "renew": "🔄 Продлить",
-        "open_app": "🚀 Открыть приложение",
-        "download_app": "⬇️ Скачать приложение",
+        "open_app": "🚀 Открыть в Hiddify",
+        "download_app": "⬇️ Скачать Hiddify",
         "back": "⬅️ Назад",
         "main_menu": "🏠 Главное меню",
         "choose_language": "🌐 Выберите язык",
@@ -73,11 +73,13 @@ TEXT: Dict[str, Dict[str, str]] = {
         "limit_reached": "Лимит устройств достигнут",
         "devices_none": "Устройств пока нет.",
         "device_removed": "Устройство удалено. Слот освобождён.",
-        "choose_platform": "Выберите платформу:",
+        "choose_platform": "Выберите платформу для установки Hiddify:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
-        "download_android": "Android: скачайте приложение по кнопке ниже, затем войдите под своим аккаунтом.",
-        "download_ios": "iPhone / iPad: откройте ссылку ниже и установите приложение.",
+        "windows": "🪟 Windows",
+        "macos": "💻 macOS",
+        "download_android": "Android: установите Hiddify, затем нажмите кнопку ниже для импорта вашей подписки.",
+        "download_ios": "iPhone / iPad: установите Hiddify, затем нажмите кнопку ниже для импорта вашей подписки.",
         "support_text": "🛟 Связаться с поддержкой",
         "faq": "FAQ",
         "write_support": "✉️ Написать в поддержку",
@@ -94,6 +96,10 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Доступно устройств",
         "token_label": "Код входа",
         "copy_token": "📋 Скопировать код",
+        "download_windows": "Windows: установите Hiddify, затем откройте ссылку импорта из браузера или вставьте подписку вручную.",
+        "download_macos": "macOS: установите Hiddify, затем откройте ссылку импорта из браузера или вставьте подписку вручную.",
+        "copy_subscription": "📋 Скопировать ссылку подписки",
+        "manual_import_hint": "Если Hiddify не открылся автоматически, скопируйте ссылку подписки и импортируйте её вручную в Hiddify.",
     },
     "en": {
         "welcome": "👋 Welcome to INET\nChoose an action below",
@@ -102,12 +108,12 @@ TEXT: Dict[str, Dict[str, str]] = {
         "buy": "💳 Buy subscription",
         "sub": "📄 My subscription",
         "devices": "📱 My devices",
-        "download": "⬇️ Download app",
+        "download": "⬇️ Hiddify / Connect",
         "support": "🛟 Support",
         "language": "🌐 Language",
         "renew": "🔄 Renew",
-        "open_app": "🚀 Open app",
-        "download_app": "⬇️ Download app",
+        "open_app": "🚀 Open in Hiddify",
+        "download_app": "⬇️ Download Hiddify",
         "back": "⬅️ Back",
         "main_menu": "🏠 Main menu",
         "choose_language": "🌐 Choose language",
@@ -137,11 +143,13 @@ TEXT: Dict[str, Dict[str, str]] = {
         "limit_reached": "Device limit reached",
         "devices_none": "No devices yet.",
         "device_removed": "Device removed. Slot released.",
-        "choose_platform": "Choose platform:",
+        "choose_platform": "Choose a platform to install Hiddify:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
-        "download_android": "Android: download the app with the button below and sign in with your account.",
-        "download_ios": "iPhone / iPad: open the link below and install the app.",
+        "windows": "🪟 Windows",
+        "macos": "💻 macOS",
+        "download_android": "Android: install Hiddify, then use the button below to import your subscription.",
+        "download_ios": "iPhone / iPad: install Hiddify, then use the button below to import your subscription.",
         "support_text": "🛟 Contact support",
         "faq": "FAQ",
         "write_support": "✉️ Write to support",
@@ -158,6 +166,10 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Devices available",
         "token_label": "Login code",
         "copy_token": "📋 Copy code",
+        "download_windows": "Windows: install Hiddify, then open the import link from your browser or paste the subscription manually.",
+        "download_macos": "macOS: install Hiddify, then open the import link from your browser or paste the subscription manually.",
+        "copy_subscription": "📋 Copy subscription link",
+        "manual_import_hint": "If Hiddify does not open automatically, copy the subscription link and import it manually in Hiddify.",
     },
 }
 
@@ -266,10 +278,41 @@ def append_token_details(text: str, lang: str, token: Optional[str], device_limi
     return "\n".join(lines)
 
 
+def build_subscription_url(subscription_token: Optional[str] = None, subscription_url: Optional[str] = None) -> Optional[str]:
+    explicit_url = str(subscription_url or "").strip()
+    if explicit_url:
+        return explicit_url
+    token = str(subscription_token or "").strip()
+    base = str(settings.BACKEND_BASE_URL or "").strip().rstrip("/")
+    if not token or not base:
+        return None
+    return f"{base}/sub/{token}"
+
+
+def subscription_copy_rows(lang: str, subscription_url: Optional[str] = None) -> List[List[InlineKeyboardButton]]:
+    final_url = build_subscription_url(subscription_url=subscription_url)
+    if not final_url:
+        return []
+    return [[InlineKeyboardButton(text=TEXT[lang]["copy_subscription"], copy_text=CopyTextButton(text=final_url))]]
+
+
 def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
     if not token:
         return []
     return [[InlineKeyboardButton(text=TEXT[lang]["copy_token"], copy_text=CopyTextButton(text=token))]]
+
+
+def platform_store_url(platform: str) -> str:
+    key = (platform or "").strip().lower()
+    if key == "android":
+        return settings.ANDROID_APP_URL
+    if key in {"ios", "iphone", "ipad"}:
+        return settings.IOS_APP_URL
+    if key == "windows":
+        return settings.WINDOWS_APP_URL
+    if key in {"macos", "mac", "osx"}:
+        return settings.MACOS_APP_URL
+    return settings.ANDROID_APP_URL
 
 
 def is_supported_telegram_url(url: Optional[str]) -> bool:
@@ -410,11 +453,17 @@ def build_open_app_url(
 
 
 
-def activated_inline(lang: str, open_app_url: Optional[str] = None, token: Optional[str] = None) -> InlineKeyboardMarkup:
+def activated_inline(
+    lang: str,
+    open_app_url: Optional[str] = None,
+    *,
+    subscription_url: Optional[str] = None,
+    subscription_token: Optional[str] = None,
+) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     rows: List[List[InlineKeyboardButton]] = []
-    rows.extend(token_copy_rows(lang, token))
-    final_open_url = open_app_url or build_open_app_url(lang=lang)
+    rows.extend(subscription_copy_rows(lang, subscription_url))
+    final_open_url = open_app_url or build_open_app_url(lang=lang, token=subscription_token)
     if is_supported_telegram_url(final_open_url):
         rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
     rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
@@ -452,19 +501,29 @@ def download_platforms_inline(lang: str) -> InlineKeyboardMarkup:
         inline_keyboard=[
             [InlineKeyboardButton(text=t["android"], callback_data="download:android")],
             [InlineKeyboardButton(text=t["ios"], callback_data="download:ios")],
+            [InlineKeyboardButton(text=t["windows"], callback_data="download:windows")],
+            [InlineKeyboardButton(text=t["macos"], callback_data="download:macos")],
             [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
         ]
     )
 
 
 
-def platform_open_inline(lang: str, platform: str, open_app_url: Optional[str] = None) -> InlineKeyboardMarkup:
+def platform_open_inline(
+    lang: str,
+    platform: str,
+    open_app_url: Optional[str] = None,
+    *,
+    subscription_url: Optional[str] = None,
+    subscription_token: Optional[str] = None,
+) -> InlineKeyboardMarkup:
     t = TEXT[lang]
-    url = settings.ANDROID_APP_URL if platform == "android" else settings.IOS_APP_URL
+    url = platform_store_url(platform)
     rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=t["download_app"], url=url)]]
-    final_open_url = open_app_url or build_open_app_url(lang=lang)
+    final_open_url = open_app_url or build_open_app_url(lang=lang, token=subscription_token)
     if is_supported_telegram_url(final_open_url):
         rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
+    rows.extend(subscription_copy_rows(lang, subscription_url))
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:download")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -511,16 +570,27 @@ async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
     await callback.answer(TEXT[lang]["menu"])
 
 
+async def fetch_subscription_access(token: str) -> Dict[str, Optional[str]]:
+    data = await api_request("GET", "/subscriptions/me", token=token)
+    return {
+        "subscription_url": (data.get("subscription_url") or "").strip() or None,
+        "subscription_token": (data.get("subscription_token") or "").strip() or None,
+        "open_app_url": build_open_app_url(lang=None, token=(data.get("subscription_token") or "").strip() or None),
+    }
+
+
 async def render_subscription_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    del telegram_id
     t = TEXT[lang]
-    code, open_app_url = await issue_login_code_for_telegram_id(telegram_id, lang)
-    open_app_url = open_app_url or build_open_app_url(lang=lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
     used = int(data.get("devices_used") or 0)
     limit = int(data.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT)
+    subscription_url = (data.get("subscription_url") or "").strip() or None
+    subscription_token = (data.get("subscription_token") or "").strip() or None
+    open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
     if not sub:
-        text = append_token_details(t["subscription_none"], lang, code, limit)
+        text = t["subscription_none"]
     else:
         plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
         status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
@@ -530,14 +600,18 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
                 f"{t['plan']}: {plan_name}",
                 f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
                 f"{t['devices_used']}: {used} / {limit}",
+                "",
+                subscription_url or "",
+                "",
+                t["manual_import_hint"],
             ]
-        )
-        text = append_token_details(text, lang, code, limit)
+        ).strip()
     rows: List[List[InlineKeyboardButton]] = []
-    rows.extend(token_copy_rows(lang, code))
+    rows.extend(subscription_copy_rows(lang, subscription_url))
     rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
-    if is_supported_telegram_url(open_app_url):
+    if sub and is_supported_telegram_url(open_app_url):
         rows.append([InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
+    rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, markup
@@ -576,14 +650,16 @@ async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 async def render_payment_success_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
+    del telegram_id
     t = TEXT[lang]
-    code, open_app_url = await issue_login_code_for_telegram_id(telegram_id, lang)
-    open_app_url = open_app_url or build_open_app_url(lang=lang)
     data = await api_request("GET", "/subscriptions/me", token=token)
     sub = data.get("subscription")
+    subscription_url = (data.get("subscription_url") or "").strip() or None
+    subscription_token = (data.get("subscription_token") or "").strip() or None
+    open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
     if not sub:
-        text = append_token_details(t["payment_received"], lang, code, int(data.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT))
-        return text, activated_inline(lang, open_app_url, code)
+        text = "\n".join([t["payment_received"], t["manual_import_hint"], subscription_url or ""]).strip()
+        return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
     text = "\n".join(
@@ -593,10 +669,13 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
             f"{t['plan']}: {plan_name}",
             f"{t['active_until']}: {_fmt_dt(sub.get('expires_at'))}",
             f"{t['available_devices']}: {device_limit} / {device_limit}",
+            "",
+            subscription_url or "",
+            "",
+            t["manual_import_hint"],
         ]
-    )
-    text = append_token_details(text, lang, code, device_limit)
-    return text, activated_inline(lang, open_app_url, code)
+    ).strip()
+    return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
 
 
 @dp.message(Command("start"))
@@ -707,8 +786,8 @@ async def menu_from_text_alias(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
 async def download_android_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
-        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", open_app_url or build_open_app_url(lang=lang)))
+        access = await fetch_subscription_access(_ctx["token"])
+        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -716,8 +795,26 @@ async def download_android_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
 async def download_ios_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
-        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", open_app_url or build_open_app_url(lang=lang)))
+        access = await fetch_subscription_access(_ctx["token"])
+        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["windows"], TEXT["en"]["windows"]}))
+async def download_windows_from_text(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        access = await fetch_subscription_access(_ctx["token"])
+        await message.answer(TEXT[lang]["download_windows"], reply_markup=platform_open_inline(lang, "windows", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({TEXT["ru"]["macos"], TEXT["en"]["macos"]}))
+async def download_macos_from_text(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        access = await fetch_subscription_access(_ctx["token"])
+        await message.answer(TEXT[lang]["download_macos"], reply_markup=platform_open_inline(lang, "macos", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -859,10 +956,14 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
         platform = callback.data.split(":", 1)[1]
         if platform == "android":
             text = TEXT[lang]["download_android"]
-        else:
+        elif platform == "ios":
             text = TEXT[lang]["download_ios"]
-        _, open_app_url = await issue_login_code_for_telegram_id(int(_ctx["user"]["telegram_id"]), lang)
-        await safe_edit(callback, text, platform_open_inline(lang, platform, open_app_url or build_open_app_url(lang=lang)))
+        elif platform == "windows":
+            text = TEXT[lang]["download_windows"]
+        else:
+            text = TEXT[lang]["download_macos"]
+        access = await fetch_subscription_access(_ctx["token"])
+        await safe_edit(callback, text, platform_open_inline(lang, platform, access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
@@ -912,7 +1013,9 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     if event_type == "payment_paid":
         plan_name = payload.get("plan_name_en") if lang == "en" else payload.get("plan_name_ru")
         device_limit = int(payload.get('device_limit', settings.VPN_DEFAULT_DEVICE_LIMIT) or settings.VPN_DEFAULT_DEVICE_LIMIT)
-        code, deep_link = await issue_login_code_for_telegram_id(int(item["telegram_id"]), lang)
+        subscription_token = (payload.get("subscription_token") or "").strip() or None
+        subscription_url = build_subscription_url(subscription_token=subscription_token)
+        open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
         text = "\n".join(
             [
                 t["payment_received"],
@@ -920,11 +1023,13 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
                 f"{t['plan']}: {plan_name}",
                 f"{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}",
                 f"{t['available_devices']}: {device_limit} / {device_limit}",
+                "",
+                subscription_url or "",
+                "",
+                t["manual_import_hint"],
             ]
-        )
-        text = append_token_details(text, lang, code, device_limit)
-        open_app_url = deep_link or build_open_app_url(lang=lang)
-        return text, activated_inline(lang, open_app_url, code)
+        ).strip()
+        return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
     if event_type == "subscription_expiring":
         text = f"{t['one_day_left']}\n\n{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}"
         markup = InlineKeyboardMarkup(
