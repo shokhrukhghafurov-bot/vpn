@@ -310,8 +310,23 @@ def _ru_lte_transport_bonus(payload: Dict[str, Any]) -> int:
     return -50
 
 
+def _ru_lte_source_priority(source: str) -> int:
+    raw = str(source or "").strip().lower()
+    if raw.endswith("/vless-reality-white-lists-rus-mobile.txt") or raw.endswith("vless-reality-white-lists-rus-mobile.txt"):
+        return 40
+    if raw.endswith("/vless-reality-white-lists-rus-mobile-2.txt") or raw.endswith("vless-reality-white-lists-rus-mobile-2.txt"):
+        return 30
+    if raw.endswith("/white-cidr-ru-checked.txt") or raw.endswith("white-cidr-ru-checked.txt"):
+        return 20
+    if raw.endswith("/white-cidr-ru-all.txt") or raw.endswith("white-cidr-ru-all.txt"):
+        return 10
+    if raw.endswith("/white-sni-ru-all.txt") or raw.endswith("white-sni-ru-all.txt"):
+        return 0
+    return 0
+
+
 def _ru_lte_transport_allowed(payload: Dict[str, Any]) -> bool:
-    allowed = {item.strip().lower() for item in (settings.RU_LTE_ALLOWED_TRANSPORTS or ["xhttp", "grpc", "ws"]) if str(item or "").strip()}
+    allowed = {item.strip().lower() for item in (settings.RU_LTE_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws", "xhttp"]) if str(item or "").strip()}
     transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
     return transport in allowed
 
@@ -382,7 +397,36 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
     for row in list_locations(active_only=False):
         if str(row.get("code") or "") == code:
             return patch_location(int(row.get("id")), updates)
-    return None
+
+    default_names = {
+        "ru-lte": ("Россия LTE", "Russia LTE", False),
+        "ru-lte-reserve-1": ("Россия LTE | Резерв 1", "Russia LTE | Reserve 1", True),
+        "ru-lte-reserve-2": ("Россия LTE | Резерв 2", "Russia LTE | Reserve 2", True),
+        "ru-lte-reserve-3": ("Россия LTE | Резерв 3", "Russia LTE | Reserve 3", True),
+    }
+    if code not in default_names:
+        return None
+
+    name_ru, name_en, is_reserve = default_names[code]
+    base_payload = dict(updates.get("vpn_payload") or {})
+    if base_payload:
+        base_payload.setdefault("location_code", code)
+        base_payload.setdefault("remark", name_en)
+
+    payload = {
+        "code": code,
+        "name_ru": str(updates.get("name_ru") or name_ru),
+        "name_en": str(updates.get("name_en") or name_en),
+        "country_code": "RU",
+        "is_active": bool(updates.get("is_active", True)),
+        "is_recommended": bool(updates.get("is_recommended", code == "ru-lte")),
+        "is_reserve": bool(updates.get("is_reserve", is_reserve)),
+        "status": str(updates.get("status") or "offline"),
+        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33}.get(code, 100)),
+        "vpn_payload": base_payload,
+        "location_source": "catalog",
+    }
+    return create_location(payload)
 
 
 def refresh_ru_lte_locations() -> Dict[str, Any]:
@@ -418,15 +462,16 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 if key in seen:
                     continue
                 seen.add(key)
-                normalized["_score"] = _ru_lte_payload_score(normalized)
                 normalized["_source"] = source
+                normalized["_source_priority"] = _ru_lte_source_priority(source)
+                normalized["_score"] = _ru_lte_payload_score(normalized)
                 candidates.append(normalized)
                 stat["accepted"] += 1
         except Exception as exc:
             stat["error"] = str(exc)
         source_stats.append(stat)
 
-    candidates.sort(key=lambda item: (int(item.get("_score") or 0), str(item.get("remark") or "")), reverse=True)
+    candidates.sort(key=lambda item: (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), str(item.get("remark") or "")), reverse=True)
     test_limit = max(1, int(settings.RU_LTE_TEST_LIMIT or 40))
     tested: List[Dict[str, Any]] = []
     probe_errors = 0
@@ -441,7 +486,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         normalized["_score"] = _ru_lte_payload_score(normalized)
         tested.append(normalized)
 
-    tested.sort(key=lambda item: (int(item.get("_score") or 0), -int(item.get("_latency_ms") or 999999)), reverse=True)
+    tested.sort(key=lambda item: (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), -int(item.get("_latency_ms") or 999999)), reverse=True)
     top = tested[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
