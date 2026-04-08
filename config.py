@@ -7,9 +7,9 @@ from typing import Any, Dict, List
 BUILTIN_MVP_LOCATIONS_JSON = (
     '[{"code":"auto-fastest","name_ru":"Авто | Самый быстрый","name_en":"Auto | Fastest","country_code":null,"is_active":true,"is_recommended":true,"is_reserve":false,"status":"online","sort_order":10},'
     '{"code":"auto-reserve","name_ru":"Авто | Резервный","name_en":"Auto | Reserve","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":true,"status":"online","sort_order":20},'
-    '{"code":"ru-lte","name_ru":"Россия LTE","name_en":"Russia LTE","country_code":"RU","is_active":true,"is_recommended":true,"is_reserve":false,"status":"offline","sort_order":30,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte","remark":"Russia LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
-    '{"code":"ru-lte-reserve-1","name_ru":"Россия LTE | Резерв 1","name_en":"Russia LTE | Reserve 1","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":31,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte-reserve-1","remark":"Russia LTE | Reserve 1","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
-    '{"code":"ru-lte-reserve-2","name_ru":"Россия LTE | Резерв 2","name_en":"Russia LTE | Reserve 2","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":32,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte-reserve-2","remark":"Russia LTE | Reserve 2","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
+    '{"code":"ru-lte","name_ru":"Россия LTE","name_en":"Russia LTE","country_code":"RU","is_active":true,"is_recommended":true,"is_reserve":false,"status":"offline","sort_order":30,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte","remark":"Russia LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
+    '{"code":"ru-lte-reserve-1","name_ru":"Россия LTE | Резерв 1","name_en":"Russia LTE | Reserve 1","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":31,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte-reserve-1","remark":"Russia LTE | Reserve 1","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
+    '{"code":"ru-lte-reserve-2","name_ru":"Россия LTE | Резерв 2","name_en":"Russia LTE | Reserve 2","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":32,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte-reserve-2","remark":"Russia LTE | Reserve 2","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"se","name_ru":"Sweden","name_en":"Sweden","country_code":"SE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":40},'
     '{"code":"nl-1","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":50},'
     '{"code":"de-1","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":60},'
@@ -127,7 +127,7 @@ class Settings:
     DEFAULT_LOCATIONS_ENV_JSON: str = os.getenv("DEFAULT_LOCATIONS_JSON", "")
     DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED: bool = _env_bool("DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED", False)
 
-    VPN_ENGINE: str = os.getenv("VPN_ENGINE", "sing-box")
+    VPN_ENGINE: str = os.getenv("VPN_ENGINE", "nekobox")
     VLESS_DEFAULT_CONFIG_JSON: str = os.getenv("VLESS_DEFAULT_CONFIG_JSON", "")
     VLESS_LOCATION_CONFIGS_JSON: str = os.getenv("VLESS_LOCATION_CONFIGS_JSON", "")
     VLESS_SERVER: str = os.getenv("VLESS_SERVER", "")
@@ -187,7 +187,7 @@ class Settings:
             return {}
         payload: Dict[str, Any] = {
             "protocol": "vless",
-            "engine": self.VPN_ENGINE or "sing-box",
+            "engine": self.VPN_ENGINE or "nekobox",
             "server": self.VLESS_SERVER.strip(),
             "port": int(self.VLESS_PORT or 443),
             "uuid": self.VLESS_UUID.strip(),
