@@ -70,7 +70,7 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
     return None
 
 
-SCHEMA_SQL = """
+SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     telegram_id BIGINT NOT NULL UNIQUE,
@@ -84,8 +84,6 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_users_status ON users(status);
-CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users(subscription_token) WHERE subscription_token IS NOT NULL;
 
 CREATE TABLE IF NOT EXISTS plans (
     id SERIAL PRIMARY KEY,
@@ -111,8 +109,6 @@ CREATE TABLE IF NOT EXISTS subscriptions (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id);
-CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status);
 
 CREATE TABLE IF NOT EXISTS devices (
     id SERIAL PRIMARY KEY,
@@ -125,7 +121,6 @@ CREATE TABLE IF NOT EXISTS devices (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(user_id, device_fingerprint)
 );
-CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id);
 
 CREATE TABLE IF NOT EXISTS locations (
     id SERIAL PRIMARY KEY,
@@ -163,8 +158,6 @@ CREATE TABLE IF NOT EXISTS payments (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     paid_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id);
-CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status);
 
 CREATE TABLE IF NOT EXISTS auth_codes (
     code TEXT PRIMARY KEY,
@@ -174,8 +167,6 @@ CREATE TABLE IF NOT EXISTS auth_codes (
     meta JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
-CREATE INDEX IF NOT EXISTS idx_auth_codes_user_id ON auth_codes(user_id);
-CREATE INDEX IF NOT EXISTS idx_auth_codes_expires_at ON auth_codes(expires_at);
 
 CREATE TABLE IF NOT EXISTS admin_notes (
     id SERIAL PRIMARY KEY,
@@ -203,7 +194,6 @@ CREATE TABLE IF NOT EXISTS bot_notifications (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     sent_at TIMESTAMPTZ
 );
-CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at);
 
 CREATE TABLE IF NOT EXISTS bot_error_log (
     id BIGSERIAL PRIMARY KEY,
@@ -394,7 +384,7 @@ def db() -> psycopg.Connection:
 def bootstrap() -> None:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(SCHEMA_SQL)
+            cur.execute(SCHEMA_TABLES_SQL)
             _run_schema_migrations(cur)
             _resync_serial_sequences(cur)
         conn.commit()
