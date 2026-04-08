@@ -1039,6 +1039,37 @@ def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, 
         return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
 
 
+def _detect_android_app_package() -> str:
+    explicit = str(getattr(settings, "ANDROID_APP_PACKAGE", "") or "").strip()
+    if explicit:
+        return explicit
+    parsed = urlsplit(str(settings.ANDROID_APP_URL or "").strip())
+    if parsed.scheme and parsed.netloc:
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        package_name = str(query.get("id") or "").strip()
+        if package_name:
+            return package_name
+    return ""
+
+
+def _build_android_intent_url(native_url: str) -> str:
+    parsed_native = urlsplit(native_url)
+    if not parsed_native.scheme or parsed_native.scheme in {"http", "https"}:
+        return ""
+    android_package = _detect_android_app_package()
+    if not android_package:
+        return ""
+    intent_path = parsed_native.path or ""
+    if parsed_native.netloc:
+        intent_path = f"//{parsed_native.netloc}{intent_path}"
+    intent_query = f"?{parsed_native.query}" if parsed_native.query else ""
+    intent_fragment = f"#{parsed_native.fragment}" if parsed_native.fragment else ""
+    return (
+        f"intent:{intent_path}{intent_query}{intent_fragment}"
+        f"#Intent;scheme={parsed_native.scheme};package={android_package};end"
+    )
+
+
 def _subscription_authorized(token: str) -> bool:
     expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
     provided = str(token or "").strip()
@@ -1174,23 +1205,12 @@ def open_app_bridge(
         code_block = f'<div class="code"><div class="label">{html.escape(page_text["code_label"])}</div><code>{html.escape(code)}</code></div>'
     native_url_attr = html.escape(native_url, quote=True)
     native_url_js = json.dumps(native_url)
-    android_intent_url = ""
-    parsed_native = urlsplit(native_url)
-    if parsed_native.scheme and parsed_native.scheme not in {"http", "https"}:
-        intent_path = parsed_native.path or ""
-        intent_query = f"?{parsed_native.query}" if parsed_native.query else ""
-        intent_fragment = f"#{parsed_native.fragment}" if parsed_native.fragment else ""
-        intent_tail = ""
-        android_package = "com.example.inet_app"
-        if parsed_native.netloc:
-            intent_path = f"//{parsed_native.netloc}{intent_path}"
-        android_intent_url = (
-            f"intent:{intent_path}{intent_query}{intent_fragment}"
-            f"#Intent;scheme={parsed_native.scheme};package={android_package};end"
-        )
+    android_intent_url = _build_android_intent_url(native_url)
     android_intent_url_js = json.dumps(android_intent_url)
     android_url = html.escape(settings.ANDROID_APP_URL, quote=True)
+    android_url_js = json.dumps(str(settings.ANDROID_APP_URL or ""))
     ios_url = html.escape(settings.IOS_APP_URL, quote=True)
+    ios_url_js = json.dumps(str(settings.IOS_APP_URL or ""))
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
@@ -1239,23 +1259,69 @@ def open_app_bridge(
     (function () {{
       const nativeUrl = {native_url_js};
       const androidIntentUrl = {android_intent_url_js};
-      const isAndroid = /Android/i.test(navigator.userAgent || '');
-      const tryOpen = function () {{
-        if (isAndroid && androidIntentUrl) {{
-          window.location.replace(androidIntentUrl);
-          window.setTimeout(function () {{
-            window.location.href = nativeUrl;
-          }}, 180);
+      const androidStoreUrl = {android_url_js};
+      const iosStoreUrl = {ios_url_js};
+      const userAgent = navigator.userAgent || '';
+      const isAndroid = /Android/i.test(userAgent);
+      const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
+      let hiddenAt = 0;
+
+      const markHidden = function () {{
+        hiddenAt = Date.now();
+      }};
+      document.addEventListener('visibilitychange', function () {{
+        if (document.visibilityState === 'hidden') {{
+          markHidden();
+        }}
+      }});
+      window.addEventListener('pagehide', markHidden);
+      window.addEventListener('blur', markHidden);
+
+      const launchByAnchor = function (url) {{
+        if (!url) return;
+        const link = document.createElement('a');
+        link.href = url;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        window.setTimeout(function () {{
+          link.remove();
+        }}, 250);
+      }};
+
+      const openStoreIfNeeded = function () {{
+        if (Date.now() - hiddenAt < 1200) {{
           return;
         }}
-        const iframe = document.createElement('iframe');
-        iframe.style.display = 'none';
-        iframe.src = nativeUrl;
-        document.body.appendChild(iframe);
-        window.setTimeout(function () {{
-          window.location.href = nativeUrl;
-        }}, 120);
+        const storeUrl = isAndroid ? androidStoreUrl : (isIOS ? iosStoreUrl : '');
+        if (storeUrl) {{
+          window.location.href = storeUrl;
+        }}
       }};
+
+      const tryOpen = function () {{
+        if (isAndroid && androidIntentUrl) {{
+          launchByAnchor(androidIntentUrl);
+          window.setTimeout(function () {{
+            if (Date.now() - hiddenAt < 1200) {{
+              return;
+            }}
+            launchByAnchor(nativeUrl);
+          }}, 250);
+          window.setTimeout(openStoreIfNeeded, 1800);
+          return;
+        }}
+
+        launchByAnchor(nativeUrl);
+        window.setTimeout(function () {{
+          if (Date.now() - hiddenAt < 1200) {{
+            return;
+          }}
+          window.location.href = nativeUrl;
+        }}, 180);
+        window.setTimeout(openStoreIfNeeded, 1800);
+      }};
+
       window.setTimeout(tryOpen, 80);
       document.querySelector('.btn-primary')?.addEventListener('click', function (event) {{
         event.preventDefault();
