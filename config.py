@@ -232,6 +232,9 @@ class Settings:
     BLACK_CONNECT_TIMEOUT_SEC: int = _env_int("BLACK_CONNECT_TIMEOUT_SEC", 4)
     BLACK_ALLOWED_TRANSPORTS: List[str] = None
 
+    APP_SYNC_POLL_SEC: int = _env_int("APP_SYNC_POLL_SEC", 60)
+    APP_SYNC_MIN_POLL_SEC: int = _env_int("APP_SYNC_MIN_POLL_SEC", 15)
+
     def __post_init__(self) -> None:
         self.ANDROID_APP_URL = _normalize_store_url(self.ANDROID_APP_URL, "android")
         self.IOS_APP_URL = _normalize_store_url(self.IOS_APP_URL, "ios")
