@@ -87,6 +87,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "unexpected_error": "Произошла ошибка. Проверь логи Railway и параметры окружения.",
         "one_day_left": "Ваша подписка скоро закончится\nОстался 1 день.",
         "expired_notice": "Подписка истекла",
+        "expired_access_disabled": "Доступ к VPN отключён.",
+        "expired_buy_cta": "Чтобы снова подключиться, купите подписку.",
         "payment_failed": "Оплата не прошла. Попробуйте ещё раз или обратитесь в поддержку.",
         "status_label": "Статус",
         "remove": "🗑️ Удалить",
@@ -158,6 +160,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "unexpected_error": "Something went wrong. Check Railway logs and environment variables.",
         "one_day_left": "Your subscription will expire soon\n1 day left.",
         "expired_notice": "Subscription expired",
+        "expired_access_disabled": "VPN access is disabled.",
+        "expired_buy_cta": "Buy a subscription to connect again.",
         "payment_failed": "Payment failed. Please try again or contact support.",
         "status_label": "Status",
         "remove": "🗑️ Remove",
@@ -624,7 +628,8 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
                 f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
                 f"{t['devices_used']}: {used} / {limit}",
                 "",
-                t["subscription_buy_prompt"],
+                t["expired_access_disabled"],
+                t["expired_buy_cta"],
             ]
         ).strip()
         return text, subscription_required_inline(lang)
@@ -690,7 +695,8 @@ async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple
                 f"{TEXT[lang]['plan']}: {plan_name}",
                 f"{TEXT[lang]['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
                 "",
-                TEXT[lang]["subscription_buy_prompt"],
+                TEXT[lang]["expired_access_disabled"],
+                TEXT[lang]["expired_buy_cta"],
             ]
         ).strip()
     else:
@@ -1128,7 +1134,7 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
         )
         return text, markup
     if event_type == "subscription_expired":
-        text = "\n".join([t["expired_notice"], "", t["subscription_buy_prompt"]]).strip()
+        text = "\n".join([t["expired_notice"], "", t["expired_access_disabled"], t["expired_buy_cta"]]).strip()
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
                 [InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")],
