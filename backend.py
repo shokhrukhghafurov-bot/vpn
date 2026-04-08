@@ -1106,7 +1106,7 @@ def public_subscription(token: str) -> Response:
 def public_subscription_hint() -> Dict[str, Any]:
     return {
         "ok": True,
-        "message": "Use /sub/<SUBSCRIPTION_TOKEN> and import it into NekoBox as a subscription",
+        "message": "Use /sub/<SUBSCRIPTION_TOKEN>",
     }
 
 
