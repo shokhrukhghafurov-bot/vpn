@@ -257,9 +257,14 @@ async def issue_login_code_for_telegram_id(telegram_id: int, language: str = "ru
 
 
 def append_token_details(text: str, lang: str, token: Optional[str], device_limit: Optional[int] = None) -> str:
-    # Token text is intentionally hidden in the message body.
-    # Access is provided via the copy button only.
-    return text
+    if not token:
+        return text
+    label = TEXT[lang].get('token_label', 'Login code')
+    device_text = ''
+    if device_limit and int(device_limit) > 0:
+        limit_label = TEXT[lang].get('devices_limit_hint', 'Devices')
+        device_text = f"\n{limit_label}: {int(device_limit)}"
+    return f"{text}\n\n{label}:\n{token}{device_text}"
 
 
 def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboardButton]]:
