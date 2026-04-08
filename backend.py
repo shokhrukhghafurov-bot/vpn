@@ -996,35 +996,6 @@ def _bot_public_url() -> str:
     return settings.SUPPORT_TELEGRAM_URL
 
 
-
-
-def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
-    bridge = (settings.OPEN_APP_BRIDGE_URL or "").strip()
-    if bridge:
-        parts = urlsplit(bridge)
-        query = dict(parse_qsl(parts.query, keep_blank_values=True))
-        if code:
-            query["code"] = code
-        elif token:
-            query["token"] = token
-        if lang:
-            query["lang"] = lang
-        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-
-    try:
-        return str(request.url_for("open_app_bridge", code=code or "", token=token or "", lang=lang or "ru"))
-    except Exception:
-        base = str(request.base_url).rstrip("/")
-        query = {}
-        if code:
-            query["code"] = code
-        elif token:
-            query["token"] = token
-        if lang:
-            query["lang"] = lang
-        suffix = f"?{urlencode(query)}" if query else ""
-        return f"{base}/open-app{suffix}"
-
 def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
     base = settings.OPEN_APP_URL or "inet://login"
     parts = urlsplit(base)
@@ -1176,6 +1147,21 @@ def open_app_bridge(
         code_block = f'<div class="code"><div class="label">{html.escape(page_text["code_label"])}</div><code>{html.escape(code)}</code></div>'
     native_url_attr = html.escape(native_url, quote=True)
     native_url_js = json.dumps(native_url)
+    android_intent_url = ""
+    parsed_native = urlsplit(native_url)
+    if parsed_native.scheme and parsed_native.scheme not in {"http", "https"}:
+        intent_path = parsed_native.path or ""
+        intent_query = f"?{parsed_native.query}" if parsed_native.query else ""
+        intent_fragment = f"#{parsed_native.fragment}" if parsed_native.fragment else ""
+        intent_tail = ""
+        android_package = "com.example.inet_app"
+        if parsed_native.netloc:
+            intent_path = f"//{parsed_native.netloc}{intent_path}"
+        android_intent_url = (
+            f"intent:{intent_path}{intent_query}{intent_fragment}"
+            f"#Intent;scheme={parsed_native.scheme};package={android_package};end"
+        )
+    android_intent_url_js = json.dumps(android_intent_url)
     android_url = html.escape(settings.ANDROID_APP_URL, quote=True)
     ios_url = html.escape(settings.IOS_APP_URL, quote=True)
     bot_url_attr = html.escape(bot_url, quote=True)
@@ -1223,9 +1209,32 @@ def open_app_bridge(
     </div>
   </div>
   <script>
-    window.setTimeout(function () {{
-      window.location.href = {native_url_js};
-    }}, 120);
+    (function () {{
+      const nativeUrl = {native_url_js};
+      const androidIntentUrl = {android_intent_url_js};
+      const isAndroid = /Android/i.test(navigator.userAgent || '');
+      const tryOpen = function () {{
+        if (isAndroid && androidIntentUrl) {{
+          window.location.replace(androidIntentUrl);
+          window.setTimeout(function () {{
+            window.location.href = nativeUrl;
+          }}, 180);
+          return;
+        }}
+        const iframe = document.createElement('iframe');
+        iframe.style.display = 'none';
+        iframe.src = nativeUrl;
+        document.body.appendChild(iframe);
+        window.setTimeout(function () {{
+          window.location.href = nativeUrl;
+        }}, 120);
+      }};
+      window.setTimeout(tryOpen, 80);
+      document.querySelector('.btn-primary')?.addEventListener('click', function (event) {{
+        event.preventDefault();
+        tryOpen();
+      }});
+    }})();
   </script>
 </body>
 </html>"""
