@@ -1225,6 +1225,11 @@ def public_subscription_hint() -> Dict[str, Any]:
     }
 
 
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
 @app.get("/open-app", response_class=HTMLResponse, name="open_app_bridge")
 def open_app_bridge(
     request: Request,
