@@ -10,7 +10,6 @@ BUILTIN_MVP_LOCATIONS_JSON = (
     '{"code":"ru-lte","name_ru":"Россия LTE","name_en":"Russia LTE","country_code":"RU","is_active":true,"is_recommended":true,"is_reserve":false,"status":"offline","sort_order":30,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte","remark":"Russia LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"ru-lte-reserve-1","name_ru":"Россия LTE | Резерв 1","name_en":"Russia LTE | Reserve 1","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":31,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte-reserve-1","remark":"Russia LTE | Reserve 1","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"ru-lte-reserve-2","name_ru":"Россия LTE | Резерв 2","name_en":"Russia LTE | Reserve 2","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":32,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte-reserve-2","remark":"Russia LTE | Reserve 2","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
-    '{"code":"ru-lte-reserve-3","name_ru":"Россия LTE | Резерв 3","name_en":"Russia LTE | Reserve 3","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":33,"vpn_payload":{"engine":"sing-box","protocol":"vless","location_code":"ru-lte-reserve-3","remark":"Russia LTE | Reserve 3","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"se","name_ru":"Sweden","name_en":"Sweden","country_code":"SE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":40},'
     '{"code":"nl-1","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":50},'
     '{"code":"de-1","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":60},'
@@ -161,6 +160,7 @@ class Settings:
     RU_LTE_MAX_CANDIDATES: int = _env_int("RU_LTE_MAX_CANDIDATES", 4)
     RU_LTE_TEST_LIMIT: int = _env_int("RU_LTE_TEST_LIMIT", 40)
     RU_LTE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_CONNECT_TIMEOUT_SEC", 4)
+    RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
 
     def __post_init__(self) -> None:
         if self.CORS_ORIGINS is None:
@@ -171,6 +171,8 @@ class Settings:
             self.VLESS_DNS_SERVERS = _env_list("VLESS_DNS_SERVERS", "1.1.1.1,8.8.8.8")
         if self.VLESS_ALPN is None:
             self.VLESS_ALPN = _env_list("VLESS_ALPN", "")
+        if self.RU_LTE_ALLOWED_TRANSPORTS is None:
+            self.RU_LTE_ALLOWED_TRANSPORTS = _env_list("RU_LTE_ALLOWED_TRANSPORTS", "xhttp,grpc,ws")
         if self.RU_LTE_SOURCE_URLS is None:
             self.RU_LTE_SOURCE_URLS = _env_list(
                 "RU_LTE_SOURCE_URLS",
