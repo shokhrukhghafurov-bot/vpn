@@ -67,6 +67,7 @@ class Settings:
     OPEN_APP_URL: str = os.getenv("OPEN_APP_URL", "inet://login")
     OPEN_APP_BRIDGE_URL: str = os.getenv("OPEN_APP_BRIDGE_URL", "")
     ANDROID_APP_URL: str = os.getenv("ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.example.inet")
+    ANDROID_APP_PACKAGE: str = os.getenv("ANDROID_APP_PACKAGE", "")
     IOS_APP_URL: str = os.getenv("IOS_APP_URL", "https://apps.apple.com/app/id000000000")
     SUPPORT_TELEGRAM_URL: str = os.getenv("SUPPORT_TELEGRAM_URL", "https://t.me/your_admin")
     SUPPORT_FAQ_RU: str = os.getenv(
