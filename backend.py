@@ -996,6 +996,35 @@ def _bot_public_url() -> str:
     return settings.SUPPORT_TELEGRAM_URL
 
 
+
+
+def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    bridge = (settings.OPEN_APP_BRIDGE_URL or "").strip()
+    if bridge:
+        parts = urlsplit(bridge)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if code:
+            query["code"] = code
+        elif token:
+            query["token"] = token
+        if lang:
+            query["lang"] = lang
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    try:
+        return str(request.url_for("open_app_bridge", code=code or "", token=token or "", lang=lang or "ru"))
+    except Exception:
+        base = str(request.base_url).rstrip("/")
+        query = {}
+        if code:
+            query["code"] = code
+        elif token:
+            query["token"] = token
+        if lang:
+            query["lang"] = lang
+        suffix = f"?{urlencode(query)}" if query else ""
+        return f"{base}/open-app{suffix}"
+
 def _build_native_open_app_url(*, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
     base = settings.OPEN_APP_URL or "inet://login"
     parts = urlsplit(base)
