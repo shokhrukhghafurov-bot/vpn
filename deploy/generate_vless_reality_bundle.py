@@ -96,7 +96,7 @@ def build_bridge_config(args: argparse.Namespace) -> dict:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate both mobile vpn_payload for NekoBox and sing-box bridge config for a VLESS/REALITY location.")
+    parser = argparse.ArgumentParser(description="Generate mobile vpn_payload for NekoBox for a VLESS/REALITY location.")
     parser.add_argument('--location-code', required=True)
     parser.add_argument('--remark', required=True)
     parser.add_argument('--server', required=True, help='Public bridge host/IP the app connects to')
