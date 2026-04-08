@@ -100,6 +100,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "download_macos": "macOS: установите Hiddify, затем откройте ссылку импорта из браузера или вставьте подписку вручную.",
         "copy_subscription": "📋 Скопировать ссылку подписки",
         "manual_import_hint": "Если Hiddify не открылся автоматически, скопируйте ссылку подписки и импортируйте её вручную в Hiddify.",
+        "subscription_buy_prompt": "Чтобы подключиться, купите или продлите подписку.",
     },
     "en": {
         "welcome": "👋 Welcome to INET\nChoose an action below",
@@ -170,6 +171,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "download_macos": "macOS: install Hiddify, then open the import link from your browser or paste the subscription manually.",
         "copy_subscription": "📋 Copy subscription link",
         "manual_import_hint": "If Hiddify does not open automatically, copy the subscription link and import it manually in Hiddify.",
+        "subscription_buy_prompt": "To connect, buy or renew a subscription.",
     },
 }
 
@@ -572,11 +574,28 @@ async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
 
 async def fetch_subscription_access(token: str) -> Dict[str, Optional[str]]:
     data = await api_request("GET", "/subscriptions/me", token=token)
+    if not data.get("is_active"):
+        return {
+            "subscription_url": None,
+            "subscription_token": None,
+            "open_app_url": None,
+        }
+    clean_token = (data.get("subscription_token") or "").strip() or None
     return {
         "subscription_url": (data.get("subscription_url") or "").strip() or None,
-        "subscription_token": (data.get("subscription_token") or "").strip() or None,
-        "open_app_url": build_open_app_url(lang=None, token=(data.get("subscription_token") or "").strip() or None),
+        "subscription_token": clean_token,
+        "open_app_url": build_open_app_url(lang=None, token=clean_token) if clean_token else None,
     }
+
+
+def subscription_required_inline(lang: str) -> InlineKeyboardMarkup:
+    t = TEXT[lang]
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")],
+            [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
+        ]
+    )
 
 
 async def render_subscription_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
@@ -589,11 +608,15 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
     subscription_url = (data.get("subscription_url") or "").strip() or None
     subscription_token = (data.get("subscription_token") or "").strip() or None
     open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
+
     if not sub:
-        text = t["subscription_none"]
-    else:
-        plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
-        status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
+        text = "\n".join([t["subscription_none"], "", t["subscription_buy_prompt"]]).strip()
+        return text, subscription_required_inline(lang)
+
+    plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
+    status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
+
+    if not data.get("is_active"):
         text = "\n".join(
             [
                 f"{t['subscription_status']}: {status_text}",
@@ -601,15 +624,27 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
                 f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
                 f"{t['devices_used']}: {used} / {limit}",
                 "",
-                subscription_url or "",
-                "",
-                t["manual_import_hint"],
+                t["subscription_buy_prompt"],
             ]
         ).strip()
+        return text, subscription_required_inline(lang)
+
+    text = "\n".join(
+        [
+            f"{t['subscription_status']}: {status_text}",
+            f"{t['plan']}: {plan_name}",
+            f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
+            f"{t['devices_used']}: {used} / {limit}",
+            "",
+            subscription_url or "",
+            "",
+            t["manual_import_hint"],
+        ]
+    ).strip()
     rows: List[List[InlineKeyboardButton]] = []
     rows.extend(subscription_copy_rows(lang, subscription_url))
     rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
-    if sub and is_supported_telegram_url(open_app_url):
+    if is_supported_telegram_url(open_app_url):
         rows.append([InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
     rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
@@ -640,6 +675,27 @@ async def render_devices_message(lang: str, token: str) -> Tuple[str, InlineKeyb
         lines.append(t["limit_reached"])
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
     return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
+    data = await api_request("GET", "/subscriptions/me", token=token)
+    sub = data.get("subscription")
+    if data.get("is_active") and sub:
+        return None
+    if sub:
+        plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
+        text = "\n".join(
+            [
+                f"{TEXT[lang]['subscription_status']}: {TEXT[lang]['subscription_expired']}",
+                f"{TEXT[lang]['plan']}: {plan_name}",
+                f"{TEXT[lang]['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
+                "",
+                TEXT[lang]["subscription_buy_prompt"],
+            ]
+        ).strip()
+    else:
+        text = "\n".join([TEXT[lang]["subscription_none"], "", TEXT[lang]["subscription_buy_prompt"]]).strip()
+    return text, subscription_required_inline(lang)
 
 
 async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -786,6 +842,11 @@ async def menu_from_text_alias(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["android"], TEXT["en"]["android"]}))
 async def download_android_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await message.answer(text, reply_markup=markup)
+            return
         access = await fetch_subscription_access(_ctx["token"])
         await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
@@ -795,6 +856,11 @@ async def download_android_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["ios"], TEXT["en"]["ios"]}))
 async def download_ios_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await message.answer(text, reply_markup=markup)
+            return
         access = await fetch_subscription_access(_ctx["token"])
         await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
@@ -804,6 +870,11 @@ async def download_ios_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["windows"], TEXT["en"]["windows"]}))
 async def download_windows_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await message.answer(text, reply_markup=markup)
+            return
         access = await fetch_subscription_access(_ctx["token"])
         await message.answer(TEXT[lang]["download_windows"], reply_markup=platform_open_inline(lang, "windows", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
@@ -813,6 +884,11 @@ async def download_windows_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["macos"], TEXT["en"]["macos"]}))
 async def download_macos_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await message.answer(text, reply_markup=markup)
+            return
         access = await fetch_subscription_access(_ctx["token"])
         await message.answer(TEXT[lang]["download_macos"], reply_markup=platform_open_inline(lang, "macos", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
@@ -944,6 +1020,12 @@ async def cb_device_remove(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "menu:download")
 async def cb_download(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await safe_edit(callback, text, markup)
+            await callback.answer()
+            return
         await safe_edit(callback, TEXT[lang]["choose_platform"], download_platforms_inline(lang))
         await callback.answer()
 
@@ -953,6 +1035,12 @@ async def cb_download(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("download:"))
 async def cb_download_platform(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        inactive = await ensure_active_subscription_ui(lang, _ctx["token"])
+        if inactive:
+            text, markup = inactive
+            await safe_edit(callback, text, markup)
+            await callback.answer()
+            return
         platform = callback.data.split(":", 1)[1]
         if platform == "android":
             text = TEXT[lang]["download_android"]
@@ -1040,10 +1128,10 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
         )
         return text, markup
     if event_type == "subscription_expired":
-        text = t["expired_notice"]
+        text = "\n".join([t["expired_notice"], "", t["subscription_buy_prompt"]]).strip()
         markup = InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")],
+                [InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")],
                 [InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")],
             ]
         )
