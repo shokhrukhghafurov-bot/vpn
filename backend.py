@@ -1021,6 +1021,8 @@ def _app_config_payload() -> Dict[str, Any]:
             "min_poll_sec": max(5, int(settings.APP_SYNC_MIN_POLL_SEC or 15)),
             "locations_cache_ttl_sec": _LOCATIONS_CACHE_TTL_SEC,
             "subscription_path": "/sub/{token}",
+            "bootstrap_path": "/app/bootstrap/{token}",
+            "bootstrap_query_path": "/app/bootstrap?token={token}",
             "version_path": "/config/version",
             "sync_path": "/sync",
         },
@@ -1498,6 +1500,115 @@ def _subscription_public_url(request: Optional[Request] = None, token: Optional[
         except Exception:
             pass
     return _subscription_public_url_from_base(settings.BACKEND_BASE_URL, clean_token)
+
+
+def _public_backend_base(request: Optional[Request] = None) -> str:
+    if request is not None:
+        try:
+            return str(request.base_url).rstrip("/")
+        except Exception:
+            pass
+    return str(settings.BACKEND_BASE_URL or "").rstrip("/")
+
+
+def _app_bootstrap_public_url(request: Optional[Request] = None, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
+    clean_token = _resolve_subscription_token(token=token, code=code)
+    if not clean_token:
+        return None
+    if request is not None:
+        try:
+            return str(request.url_for("app_bootstrap_by_token", token=clean_token))
+        except Exception:
+            pass
+    base = _public_backend_base(request)
+    return f"{base}/app/bootstrap/{quote(clean_token, safe='')}" if base else None
+
+
+def _config_version_public_url(request: Optional[Request] = None) -> str:
+    base = _public_backend_base(request)
+    return f"{base}/config/version" if base else "/config/version"
+
+
+def _sync_public_url(request: Optional[Request] = None) -> str:
+    base = _public_backend_base(request)
+    return f"{base}/sync" if base else "/sync"
+
+
+def _locations_public_url(request: Optional[Request] = None) -> str:
+    base = _public_backend_base(request)
+    return f"{base}/locations" if base else "/locations"
+
+
+def _location_public_url(request: Optional[Request] = None, location_code: str = "{code}") -> str:
+    base = _public_backend_base(request)
+    quoted = quote(str(location_code or "{code}"), safe="{}")
+    return f"{base}/locations/{quoted}" if base else f"/locations/{quoted}"
+
+
+def _vpn_config_public_url(request: Optional[Request] = None, location_code: str = "{code}") -> str:
+    base = _public_backend_base(request)
+    quoted = quote(str(location_code or "{code}"), safe="{}")
+    return f"{base}/vpn/config/{quoted}" if base else f"/vpn/config/{quoted}"
+
+
+def _build_custom_mobile_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+    template = str(getattr(settings, "OPEN_APP_URL", "") or "").strip()
+    if not template:
+        return ""
+    clean_token = _resolve_subscription_token(token=token, code=code)
+    subscription_url = _subscription_public_url(request, token=clean_token) if clean_token else ""
+    bootstrap_url = _app_bootstrap_public_url(request, token=clean_token) if clean_token else ""
+    replacements = {
+        "token": clean_token or "",
+        "code": code or "",
+        "lang": lang or "",
+        "subscription_url": subscription_url or "",
+        "bootstrap_url": bootstrap_url or "",
+        "version_url": _config_version_public_url(request),
+        "sync_url": _sync_public_url(request),
+        "locations_url": _locations_public_url(request),
+        "location_url_template": _location_public_url(request),
+        "vpn_config_url_template": _vpn_config_public_url(request),
+        "backend_base_url": _public_backend_base(request),
+        "open_hiddify_url": _build_open_app_bridge_url(request, code=code, token=clean_token, lang=lang) if request is not None else "",
+    }
+    try:
+        return template.format(**replacements)
+    except Exception:
+        return template
+
+
+def _app_bootstrap_payload(request: Optional[Request], *, token: str, lang: str = "ru", include_locations: bool = True, force_refresh: bool = False) -> Dict[str, Any]:
+    norm_lang = "en" if lang == "en" else "ru"
+    sync_state = _sync_snapshot(force_refresh=force_refresh)
+    app_open_url = _build_custom_mobile_app_url(request, token=token, lang=norm_lang)
+    return {
+        "ok": True,
+        "token": token,
+        "language": norm_lang,
+        "backend_base_url": _public_backend_base(request),
+        "bootstrap_url": _app_bootstrap_public_url(request, token=token),
+        "subscription_url": _subscription_public_url(request, token=token),
+        "open_hiddify_url": _build_open_app_bridge_url(request, token=token, lang=norm_lang) if request is not None else "",
+        "native_hiddify_url": _build_native_open_app_url(request=request, token=token, lang=norm_lang),
+        "open_app_url": app_open_url or None,
+        "config_version": sync_state["version"],
+        "locations_version": sync_state["locations_version"],
+        "updated_at": sync_state["updated_at"],
+        "poll_sec": max(5, int(settings.APP_SYNC_POLL_SEC or 60)),
+        "min_poll_sec": max(5, int(settings.APP_SYNC_MIN_POLL_SEC or 15)),
+        "sync_urls": {
+            "bootstrap_url": _app_bootstrap_public_url(request, token=token),
+            "subscription_url": _subscription_public_url(request, token=token),
+            "version_url": _config_version_public_url(request),
+            "sync_url": _sync_public_url(request),
+            "locations_url": _locations_public_url(request),
+            "location_url_template": _location_public_url(request),
+            "vpn_config_url_template": _vpn_config_public_url(request),
+        },
+        "app_config": sync_state["app_config"],
+        "locations": sync_state["locations"] if include_locations else [],
+    }
 
 
 def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
@@ -2193,6 +2304,40 @@ def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_curre
     return {"ok": True, "user": updated}
 
 
+@app.get("/app/bootstrap/{token}", name="app_bootstrap_by_token")
+def app_bootstrap_by_token(
+    token: str,
+    request: Request,
+    response: Response,
+    lang: str = Query(default="ru"),
+    include_locations: bool = Query(default=True),
+    force: bool = Query(default=False),
+) -> Dict[str, Any]:
+    active_token = _resolve_subscription_token(token=token)
+    if not _subscription_token_is_active(active_token):
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    payload = _app_bootstrap_payload(request, token=active_token, lang=lang, include_locations=include_locations, force_refresh=force)
+    _apply_no_cache_headers(response, version=payload["config_version"], updated_at=payload["updated_at"], etag=f'W/"bootstrap-{payload["config_version"]}"')
+    return payload
+
+
+@app.get("/app/bootstrap")
+def app_bootstrap_query(
+    request: Request,
+    response: Response,
+    token: str = Query(...),
+    lang: str = Query(default="ru"),
+    include_locations: bool = Query(default=True),
+    force: bool = Query(default=False),
+) -> Dict[str, Any]:
+    active_token = _resolve_subscription_token(token=token)
+    if not _subscription_token_is_active(active_token):
+        raise HTTPException(status_code=404, detail="Subscription not found")
+    payload = _app_bootstrap_payload(request, token=active_token, lang=lang, include_locations=include_locations, force_refresh=force)
+    _apply_no_cache_headers(response, version=payload["config_version"], updated_at=payload["updated_at"], etag=f'W/"bootstrap-{payload["config_version"]}"')
+    return payload
+
+
 @app.get("/config/version")
 def config_version(response: Response, force: bool = Query(default=False)) -> Dict[str, Any]:
     snapshot = _sync_snapshot(force_refresh=force)
@@ -2237,7 +2382,7 @@ def plans() -> Dict[str, Any]:
 
 
 @app.get("/subscriptions/me")
-def subscription_me(response: Response, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+def subscription_me(request: Request, response: Response, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
     if view.get("is_active") and view.get("subscription"):
@@ -2248,7 +2393,28 @@ def subscription_me(response: Response, user: Dict[str, Any] = Depends(get_curre
         subscription_url = None
     sync_snapshot = _sync_snapshot()
     _apply_no_cache_headers(response, version=sync_snapshot["version"], updated_at=sync_snapshot["updated_at"])
-    return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url, "config_version": sync_snapshot["version"]}
+    bootstrap_url = _app_bootstrap_public_url(request, token=subscription_token) if subscription_token else None
+    sync_urls = {
+        "bootstrap_url": bootstrap_url,
+        "subscription_url": subscription_url,
+        "version_url": _config_version_public_url(request),
+        "sync_url": _sync_public_url(request),
+        "locations_url": _locations_public_url(request),
+        "location_url_template": _location_public_url(request),
+        "vpn_config_url_template": _vpn_config_public_url(request),
+    }
+    return {
+        "ok": True,
+        **view,
+        "subscription_token": subscription_token,
+        "subscription_url": subscription_url,
+        "bootstrap_url": bootstrap_url,
+        "open_app_url": _build_custom_mobile_app_url(request, token=subscription_token, lang=user.get("language") or "ru") if subscription_token else None,
+        "open_hiddify_url": _build_open_app_bridge_url(request, token=subscription_token, lang=user.get("language") or "ru") if subscription_token else None,
+        "config_version": sync_snapshot["version"],
+        "locations_version": sync_snapshot["locations_version"],
+        "sync_urls": sync_urls,
+    }
 
 
 @app.get("/devices")
