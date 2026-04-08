@@ -1446,6 +1446,49 @@ def get_current_subscription(user_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
+def get_subscription_device_gate_by_token(subscription_token: str, device_fingerprint: str) -> Optional[Dict[str, Any]]:
+    token = str(subscription_token or "").strip()
+    fingerprint = str(device_fingerprint or "").strip()
+    if not token:
+        return None
+    user = get_user_by_subscription_token(token)
+    if not user:
+        return None
+    if user.get("status") == "blocked":
+        return {
+            "allowed": False,
+            "reason": "user_blocked",
+            "detail": "Access blocked",
+            "user_id": int(user["id"]),
+            "devices_used": 0,
+            "device_limit": 0,
+            "known_device": False,
+        }
+    subscription = get_current_subscription(int(user["id"]))
+    if not subscription:
+        return {
+            "allowed": False,
+            "reason": "subscription_inactive",
+            "detail": "Active subscription required",
+            "user_id": int(user["id"]),
+            "devices_used": 0,
+            "device_limit": 0,
+            "known_device": False,
+        }
+    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
+    devices = get_user_devices(int(user["id"]))
+    known_device = bool(fingerprint) and any(str(item.get("device_fingerprint") or "") == fingerprint for item in devices)
+    return {
+        "allowed": known_device or len(devices) < allowed_limit,
+        "reason": "ok" if (known_device or len(devices) < allowed_limit) else "device_limit_reached",
+        "detail": "OK" if (known_device or len(devices) < allowed_limit) else f"Device limit reached ({len(devices)}/{allowed_limit})",
+        "user_id": int(user["id"]),
+        "devices_used": len(devices),
+        "device_limit": allowed_limit,
+        "known_device": known_device,
+    }
+
+
 def get_latest_subscription(user_id: int) -> Optional[Dict[str, Any]]:
     refresh_subscription_statuses(user_id)
     with db() as conn:
@@ -1509,7 +1552,14 @@ def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
         return _get_user_subscription_view_with_conn(conn, user_id)
 
 
-def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
+def _upsert_device_record(
+    user_id: int,
+    platform: str,
+    device_name: str,
+    device_fingerprint: str,
+    *,
+    enforce_limit: bool = True,
+) -> Optional[Dict[str, Any]]:
     user = get_user_by_id(user_id)
     if not user:
         raise ValueError("User not found")
@@ -1518,7 +1568,7 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
     subscription = get_current_subscription(user_id)
     if not subscription:
         raise PermissionError("Active subscription required")
-    if not settings.VPN_NEW_ACTIVATIONS_ENABLED:
+    if enforce_limit and not settings.VPN_NEW_ACTIVATIONS_ENABLED:
         raise PermissionError("New activations are disabled")
     allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
     existing = get_user_devices(user_id)
@@ -1537,9 +1587,11 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
                     )
                     row = cur.fetchone()
                 conn.commit()
-            return dict(row)
+            return dict(row) if row else None
     if len(existing) >= allowed_limit:
-        raise PermissionError(f"Device limit reached ({allowed_limit})")
+        if enforce_limit:
+            raise PermissionError(f"Device limit reached ({allowed_limit})")
+        return None
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -1552,7 +1604,35 @@ def register_device(user_id: int, platform: str, device_name: str, device_finger
             )
             row = cur.fetchone()
         conn.commit()
-    return dict(row)
+    return dict(row) if row else None
+
+
+
+def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
+    item = _upsert_device_record(user_id, platform, device_name, device_fingerprint, enforce_limit=True)
+    if not item:
+        raise PermissionError("Device registration failed")
+    return item
+
+
+
+def touch_subscription_device_by_token(subscription_token: str, platform: str, device_name: str, device_fingerprint: str) -> Optional[Dict[str, Any]]:
+    token = str(subscription_token or "").strip()
+    if not token or not device_fingerprint:
+        return None
+    user = get_user_by_subscription_token(token)
+    if not user:
+        return None
+    try:
+        return _upsert_device_record(
+            int(user["id"]),
+            str(platform or "client").strip() or "client",
+            str(device_name or "VPN client").strip() or "VPN client",
+            str(device_fingerprint or "").strip(),
+            enforce_limit=False,
+        )
+    except Exception:
+        return None
 
 
 def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
