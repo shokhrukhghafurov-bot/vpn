@@ -486,7 +486,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         normalized["_score"] = _ru_lte_payload_score(normalized)
         tested.append(normalized)
 
-    tested.sort(key=lambda item: (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), -int(item.get("_latency_ms") or 999999)), reverse=True)
+    tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
     top = tested[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
@@ -513,8 +513,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "is_active": True,
                 "is_recommended": code == "ru-lte",
                 "is_reserve": code != "ru-lte",
-                "speed_ms": latency_ms if latency_ms > 0 else None,
-                "speed_label": f"ping {latency_ms} ms" if latency_ms > 0 else None,
+                "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
             }
             row = _patch_location_by_code(code, updates)
@@ -542,7 +541,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     "server": existing_payload.get("server"),
                     "transport": existing_payload.get("transport"),
                     "remark": remarks.get(code, code),
-                    "latency_ms": existing.get("speed_ms"),
+                    "latency_ms": existing.get("ping_ms"),
                     "updated": True,
                     "kept_old": True,
                 })
