@@ -1113,6 +1113,20 @@ def _subscription_access_context(token: str) -> Optional[Dict[str, Any]]:
 
 
 
+def _subscription_token_is_active(token: Optional[str]) -> bool:
+    access = _subscription_access_context(str(token or "").strip())
+    if not access:
+        return False
+    if access["kind"] != "user":
+        return True
+    user = access.get("user")
+    if not user or user.get("status") == "blocked":
+        return False
+    view = get_user_subscription_view(int(user["id"]))
+    return bool(view.get("is_active") and view.get("subscription"))
+
+
+
 def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
     normalized = _normalize_vpn_payload_keys(payload)
     if not normalized or not _config_is_complete(normalized):
@@ -1239,8 +1253,9 @@ def open_app_bridge(
 ) -> HTMLResponse:
     norm_lang = "en" if lang == "en" else "ru"
     resolved_token = _resolve_subscription_token(token=token, code=code)
-    native_url = _build_native_open_app_url(request=request, code=code, token=resolved_token, lang=norm_lang)
-    subscription_url = _subscription_public_url(request, token=resolved_token)
+    active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
+    native_url = _build_native_open_app_url(request=request, code=code, token=active_token, lang=norm_lang) if active_token else ""
+    subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     bot_url = _bot_public_url()
     page_text = {
         "ru": {
@@ -1546,8 +1561,12 @@ def plans() -> Dict[str, Any]:
 def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
-    subscription_token = view.get("subscription_token") or ensure_user_subscription_token(int(user["id"]))
-    subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, subscription_token)
+    if view.get("is_active") and view.get("subscription"):
+        subscription_token = view.get("subscription_token") or ensure_user_subscription_token(int(user["id"]))
+        subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, subscription_token)
+    else:
+        subscription_token = None
+        subscription_url = None
     return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url}
 
 
