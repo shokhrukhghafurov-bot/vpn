@@ -10,6 +10,10 @@ from uuid import uuid4
 import time
 import threading
 import socket
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
 
 import jwt
@@ -234,18 +238,47 @@ PUBLIC_STABLE_LOCATION_CODES: Tuple[str, ...] = RU_LTE_LOCATION_CODES + BLACK_LO
 PUBLIC_VIRTUAL_LOCATION_CODES: Tuple[str, ...] = ("auto-fastest", "auto-reserve")
 _DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
 _DEAD_CANDIDATE_LOCK = threading.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+_LOCAL_SOURCE_FALLBACKS: Dict[str, Path] = {
+    "Vless-Reality-White-Lists-Rus-Mobile.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+    "WHITE-CIDR-RU-checked.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-checked.txt",
+    "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
+}
+
+
+def _resolve_local_source_path(source: str) -> Path:
+    raw = str(source or "").strip()
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    return (_PROJECT_ROOT / path).resolve()
 
 
 def _read_text_from_source(source: str) -> str:
     raw = str(source or "").strip()
     if not raw:
         return ""
+    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(Path(urlsplit(raw).path or raw).name)
     if raw.startswith(("http://", "https://")):
-        response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
-        response.raise_for_status()
-        return response.text
-    with open(raw, "r", encoding="utf-8") as fh:
-        return fh.read()
+        try:
+            response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            if fallback_path and fallback_path.is_file():
+                return fallback_path.read_text(encoding="utf-8")
+            raise
+    path = _resolve_local_source_path(raw)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    if fallback_path and fallback_path.is_file():
+        return fallback_path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Source file not found: {raw}")
 
 
 def _decode_vless_name(fragment: str) -> str:
@@ -271,7 +304,7 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
     query = dict(parse_qsl(parsed.query, keep_blank_values=True))
     transport = (query.get("type") or query.get("transport") or query.get("network") or "tcp").strip() or "tcp"
     payload: Dict[str, Any] = {
-        "engine": "nekobox",
+        "engine": "xray",
         "protocol": "vless",
         "server": server,
         "port": port,
@@ -495,6 +528,345 @@ def _probe_candidate_with_timeout(payload: Dict[str, Any], timeout_seconds: floa
     return {"ok": False, "latency_ms": None, "error": last_error or "connect_failed"}
 
 
+def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
+    runner = str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray").strip().lower() or "xray"
+    if runner not in {"xray", "sing-box", "singbox", "auto"}:
+        runner = "xray"
+
+    def _resolve_path(raw_value: str, default_name: str) -> Optional[str]:
+        raw = str(raw_value or default_name).strip() or default_name
+        if raw.startswith("/"):
+            probe_path = Path(raw)
+            return str(probe_path) if probe_path.is_file() else None
+        return shutil.which(raw)
+
+    xray_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray"), "xray")
+    singbox_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"), "sing-box")
+
+    if runner == "auto":
+        if xray_bin:
+            return ("xray", xray_bin)
+        if singbox_bin:
+            return ("singbox", singbox_bin)
+        return ("xray", None)
+    if runner in {"sing-box", "singbox"}:
+        return ("singbox", singbox_bin)
+    return ("xray", xray_bin)
+
+
+def _pick_free_local_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def _wait_for_local_socks_port(port: int, timeout_sec: float) -> bool:
+    deadline = time.time() + max(1.0, timeout_sec)
+    while time.time() < deadline:
+        sock = None
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            return True
+        except OSError:
+            time.sleep(0.1)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return False
+
+
+def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
+    transport = _payload_transport(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or payload.get("host") or "").strip()
+    user: Dict[str, Any] = {
+        "id": str(payload.get("uuid") or "").strip(),
+        "encryption": "none",
+    }
+    flow = str(payload.get("flow") or "").strip()
+    if flow:
+        user["flow"] = flow
+
+    stream_settings: Dict[str, Any] = {
+        "network": transport if transport not in {"websocket"} else "ws",
+        "security": "reality",
+        "realitySettings": {
+            "show": False,
+            "serverName": server_name,
+            "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
+            "publicKey": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+            "shortId": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+            "spiderX": str(payload.get("path") or "/").strip() or "/",
+        },
+    }
+    if transport == "grpc":
+        stream_settings["grpcSettings"] = {
+            "serviceName": str(payload.get("service_name") or "").strip(),
+            "multiMode": False,
+        }
+    elif transport in {"ws", "websocket"}:
+        ws_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or "/").strip() or "/",
+        }
+        host = str(payload.get("host") or server_name or "").strip()
+        if host:
+            ws_settings["headers"] = {"Host": host}
+        stream_settings["wsSettings"] = ws_settings
+
+    dns_servers = [str(item or "").strip() for item in (payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()]
+    if not dns_servers:
+        dns_servers = ["1.1.1.1", "8.8.8.8"]
+
+    return {
+        "log": {"loglevel": "warning"},
+        "dns": {
+            "servers": dns_servers,
+            "queryStrategy": "UseIPv4",
+        },
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": int(socks_port),
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True,
+                },
+                "sniffing": {
+                    "enabled": False,
+                },
+            }
+        ],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": str(payload.get("server") or "").strip(),
+                            "port": int(payload.get("port") or 0),
+                            "users": [user],
+                        }
+                    ]
+                },
+                "streamSettings": stream_settings,
+            }
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+        },
+    }
+
+
+def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
+    transport = _payload_transport(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
+    outbound: Dict[str, Any] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": str(payload.get("server") or "").strip(),
+        "server_port": int(payload.get("port") or 0),
+        "uuid": str(payload.get("uuid") or "").strip(),
+        "packet_encoding": str(payload.get("packet_encoding") or "xudp").strip() or "xudp",
+        "tls": {
+            "enabled": True,
+            "server_name": server_name,
+            "utls": {
+                "enabled": True,
+                "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
+            },
+            "reality": {
+                "enabled": True,
+                "public_key": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+                "short_id": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+            },
+        },
+    }
+    flow = str(payload.get("flow") or "").strip()
+    if flow:
+        outbound["flow"] = flow
+    if transport == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": str(payload.get("service_name") or "").strip(),
+        }
+    elif transport in {"ws", "websocket"}:
+        transport_payload: Dict[str, Any] = {
+            "type": "ws",
+            "path": str(payload.get("path") or "/").strip() or "/",
+        }
+        host = str(payload.get("host") or "").strip()
+        if host:
+            transport_payload["headers"] = {"Host": host}
+        outbound["transport"] = transport_payload
+
+    dns_remote_addr = str((payload.get("dns_servers") or ["1.1.1.1"])[0] or "1.1.1.1").strip() or "1.1.1.1"
+    dns_local_addr = str((payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"])[-1] or "8.8.8.8").strip() or "8.8.8.8"
+    return {
+        "log": {"level": "error"},
+        "dns": {
+            "servers": [
+                {"tag": "dns-remote", "address": dns_remote_addr, "detour": "proxy"},
+                {"tag": "dns-direct", "address": dns_local_addr},
+            ],
+            "rules": [
+                {"outbound": ["proxy"], "server": "dns-remote"},
+            ],
+            "final": "dns-remote",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "local-socks",
+                "listen": "127.0.0.1",
+                "listen_port": int(socks_port),
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "final": "proxy",
+        },
+    }
+
+
+def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
+    connect_timeout = max(2, int(settings.RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC or 6))
+    max_time = max(connect_timeout + 1, int(settings.RU_LTE_REAL_PROBE_MAX_TIME_SEC or 12))
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code} %{time_connect} %{time_starttransfer} %{time_total}",
+        "--socks5-hostname",
+        f"127.0.0.1:{int(socks_port)}",
+        "--connect-timeout",
+        str(connect_timeout),
+        "--max-time",
+        str(max_time),
+        url,
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=max_time + 2)
+    if completed.returncode != 0:
+        return {"ok": False, "error": (completed.stderr or completed.stdout or f"curl_exit_{completed.returncode}").strip()}
+    parts = str(completed.stdout or "").strip().split()
+    if len(parts) != 4:
+        return {"ok": False, "error": "curl_bad_metrics"}
+    http_code, _time_connect, _time_ttfb, time_total = parts
+    try:
+        latency_ms = int(float(time_total) * 1000)
+    except (TypeError, ValueError):
+        latency_ms = None
+    if str(http_code) == "000":
+        return {"ok": False, "error": "http_000", "latency_ms": latency_ms}
+    return {"ok": True, "latency_ms": latency_ms, "http_code": http_code}
+
+
+def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+
+    def _append(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        if text.startswith(("http://", "https://")):
+            url = text
+        else:
+            host = text.split("/")[0].strip()
+            if not host or ":" in host or " " in host:
+                return
+            url = f"https://{host}/"
+        if url not in candidates:
+            candidates.append(url)
+
+    _append(payload.get("host"))
+    _append(payload.get("server_name") or payload.get("sni"))
+    for item in (settings.RU_LTE_REAL_PROBE_URLS or []):
+        _append(item)
+    return candidates
+
+
+def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str, Any]:
+    runner_name, runner_bin = _resolve_probe_runner()
+    if not runner_bin:
+        return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
+
+    urls = _ru_lte_candidate_probe_urls(payload)
+    if not urls:
+        return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
+
+    socks_port = _pick_free_local_port()
+    warmup_ms = max(0, int(settings.RU_LTE_REAL_PROBE_WARMUP_MS or 1200))
+    process: Optional[subprocess.Popen[str]] = None
+    stdout_tail = ""
+    with tempfile.TemporaryDirectory(prefix="inet_ru_lte_probe_") as temp_dir:
+        config_path = Path(temp_dir) / "config.json"
+        if runner_name == "singbox":
+            config_payload = _build_singbox_ru_lte_probe_config(payload, socks_port)
+            command = [runner_bin, "run", "-c", str(config_path)]
+        else:
+            config_payload = _build_xray_ru_lte_probe_config(payload, socks_port)
+            command = [runner_bin, "-config", str(config_path)]
+        config_path.write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if not _wait_for_local_socks_port(socks_port, max(2.0, float(settings.RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC or 6))):
+                if process.poll() is not None:
+                    stdout_tail = (process.stdout.read() if process.stdout else "").strip()[-700:]
+                    return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real"}
+                return {"ok": False, "latency_ms": None, "error": "socks_not_ready", "method": f"{runner_name}_real"}
+            if warmup_ms > 0:
+                time.sleep(warmup_ms / 1000.0)
+            last_error = "probe_failed"
+            for url in urls:
+                result = _run_curl_through_socks(url, socks_port)
+                if result.get("ok"):
+                    result["method"] = f"{runner_name}_real"
+                    result["probe_url"] = url
+                    return result
+                last_error = str(result.get("error") or last_error)
+            return {"ok": False, "latency_ms": None, "error": last_error, "method": f"{runner_name}_real"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "latency_ms": None, "error": "real_probe_timeout", "method": f"{runner_name}_real"}
+        except Exception as exc:
+            return {"ok": False, "latency_ms": None, "error": f"real_probe_exception:{exc}", "method": f"{runner_name}_real"}
+        finally:
+            if process is not None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=1)
+                    except Exception:
+                        pass
+
+
 def _ru_lte_transport_bonus(payload: Dict[str, Any]) -> int:
     transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
     if transport == "xhttp":
@@ -551,36 +923,16 @@ def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    server = str(payload.get("server") or "").strip()
-    port = int(payload.get("port") or 0)
-    if not server or port <= 0:
-        return {"ok": False, "latency_ms": None, "error": "missing_server_or_port"}
+    if bool(settings.RU_LTE_REAL_PROBE_ENABLED):
+        real_probe = _probe_ru_lte_candidate_via_real_tunnel(payload)
+        if real_probe.get("ok"):
+            return real_probe
+        if bool(settings.RU_LTE_REAL_PROBE_REQUIRED):
+            return real_probe
 
-    started = time.perf_counter()
-    try:
-        addr_infos = socket.getaddrinfo(server, port, type=socket.SOCK_STREAM)
-    except OSError as exc:
-        return {"ok": False, "latency_ms": None, "error": f"dns:{exc}"}
-
-    timeout = max(1.0, float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
-    last_error = None
-    for family, socktype, proto, _canonname, sockaddr in addr_infos[:4]:
-        sock = None
-        try:
-            sock = socket.socket(family, socktype, proto)
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            latency_ms = int((time.perf_counter() - started) * 1000)
-            return {"ok": True, "latency_ms": latency_ms, "error": None}
-        except OSError as exc:
-            last_error = str(exc)
-        finally:
-            if sock is not None:
-                try:
-                    sock.close()
-                except OSError:
-                    pass
-    return {"ok": False, "latency_ms": None, "error": last_error or "connect_failed"}
+    fallback_probe = _probe_candidate_with_timeout(payload, float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
+    fallback_probe["method"] = "tcp_fallback"
+    return fallback_probe
 
 
 def _ru_lte_payload_score(payload: Dict[str, Any]) -> int:
@@ -725,6 +1077,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         normalized = dict(candidate)
         normalized["_probe_ok"] = True
         normalized["_latency_ms"] = int(probe.get("latency_ms") or 0)
+        normalized["_probe_method"] = str(probe.get("method") or "")
+        normalized["_probe_url"] = str(probe.get("probe_url") or "")
         normalized["_score"] = _ru_lte_payload_score(normalized)
         tested.append(normalized)
 
@@ -753,6 +1107,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 continue
             existing_payload["_probe_ok"] = True
             existing_payload["_latency_ms"] = int(probe.get("latency_ms") or existing.get("ping_ms") or 0)
+            existing_payload["_probe_method"] = str(probe.get("method") or "")
+            existing_payload["_probe_url"] = str(probe.get("probe_url") or "")
             existing_payload["_source_priority"] = -1
             existing_payload["_score"] = _ru_lte_payload_score(existing_payload)
             top.append(existing_payload)
@@ -774,6 +1130,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
                 payload.pop(key, None)
+            probe_method = str(payload.pop("_probe_method", "") or "")
+            probe_url = str(payload.pop("_probe_url", "") or "")
             latency_ms = int(payload.pop("_latency_ms", 0) or 0)
             payload["location_code"] = code
             payload["remark"] = remarks.get(code, code)
@@ -793,6 +1151,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "transport": payload.get("transport"),
                 "remark": payload.get("remark"),
                 "latency_ms": latency_ms,
+                "probe_method": probe_method,
+                "probe_url": probe_url,
                 "updated": bool(row),
                 "kept_old": idx >= len(tested),
             })
@@ -819,6 +1179,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                             "transport": existing_payload.get("transport"),
                             "remark": remarks.get(code, code),
                             "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "probe_method": probe.get("method"),
+                            "probe_url": probe.get("probe_url"),
                             "updated": True,
                             "kept_old": True,
                         })
@@ -838,17 +1200,27 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
+    selected_live = [item for item in assigned if item.get("server")]
+    reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
+    effective_candidates_total = max(len(tested), len(selected_live))
+
     return {
         "ok": bool(top),
         "sources": source_stats,
-        "candidates_total": len(candidates),
+        "candidates_total": effective_candidates_total,
+        "parsed_candidates_total": len(candidates),
+        "effective_candidates_total": effective_candidates_total,
         "quality_rejected_total": quality_rejected_total,
         "cooldown_skipped_total": cooldown_skipped_total,
         "tested_total": probed_total,
         "live_total": len(tested),
+        "reused_existing_total": reused_existing_total,
         "probe_errors": probe_errors,
+        "real_probe_enabled": bool(settings.RU_LTE_REAL_PROBE_ENABLED),
+        "real_probe_required": bool(settings.RU_LTE_REAL_PROBE_REQUIRED),
+        "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
         "selected": assigned,
-        "selected_live_total": len([item for item in assigned if item.get("server")]),
+        "selected_live_total": len(selected_live),
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
     }
@@ -1041,17 +1413,24 @@ def refresh_black_locations() -> Dict[str, Any]:
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "security": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
+    selected_live = [item for item in assigned if item.get("server")]
+    reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
+    effective_candidates_total = max(len(tested), len(selected_live))
+
     return {
         "ok": bool(top),
         "sources": source_stats,
-        "candidates_total": len(candidates),
+        "candidates_total": effective_candidates_total,
+        "parsed_candidates_total": len(candidates),
+        "effective_candidates_total": effective_candidates_total,
         "quality_rejected_total": quality_rejected_total,
         "cooldown_skipped_total": cooldown_skipped_total,
         "tested_total": probed_total,
         "live_total": len(tested),
+        "reused_existing_total": reused_existing_total,
         "probe_errors": probe_errors,
         "selected": assigned,
-        "selected_live_total": len([item for item in assigned if item.get("server")]),
+        "selected_live_total": len(selected_live),
         "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
     }
