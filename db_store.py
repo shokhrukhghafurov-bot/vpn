@@ -1705,6 +1705,86 @@ def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
         return _get_user_subscription_view_with_conn(conn, user_id)
 
 
+def _device_platform_family(platform: Any) -> str:
+    normalized = str(platform or "").strip().lower()
+    if normalized in {"android", "ios"}:
+        return "mobile"
+    if normalized in {"windows", "macos", "linux"}:
+        return "desktop"
+    if normalized == "client":
+        return "generic"
+    return normalized or "generic"
+
+
+
+def _device_client_family(device_name: Any) -> str:
+    normalized = str(device_name or "").strip().lower()
+    if "v2raytun" in normalized:
+        return "v2raytun"
+    if "hiddify" in normalized:
+        return "hiddify"
+    if "happ" in normalized:
+        return "happ"
+    if "nekobox" in normalized:
+        return "nekobox"
+    if "nekoray" in normalized:
+        return "nekoray"
+    if "sing-box" in normalized or "singbox" in normalized:
+        return "sing-box"
+    if "vpn client" in normalized:
+        return "generic"
+    return normalized or "generic"
+
+
+
+def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_name = str(device_name or "").strip()
+    platform_family = _device_platform_family(normalized_platform)
+    client_family = _device_client_family(normalized_name)
+
+    exact_matches = [
+        item for item in existing
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+        and str(item.get("device_name") or "").strip() == normalized_name
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    same_platform = [
+        item for item in existing
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+    ]
+    if len(same_platform) == 1:
+        return same_platform[0]
+
+    same_family = []
+    for item in existing:
+        item_platform = str(item.get("platform") or "").strip().lower()
+        item_name = str(item.get("device_name") or "").strip()
+        item_family = _device_platform_family(item_platform)
+        item_client_family = _device_client_family(item_name)
+        compatible_family = item_family == platform_family
+        compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
+        if compatible_family and compatible_client:
+            same_family.append(item)
+    if len(same_family) == 1:
+        return same_family[0]
+
+    if len(existing) == 1:
+        only_item = existing[0]
+        only_platform = str(only_item.get("platform") or "").strip().lower()
+        only_name = str(only_item.get("device_name") or "").strip()
+        only_family = _device_platform_family(only_platform)
+        only_client_family = _device_client_family(only_name)
+        compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
+        compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
+        if compatible_family and compatible_client:
+            return only_item
+
+    return None
+
+
 def _upsert_device_record(
     user_id: int,
     platform: str,
@@ -1743,14 +1823,8 @@ def _upsert_device_record(
             return dict(row) if row else None
     if len(existing) >= allowed_limit:
         if not enforce_limit:
-            normalized_platform = str(platform or "").strip().lower()
-            normalized_name = str(device_name or "").strip()
-            matching_items = [
-                item for item in existing
-                if str(item.get("platform") or "").strip().lower() == normalized_platform
-                and str(item.get("device_name") or "").strip() == normalized_name
-            ]
-            if len(matching_items) == 1:
+            matched_item = _select_soft_match_device(existing, platform, device_name)
+            if matched_item:
                 with db() as conn:
                     with conn.cursor() as cur:
                         cur.execute(
@@ -1764,7 +1838,7 @@ def _upsert_device_record(
                             WHERE id = %s
                             RETURNING *
                             """,
-                            (device_fingerprint, platform, device_name, matching_items[0]["id"]),
+                            (device_fingerprint, platform, device_name, matched_item["id"]),
                         )
                         row = cur.fetchone()
                     conn.commit()
