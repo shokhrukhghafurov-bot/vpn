@@ -39,17 +39,17 @@ TEXT: Dict[str, Dict[str, str]] = {
         "buy": "💳 Купить подписку",
         "sub": "📄 Моя подписка",
         "devices": "📱 Мои устройства",
-        "download": "⬇️ Hiddify / Подключение",
+        "download": "⬇️ Приложение / Подключение",
         "support": "🛟 Поддержка",
         "instructions": "📘 Инструкция",
         "renew": "🔄 Продлить",
-        "open_app": "🚀 Открыть в Hiddify",
-        "download_app": "⬇️ Скачать Hiddify",
+        "open_app": "🚀 Открыть подключение",
+        "download_app": "⬇️ Скачать приложение",
         "back": "⬅️ Назад",
         "main_menu": "🏠 Главное меню",
         "choose_language": "🌐 Выберите язык",
         "language_saved": "Язык сохранён.",
-        "instructions_text": "📘 Инструкция\n\n1. Нажмите «Hiddify / Подключение».\n2. Скопируйте вашу персональную ссылку подписки.\n3. Откройте приложение Hiddify.\n4. Нажмите «Добавить профиль» → «Импорт из буфера обмена» или «Импорт по ссылке».\n5. Вставьте ссылку и сохраните профиль.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
+        "instructions_text": "📘 Инструкция\n\n1. Нажмите «Приложение / Подключение».\n2. Выберите вашу платформу.\n3. Скопируйте вашу персональную ссылку подписки.\n4. Windows/macOS: установите Happ и добавьте ссылку вручную как Subscription / URL.\n5. Android/iPhone: установите выбранный мобильный клиент и импортируйте подписку.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
         "choose_plan": "💼 Выберите тариф:",
         "plan": "Тариф",
         "price": "Цена",
@@ -75,7 +75,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "limit_reached": "Лимит устройств достигнут",
         "devices_none": "Устройств пока нет.",
         "device_removed": "Устройство удалено. Слот освобождён.",
-        "choose_platform": "Выберите платформу для установки Hiddify:",
+        "choose_platform": "Выберите платформу для подключения:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
         "windows": "🪟 Windows",
@@ -101,8 +101,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Доступно устройств",
         "token_label": "Код входа",
         "copy_token": "📋 Скопировать код",
-        "download_windows": "Windows: установите Hiddify, запустите его от имени администратора, включите TUN / Full Tunnel, затем откройте ссылку импорта из браузера или вставьте подписку вручную.",
-        "download_macos": "macOS: установите Hiddify, затем откройте ссылку импорта из браузера или вставьте подписку вручную.",
+        "download_windows": "Windows: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
+        "download_macos": "macOS: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
         "copy_subscription": "📋 Скопировать ссылку подписки",
         "manual_import_hint": "Если Hiddify не открылся автоматически, скопируйте ссылку подписки и импортируйте её вручную в Hiddify. На Windows для TUN запустите клиент от имени администратора.",
         "subscription_buy_prompt": "Чтобы подключиться, купите или продлите подписку.",
@@ -114,17 +114,17 @@ TEXT: Dict[str, Dict[str, str]] = {
         "buy": "💳 Buy subscription",
         "sub": "📄 My subscription",
         "devices": "📱 My devices",
-        "download": "⬇️ Hiddify / Connect",
+        "download": "⬇️ Apps / Connect",
         "support": "🛟 Support",
         "instructions": "📘 Instructions",
         "renew": "🔄 Renew",
-        "open_app": "🚀 Open in Hiddify",
-        "download_app": "⬇️ Download Hiddify",
+        "open_app": "🚀 Open connection",
+        "download_app": "⬇️ Download app",
         "back": "⬅️ Back",
         "main_menu": "🏠 Main menu",
         "choose_language": "🌐 Choose language",
         "language_saved": "Language saved.",
-        "instructions_text": "📘 Instructions\n\n1. Tap \"Hiddify / Connect\".\n2. Copy your personal subscription link.\n3. Open the Hiddify app.\n4. Tap \"Add Profile\" → \"Import from Clipboard\" or \"Import from URL\".\n5. Paste the link and save the profile.\n6. Tap \"Refresh\" to load fresh locations and configs.\n7. Connect to VPN.\n\nIf any location or LTE does not work:\n• tap the \"Refresh\" button\n• wait until the profile updates\n• try another location or a reserve server\n\nIf part of the internet does not work after an air raid alert or blocking:\n• connect to an LTE location\n• then tap \"Refresh\" again\n• if the problem remains, try a reserve LTE\n\nImportant: do not share your personal subscription link with other people.",
+        "instructions_text": "📘 Instructions\n\n1. Tap \"Apps / Connect\".\n2. Choose your platform.\n3. Copy your personal subscription link.\n4. On Windows/macOS install Happ and add the link manually as Subscription / URL.\n5. On Android/iPhone install the selected mobile client and import the subscription.\n6. Tap \"Refresh\" to load fresh locations and configs.\n7. Connect to VPN.\n\nIf any location or LTE does not work:\n• tap the \"Refresh\" button\n• wait until the profile updates\n• try another location or a reserve server\n\nIf part of the internet does not work after an air raid alert or blocking:\n• connect to an LTE location\n• then tap \"Refresh\" again\n• if the problem remains, try a reserve LTE\n\nImportant: do not share your personal subscription link with other people.",
         "choose_plan": "💼 Choose a plan:",
         "plan": "Plan",
         "price": "Price",
@@ -150,7 +150,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "limit_reached": "Device limit reached",
         "devices_none": "No devices yet.",
         "device_removed": "Device removed. Slot released.",
-        "choose_platform": "Choose a platform to install Hiddify:",
+        "choose_platform": "Choose a platform to connect:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
         "windows": "🪟 Windows",
@@ -176,8 +176,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Devices available",
         "token_label": "Login code",
         "copy_token": "📋 Copy code",
-        "download_windows": "Windows: install Hiddify, run it as Administrator, enable TUN / Full Tunnel, then open the import link from your browser or paste the subscription manually.",
-        "download_macos": "macOS: install Hiddify, then open the import link from your browser or paste the subscription manually.",
+        "download_windows": "Windows: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
+        "download_macos": "macOS: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
         "copy_subscription": "📋 Copy subscription link",
         "manual_import_hint": "If Hiddify does not open automatically, copy the subscription link and import it manually in Hiddify. On Windows, run the client as Administrator before enabling TUN.",
         "subscription_buy_prompt": "To connect, buy or renew a subscription.",
@@ -202,9 +202,24 @@ def selected_client_name() -> str:
 
 def tx(lang: str, key: str) -> str:
     raw = TEXT[lang][key]
-    if key in {"download", "open_app", "download_app", "instructions_text", "choose_platform", "download_android", "download_ios", "download_windows", "download_macos", "manual_import_hint"}:
+    if key in {"download_android", "download_ios", "manual_import_hint"}:
         return raw.replace("Hiddify", selected_client_name())
     return raw
+
+
+def platform_download_button_text(lang: str, platform: str) -> str:
+    key = (platform or "").strip().lower()
+    if lang == "ru":
+        if key == "windows":
+            return "⬇️ Скачать Happ для Windows"
+        if key in {"macos", "mac", "osx"}:
+            return "⬇️ Скачать Happ для macOS"
+        return f"⬇️ Скачать {selected_client_name()}"
+    if key == "windows":
+        return "⬇️ Download Happ for Windows"
+    if key in {"macos", "mac", "osx"}:
+        return "⬇️ Download Happ for macOS"
+    return f"⬇️ Download {selected_client_name()}"
 
 
 async def refresh_app_config(force: bool = False) -> None:
@@ -215,7 +230,7 @@ async def refresh_app_config(force: bool = False) -> None:
         data = await api_request("GET", "/app/config")
     except Exception:
         return
-    settings.VPN_CLIENT_MODE = str(data.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
+    settings.VPN_CLIENT_MODE = str(data.get("mobile_client_mode") or data.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
     settings.ANDROID_APP_URL = str(data.get("android_app_url") or settings.ANDROID_APP_URL)
     settings.IOS_APP_URL = str(data.get("ios_app_url") or settings.IOS_APP_URL)
     settings.WINDOWS_APP_URL = str(data.get("windows_app_url") or getattr(settings, "WINDOWS_APP_URL", ""))
@@ -350,15 +365,20 @@ def token_copy_rows(lang: str, token: Optional[str]) -> List[List[InlineKeyboard
 
 def platform_store_url(platform: str) -> str:
     key = (platform or "").strip().lower()
-    if key == "android":
-        return settings.ANDROID_APP_URL
-    if key in {"ios", "iphone", "ipad"}:
-        return settings.IOS_APP_URL
     if key == "windows":
-        return settings.WINDOWS_APP_URL
+        return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
     if key in {"macos", "mac", "osx"}:
-        return settings.MACOS_APP_URL
-    return settings.ANDROID_APP_URL
+        return str(getattr(settings, "HAPP_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip()
+    if selected_client_mode() == "v2raytun":
+        if key == "android":
+            return str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+        if key in {"ios", "iphone", "ipad"}:
+            return str(getattr(settings, "V2RAYTUN_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip()
+    if key == "android":
+        return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+    if key in {"ios", "iphone", "ipad"}:
+        return str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip()
+    return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
 
 
 def is_supported_telegram_url(url: Optional[str]) -> bool:
@@ -481,6 +501,7 @@ def build_open_app_url(
     *,
     code: Optional[str] = None,
     token: Optional[str] = None,
+    platform: Optional[str] = None,
 ) -> str:
     base = (settings.OPEN_APP_BRIDGE_URL or "").strip() or f"{settings.BACKEND_BASE_URL.rstrip('/')}/open-app"
     final_code = code or credential
@@ -495,6 +516,8 @@ def build_open_app_url(
         query["token"] = final_token
     if lang:
         query["lang"] = lang
+    if platform:
+        query["platform"] = platform
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -565,8 +588,8 @@ def platform_open_inline(
 ) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     url = platform_store_url(platform)
-    rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=tx(lang, "download_app"), url=url)]]
-    final_open_url = open_app_url or build_open_app_url(lang=lang, token=subscription_token)
+    rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=platform_download_button_text(lang, platform), url=url)]]
+    final_open_url = build_open_app_url(lang=lang, token=subscription_token, platform=platform) if subscription_token else (open_app_url or build_open_app_url(lang=lang, platform=platform))
     if is_supported_telegram_url(final_open_url):
         rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=final_open_url)])
     rows.extend(subscription_copy_rows(lang, subscription_url))
