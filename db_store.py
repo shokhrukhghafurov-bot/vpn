@@ -563,24 +563,30 @@ def _normalize_client_mode(value: Any) -> str:
 def _client_store_urls(mode: Optional[str] = None) -> Dict[str, str]:
     selected = _normalize_client_mode(mode if mode is not None else getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
     if selected == "v2raytun":
-        return {
+        mobile = {
             "android_app_url": str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip(),
             "ios_app_url": str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip(),
-            "windows_app_url": str(getattr(settings, "V2RAYTUN_WINDOWS_APP_URL", "") or "").strip(),
-            "macos_app_url": str(getattr(settings, "V2RAYTUN_MACOS_APP_URL", "") or "").strip(),
             "android_app_package": str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip(),
         }
+    else:
+        mobile = {
+            "android_app_url": str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip(),
+            "ios_app_url": str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip(),
+            "android_app_package": str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip(),
+        }
     return {
-        "android_app_url": str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip(),
-        "ios_app_url": str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip(),
-        "windows_app_url": str(getattr(settings, "HIDDIFY_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip(),
-        "macos_app_url": str(getattr(settings, "HIDDIFY_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip(),
-        "android_app_package": str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip(),
+        **mobile,
+        "windows_app_url": str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip(),
+        "macos_app_url": str(getattr(settings, "HAPP_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip(),
     }
 
 
 def _active_client_name(mode: Optional[str] = None) -> str:
     return "v2RayTun" if _normalize_client_mode(mode) == "v2raytun" else "Hiddify"
+
+
+def _desktop_client_name() -> str:
+    return "Happ"
 
 
 def get_runtime_settings_payload() -> Dict[str, Any]:
@@ -2374,6 +2380,10 @@ def settings_snapshot() -> Dict[str, Any]:
         "app_name": settings.APP_NAME,
         "client_mode": client_mode,
         "client_name": _active_client_name(client_mode),
+        "mobile_client_mode": client_mode,
+        "mobile_client_name": _active_client_name(client_mode),
+        "desktop_client_mode": "happ",
+        "desktop_client_name": _desktop_client_name(),
         "app_env": settings.APP_ENV,
         "languages": settings.APP_LANGS,
         "device_limit": settings.VPN_DEFAULT_DEVICE_LIMIT,
