@@ -2629,9 +2629,6 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
     if limit <= 0 or used < limit:
         return gate
     platform, device_name = _detect_device_platform_and_name(request)
-    desktopish_platforms = {"windows", "macos", "linux", "client"}
-    if platform not in desktopish_platforms:
-        return gate
     user = access.get("user") or {}
     user_id = int(user.get("id") or 0)
     if user_id <= 0:
@@ -2641,9 +2638,28 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
     except Exception:
         return gate
     devices = list(view.get("devices") or [])
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_name = str(device_name or "").strip()
+    exact_matches = [
+        item
+        for item in devices
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+        and str(item.get("device_name") or "").strip() == normalized_name
+    ]
+    if len(exact_matches) == 1:
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_device_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {normalized_name or normalized_platform or 'device'} slot"
+        return relaxed
+
+    desktopish_platforms = {"windows", "macos", "linux", "client"}
+    if normalized_platform not in desktopish_platforms:
+        return gate
     soft_match = any(
         str(item.get("platform") or "").strip().lower() in desktopish_platforms
-        or str(item.get("device_name") or "").strip() == device_name
+        or str(item.get("device_name") or "").strip() == normalized_name
         for item in devices
     )
     if not soft_match:
