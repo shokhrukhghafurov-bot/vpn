@@ -2708,7 +2708,15 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         return gate
     if not access or access.get("kind") != "user":
         return gate
-    if _subscription_client_id_from_request(request):
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+    has_explicit_client_id = bool(_subscription_client_id_from_request(request))
+    allow_soft_match_with_client_id = (
+        client_hint in {"v2raytun", "hiddify"}
+        or "v2raytun" in user_agent_hint
+        or "hiddify" in user_agent_hint
+    )
+    if has_explicit_client_id and not allow_soft_match_with_client_id:
         return gate
     used = int(gate.get("devices_used") or 0)
     limit = int(gate.get("device_limit") or 0)
