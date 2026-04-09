@@ -1661,9 +1661,10 @@ def _hiddify_profile_update_interval_header_value() -> str:
         numeric = 1.0
     if numeric <= 0:
         numeric = 1.0
-    if numeric.is_integer():
-        return str(int(numeric))
-    return (f"{numeric:.6f}").rstrip("0").rstrip(".")
+    normalized_hours = int(numeric + 0.5)
+    if normalized_hours < 1:
+        normalized_hours = 1
+    return str(normalized_hours)
 
 
 def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
