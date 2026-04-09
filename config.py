@@ -10,11 +10,9 @@ BUILTIN_MVP_LOCATIONS_JSON = (
     '{"code":"ru-lte","name_ru":"Россия LTE","name_en":"Russia LTE","country_code":"RU","is_active":true,"is_recommended":true,"is_reserve":false,"status":"offline","sort_order":30,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte","remark":"Russia LTE","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"ru-lte-reserve-1","name_ru":"Россия LTE | Резерв 1","name_en":"Russia LTE | Reserve 1","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":31,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte-reserve-1","remark":"Russia LTE | Reserve 1","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"ru-lte-reserve-2","name_ru":"Россия LTE | Резерв 2","name_en":"Russia LTE | Reserve 2","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":32,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte-reserve-2","remark":"Russia LTE | Reserve 2","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
-    '{"code":"ru-lte-reserve-3","name_ru":"Россия LTE | Резерв 3","name_en":"Russia LTE | Reserve 3","country_code":"RU","is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":33,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"ru-lte-reserve-3","remark":"Russia LTE | Reserve 3","transport":"tcp","network":"tcp","security":"reality","flow":"xtls-rprx-vision","server_name":"www.cloudflare.com","sni":"www.cloudflare.com","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"intl-fast","name_ru":"Fast / International","name_en":"Fast / International","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":false,"status":"offline","sort_order":80,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"intl-fast","remark":"Fast / International","transport":"tcp","network":"tcp","security":"tls","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"intl-fast-reserve-1","name_ru":"Fast / International | Reserve 1","name_en":"Fast / International | Reserve 1","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":81,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"intl-fast-reserve-1","remark":"Fast / International | Reserve 1","transport":"tcp","network":"tcp","security":"tls","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"intl-fast-reserve-2","name_ru":"Fast / International | Reserve 2","name_en":"Fast / International | Reserve 2","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":82,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"intl-fast-reserve-2","remark":"Fast / International | Reserve 2","transport":"tcp","network":"tcp","security":"tls","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
-    '{"code":"intl-fast-reserve-3","name_ru":"Fast / International | Reserve 3","name_en":"Fast / International | Reserve 3","country_code":null,"is_active":true,"is_recommended":false,"is_reserve":true,"status":"offline","sort_order":83,"vpn_payload":{"engine":"nekobox","protocol":"vless","location_code":"intl-fast-reserve-3","remark":"Fast / International | Reserve 3","transport":"tcp","network":"tcp","security":"tls","fingerprint":"chrome","packet_encoding":"xudp","dns_servers":["1.1.1.1","8.8.8.8"]}},'
     '{"code":"se","name_ru":"Sweden","name_en":"Sweden","country_code":"SE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":40},'
     '{"code":"nl-1","name_ru":"Нидерланды","name_en":"Netherlands","country_code":"NL","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":50},'
     '{"code":"de-1","name_ru":"Германия","name_en":"Germany","country_code":"DE","is_active":true,"is_recommended":false,"is_reserve":false,"status":"online","sort_order":60},'
@@ -223,11 +221,11 @@ class Settings:
     VLESS_RAW_XRAY_CONFIG: str = os.getenv("VLESS_RAW_XRAY_CONFIG", "")
 
     RU_LTE_SOURCE_URLS: List[str] = None
-    RU_LTE_REFRESH_ON_STARTUP: bool = _env_bool("RU_LTE_REFRESH_ON_STARTUP", False)
-    RU_LTE_AUTO_REFRESH_ENABLED: bool = _env_bool("RU_LTE_AUTO_REFRESH_ENABLED", False)
-    RU_LTE_AUTO_REFRESH_MINUTES: int = _env_int("RU_LTE_AUTO_REFRESH_MINUTES", 30)
+    RU_LTE_REFRESH_ON_STARTUP: bool = _env_bool("RU_LTE_REFRESH_ON_STARTUP", True)
+    RU_LTE_AUTO_REFRESH_ENABLED: bool = _env_bool("RU_LTE_AUTO_REFRESH_ENABLED", True)
+    RU_LTE_AUTO_REFRESH_MINUTES: int = _env_int("RU_LTE_AUTO_REFRESH_MINUTES", 3)
     RU_LTE_AUTO_REFRESH_TIMEOUT_SEC: int = _env_int("RU_LTE_AUTO_REFRESH_TIMEOUT_SEC", 600)
-    RU_LTE_MAX_CANDIDATES: int = _env_int("RU_LTE_MAX_CANDIDATES", 4)
+    RU_LTE_MAX_CANDIDATES: int = _env_int("RU_LTE_MAX_CANDIDATES", 3)
     RU_LTE_TEST_LIMIT: int = _env_int("RU_LTE_TEST_LIMIT", 40)
     RU_LTE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_CONNECT_TIMEOUT_SEC", 4)
     RU_LTE_DEAD_COOLDOWN_MINUTES: int = _env_int("RU_LTE_DEAD_COOLDOWN_MINUTES", 45)
@@ -236,11 +234,11 @@ class Settings:
     HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS: float = _env_float("HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)  # normalized to whole hours for Hiddify headers
 
     BLACK_SOURCE_URLS: List[str] = None
-    BLACK_REFRESH_ON_STARTUP: bool = _env_bool("BLACK_REFRESH_ON_STARTUP", False)
-    BLACK_AUTO_REFRESH_ENABLED: bool = _env_bool("BLACK_AUTO_REFRESH_ENABLED", False)
-    BLACK_AUTO_REFRESH_MINUTES: int = _env_int("BLACK_AUTO_REFRESH_MINUTES", 30)
+    BLACK_REFRESH_ON_STARTUP: bool = _env_bool("BLACK_REFRESH_ON_STARTUP", True)
+    BLACK_AUTO_REFRESH_ENABLED: bool = _env_bool("BLACK_AUTO_REFRESH_ENABLED", True)
+    BLACK_AUTO_REFRESH_MINUTES: int = _env_int("BLACK_AUTO_REFRESH_MINUTES", 3)
     BLACK_AUTO_REFRESH_TIMEOUT_SEC: int = _env_int("BLACK_AUTO_REFRESH_TIMEOUT_SEC", 600)
-    BLACK_MAX_CANDIDATES: int = _env_int("BLACK_MAX_CANDIDATES", 4)
+    BLACK_MAX_CANDIDATES: int = _env_int("BLACK_MAX_CANDIDATES", 3)
     BLACK_TEST_LIMIT: int = _env_int("BLACK_TEST_LIMIT", 40)
     BLACK_CONNECT_TIMEOUT_SEC: int = _env_int("BLACK_CONNECT_TIMEOUT_SEC", 4)
     BLACK_DEAD_COOLDOWN_MINUTES: int = _env_int("BLACK_DEAD_COOLDOWN_MINUTES", 30)
