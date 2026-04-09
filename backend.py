@@ -1653,9 +1653,27 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
     return concrete
 
 
-@app.get("/sub/{token}")
-def public_subscription(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
-    del cid
+def _hiddify_profile_update_interval_header_value() -> str:
+    raw_value = getattr(settings, "HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)
+    try:
+        numeric = float(raw_value)
+    except (TypeError, ValueError):
+        numeric = 1.0
+    if numeric <= 0:
+        numeric = 1.0
+    if numeric.is_integer():
+        return str(int(numeric))
+    return (f"{numeric:.6f}").rstrip("0").rstrip(".")
+
+
+def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def _subscription_response(request: Request, token: str, *, head_only: bool = False) -> Response:
     access = _subscription_access_context(token)
     if not access:
         raise HTTPException(status_code=404, detail="Subscription not found")
@@ -1690,7 +1708,8 @@ def public_subscription(request: Request, token: str, cid: Optional[str] = Query
             )
             return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
 
-    _track_subscription_device_access(request, token, access)
+    if not head_only:
+        _track_subscription_device_access(request, token, access)
 
     rows = _subscription_location_rows()
     lines: List[str] = []
@@ -1706,21 +1725,55 @@ def public_subscription(request: Request, token: str, cid: Optional[str] = Query
 
     content = "\n".join(lines) + "\n"
     content_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    last_modified_dt: Optional[datetime] = None
+    for row in rows:
+        raw_updated = row.get("updated_at")
+        parsed: Optional[datetime] = None
+        if isinstance(raw_updated, datetime):
+            parsed = raw_updated
+        elif isinstance(raw_updated, str):
+            try:
+                parsed = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
+            except Exception:
+                parsed = None
+        if parsed is not None:
+            if last_modified_dt is None or parsed > last_modified_dt:
+                last_modified_dt = parsed
+    if last_modified_dt is None:
+        last_modified_dt = datetime.now(timezone.utc)
     profile_web_page_url = str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
         "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
         "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0",
+        "CDN-Cache-Control": "no-store",
+        "Surrogate-Control": "no-store",
         "Pragma": "no-cache",
         "Expires": "0",
         "ETag": f'W/"{content_etag}"',
-        "profile-update-interval": str(max(1, int(getattr(settings, "HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1) or 1))),
+        "Last-Modified": _http_date_from_datetime(last_modified_dt) or "",
+        "profile-update-interval": _hiddify_profile_update_interval_header_value(),
         "support-url": str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip(),
         "profile-web-page-url": profile_web_page_url,
         "x-hiddify-source": "subscription",
+        "x-subscription-version": content_etag,
     }
+    if head_only:
+        return Response(status_code=200, headers=headers)
     return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+@app.get("/sub/{token}")
+def public_subscription(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
+    del cid
+    return _subscription_response(request, token, head_only=False)
+
+
+@app.head("/sub/{token}")
+def public_subscription_head(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
+    del cid
+    return _subscription_response(request, token, head_only=True)
 
 
 @app.get("/sub")
