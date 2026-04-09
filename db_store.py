@@ -1018,9 +1018,9 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     if not rows:
         return None
 
-    excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3"}
+    excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2"}
     preferred_main_codes = ["ru-lte"]
-    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
+    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2"]
 
     def is_online(row: Dict[str, Any]) -> bool:
         return str(row.get("status") or "").strip().lower() == "online"
@@ -1850,7 +1850,7 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE LIMIT 1",
+                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE AND status = 'online' LIMIT 1",
                     (location_code,),
                 )
                 row = cur.fetchone()
