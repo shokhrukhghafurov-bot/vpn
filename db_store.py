@@ -1742,6 +1742,33 @@ def _upsert_device_record(
                 conn.commit()
             return dict(row) if row else None
     if len(existing) >= allowed_limit:
+        if not enforce_limit:
+            normalized_platform = str(platform or "").strip().lower()
+            normalized_name = str(device_name or "").strip()
+            matching_items = [
+                item for item in existing
+                if str(item.get("platform") or "").strip().lower() == normalized_platform
+                and str(item.get("device_name") or "").strip() == normalized_name
+            ]
+            if len(matching_items) == 1:
+                with db() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute(
+                            """
+                            UPDATE devices
+                            SET device_fingerprint = %s,
+                                platform = %s,
+                                device_name = %s,
+                                is_active = TRUE,
+                                last_seen_at = NOW()
+                            WHERE id = %s
+                            RETURNING *
+                            """,
+                            (device_fingerprint, platform, device_name, matching_items[0]["id"]),
+                        )
+                        row = cur.fetchone()
+                    conn.commit()
+                return dict(row) if row else None
         if enforce_limit:
             raise PermissionError(f"Device limit reached ({allowed_limit})")
         return None
