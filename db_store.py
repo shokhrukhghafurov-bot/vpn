@@ -71,8 +71,7 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
 
 
 VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
-VIRTUAL_LOCATION_POOL_SIZE = 3
-VIRTUAL_LOCATION_MAX_POOL_SIZE = 5
+VIRTUAL_LOCATION_POOL_SIZE = 5
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1073,6 +1072,23 @@ def _location_speed_rank(row: Dict[str, Any]) -> tuple:
     return (has_speed, download, upload, ping_score, recommended, -reserve, -(int(row.get("sort_order") or 9999)))
 
 
+def _is_lte_location(row: Dict[str, Any]) -> bool:
+    code = str(row.get("code") or "").strip().lower()
+    if code.startswith("ru-lte") or code.startswith("russia-lte"):
+        return True
+    name_parts = [row.get("name_ru"), row.get("name_en")]
+    joined = " ".join(str(part or "").strip().lower() for part in name_parts if str(part or "").strip())
+    return "lte" in joined
+
+
+def _speed_metrics_present(row: Dict[str, Any]) -> bool:
+    return bool(
+        (_normalize_optional_float(row.get("download_mbps")) or 0) > 0
+        or (_normalize_optional_float(row.get("upload_mbps")) or 0) > 0
+        or (_normalize_optional_int(row.get("ping_ms")) or 0) > 0
+    )
+
+
 def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     unique: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -1173,30 +1189,32 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
         return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
 
     def measured(predicate) -> List[Dict[str, Any]]:
-        return generic(
-            lambda row: predicate(row)
-            and ((_normalize_optional_float(row.get("download_mbps")) or 0) > 0
-                 or (_normalize_optional_float(row.get("upload_mbps")) or 0) > 0
-                 or (_normalize_optional_int(row.get("ping_ms")) or 0) > 0)
-        )
+        return generic(lambda row: predicate(row) and _speed_metrics_present(row))
 
     if code == "auto-fastest":
+        fastest_non_lte = measured(lambda row: is_online(row) and not row.get("is_reserve") and not _is_lte_location(row))
+        fastest_any_non_lte = measured(lambda row: is_online(row) and not _is_lte_location(row))
+        lte_main = by_codes(preferred_main_codes)
+        lte_reserve = by_codes(preferred_reserve_codes)
         return _dedupe_location_rows(
-            measured(lambda row: is_online(row) and not row.get("is_reserve"))
-            + measured(lambda row: is_online(row))
-            + by_codes(preferred_main_codes)
-            + by_codes(preferred_reserve_codes)
-            + generic(lambda row: is_online(row) and row.get("is_recommended"))
+            fastest_non_lte[:3]
+            + lte_main
+            + lte_reserve
+            + fastest_non_lte[3:]
+            + fastest_any_non_lte
+            + generic(lambda row: is_online(row) and row.get("is_recommended") and not _is_lte_location(row))
+            + generic(lambda row: is_online(row) and not _is_lte_location(row))
             + generic(lambda row: is_online(row))
         )
 
     if code == "auto-reserve":
         return _dedupe_location_rows(
-            measured(lambda row: is_online(row) and row.get("is_reserve"))
+            measured(lambda row: is_online(row) and row.get("is_reserve") and not _is_lte_location(row))
             + by_codes(preferred_reserve_codes)
-            + generic(lambda row: is_online(row) and row.get("is_reserve"))
             + by_codes(preferred_main_codes)
-            + measured(lambda row: is_online(row))
+            + generic(lambda row: is_online(row) and row.get("is_reserve") and not _is_lte_location(row))
+            + measured(lambda row: is_online(row) and not _is_lte_location(row))
+            + generic(lambda row: is_online(row) and not _is_lte_location(row))
             + generic(lambda row: is_online(row))
         )
     return []
@@ -1211,32 +1229,21 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    primary_pool_size = max(1, VIRTUAL_LOCATION_POOL_SIZE)
-    max_pool_size = max(primary_pool_size, VIRTUAL_LOCATION_MAX_POOL_SIZE)
-    primary_pool = ranked_candidates[:primary_pool_size]
-    candidate_pool = ranked_candidates[:max_pool_size]
-    if not candidate_pool:
-        return None
-
+    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not user_id:
-        return primary_pool[0] if primary_pool else candidate_pool[0]
+        return pool[0]
 
     assigned_code = get_user_virtual_location_assignment(user_id, code)
     if assigned_code:
-        for row in candidate_pool:
+        for row in pool:
             if str(row.get("code") or "").strip() == assigned_code:
                 return row
 
-    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in candidate_pool])
-
-    def load_rank(item: tuple[int, Dict[str, Any]]) -> tuple[int, int, int]:
-        index, row = item
-        concrete_code = str(row.get("code") or "").strip()
-        current_load = int(loads.get(concrete_code, 0))
-        outside_primary_penalty = 0 if index < primary_pool_size else 1
-        return (current_load, outside_primary_penalty, index)
-
-    selected = min(enumerate(candidate_pool), key=load_rank)[1]
+    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
+    selected = min(
+        enumerate(pool),
+        key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
+    )[1]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
