@@ -555,6 +555,34 @@ def _current_runtime_plan_payloads() -> List[Dict[str, Any]]:
     return plans
 
 
+def _normalize_client_mode(value: Any) -> str:
+    mode = str(value or "").strip().lower()
+    return "v2raytun" if mode == "v2raytun" else "hiddify"
+
+
+def _client_store_urls(mode: Optional[str] = None) -> Dict[str, str]:
+    selected = _normalize_client_mode(mode if mode is not None else getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
+    if selected == "v2raytun":
+        return {
+            "android_app_url": str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip(),
+            "ios_app_url": str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip(),
+            "windows_app_url": str(getattr(settings, "V2RAYTUN_WINDOWS_APP_URL", "") or "").strip(),
+            "macos_app_url": str(getattr(settings, "V2RAYTUN_MACOS_APP_URL", "") or "").strip(),
+            "android_app_package": str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip(),
+        }
+    return {
+        "android_app_url": str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip(),
+        "ios_app_url": str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip(),
+        "windows_app_url": str(getattr(settings, "HIDDIFY_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip(),
+        "macos_app_url": str(getattr(settings, "HIDDIFY_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip(),
+        "android_app_package": str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip(),
+    }
+
+
+def _active_client_name(mode: Optional[str] = None) -> str:
+    return "v2RayTun" if _normalize_client_mode(mode) == "v2raytun" else "Hiddify"
+
+
 def get_runtime_settings_payload() -> Dict[str, Any]:
     with db() as conn:
         with conn.cursor() as cur:
@@ -567,6 +595,7 @@ def get_runtime_settings_payload() -> Dict[str, Any]:
 def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     data = dict(payload or get_runtime_settings_payload() or {})
     settings.APP_NAME = _coerce_runtime_str(data.get("app_name"), settings.APP_NAME)
+    settings.VPN_CLIENT_MODE = _normalize_client_mode(data.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
     settings.APP_ENV = _coerce_runtime_str(data.get("app_env"), settings.APP_ENV)
     settings.APP_LANGS = _coerce_runtime_languages(data.get("languages"), list(settings.APP_LANGS or ["ru", "en"]))
     settings.BOT_NAME = _coerce_runtime_str(data.get("bot_name"), settings.BOT_NAME)
@@ -614,6 +643,7 @@ def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -
 def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = {
         "app_name": _coerce_runtime_str(payload.get("app_name"), settings.APP_NAME),
+        "client_mode": _normalize_client_mode(payload.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify")),
         "app_env": _coerce_runtime_str(payload.get("app_env"), settings.APP_ENV),
         "languages": _coerce_runtime_languages(payload.get("languages"), list(settings.APP_LANGS or ["ru", "en"])),
         "bot_name": _coerce_runtime_str(payload.get("bot_name"), settings.BOT_NAME),
@@ -2331,8 +2361,12 @@ def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
 
 def settings_snapshot() -> Dict[str, Any]:
     plans = _current_runtime_plan_payloads()
+    urls = _client_store_urls()
+    client_mode = _normalize_client_mode(getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
     return {
         "app_name": settings.APP_NAME,
+        "client_mode": client_mode,
+        "client_name": _active_client_name(client_mode),
         "app_env": settings.APP_ENV,
         "languages": settings.APP_LANGS,
         "device_limit": settings.VPN_DEFAULT_DEVICE_LIMIT,
@@ -2347,10 +2381,11 @@ def settings_snapshot() -> Dict[str, Any]:
         "bot_name": settings.BOT_NAME,
         "bot_username": settings.BOT_USERNAME,
         "open_app_url": settings.OPEN_APP_URL,
-        "android_app_url": settings.ANDROID_APP_URL,
-        "ios_app_url": settings.IOS_APP_URL,
-        "windows_app_url": getattr(settings, "WINDOWS_APP_URL", ""),
-        "macos_app_url": getattr(settings, "MACOS_APP_URL", ""),
+        "android_app_url": urls["android_app_url"],
+        "ios_app_url": urls["ios_app_url"],
+        "windows_app_url": urls["windows_app_url"],
+        "macos_app_url": urls["macos_app_url"],
+        "android_app_package": urls["android_app_package"],
         "settings_editable": True,
         "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
         "plans": plans,
