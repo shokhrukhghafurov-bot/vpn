@@ -1226,24 +1226,14 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     source_errors_total = len(source_errors)
     sources_ok_total = len(source_stats) - source_errors_total
     display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
-    if raw_parsed_total > 0:
-        refresh_summary = (
-            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
-            f"live {len(tested)} | selected {len(selected_live)}"
-        )
-    elif selected_live:
-        if source_errors_total:
-            refresh_summary = (
-                f"parsed 0 | reused existing {len(selected_live)} | "
-                f"source_errors {source_errors_total}"
-            )
-        else:
-            refresh_summary = (
-                f"parsed 0 | reused existing {len(selected_live)} | "
-                f"live {len(tested)}"
-            )
-    else:
-        refresh_summary = "parsed 0 | selected 0"
+    summary_live_total = max(len(tested), len(selected_live))
+    refresh_summary = (
+        f"parsed {raw_parsed_total} | live {summary_live_total} | selected {len(selected_live)}"
+    )
+    if reused_existing_total:
+        refresh_summary += f" | reused {reused_existing_total}"
+    if source_errors_total:
+        refresh_summary += f" | source_errors {source_errors_total}"
 
     return {
         "ok": bool(top),
@@ -1491,24 +1481,14 @@ def refresh_black_locations() -> Dict[str, Any]:
     source_errors_total = len(source_errors)
     sources_ok_total = len(source_stats) - source_errors_total
     display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
-    if raw_parsed_total > 0:
-        refresh_summary = (
-            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
-            f"live {len(tested)} | selected {len(selected_live)}"
-        )
-    elif selected_live:
-        if source_errors_total:
-            refresh_summary = (
-                f"parsed 0 | reused existing {len(selected_live)} | "
-                f"source_errors {source_errors_total}"
-            )
-        else:
-            refresh_summary = (
-                f"parsed 0 | reused existing {len(selected_live)} | "
-                f"live {len(tested)}"
-            )
-    else:
-        refresh_summary = "parsed 0 | selected 0"
+    summary_live_total = max(len(tested), len(selected_live))
+    refresh_summary = (
+        f"parsed {raw_parsed_total} | live {summary_live_total} | selected {len(selected_live)}"
+    )
+    if reused_existing_total:
+        refresh_summary += f" | reused {reused_existing_total}"
+    if source_errors_total:
+        refresh_summary += f" | source_errors {source_errors_total}"
 
     return {
         "ok": bool(top),
@@ -2854,6 +2834,12 @@ def open_app_bridge(
     response.headers["Expires"] = "0"
     return response
 
+
+@app.get("/robots.txt", include_in_schema=False)
+def robots_txt() -> Response:
+    response = Response(content="User-agent: *\nAllow: /\n", media_type="text/plain")
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
