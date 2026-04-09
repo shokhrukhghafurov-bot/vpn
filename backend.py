@@ -2373,15 +2373,72 @@ def _resolve_subscription_token(*, token: Optional[str] = None, code: Optional[s
     return ensure_user_subscription_token(int(user["id"]))
 
 
+def _request_forwarded_proto(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    raw_cf_visitor = str(request.headers.get("cf-visitor") or "").strip()
+    if raw_cf_visitor:
+        try:
+            parsed_cf_visitor = json.loads(raw_cf_visitor)
+            cf_scheme = str(parsed_cf_visitor.get("scheme") or "").strip().lower()
+            if cf_scheme in {"http", "https"}:
+                return cf_scheme
+        except Exception:
+            pass
+    for header_name in ("x-forwarded-proto", "x-forwarded-protocol", "x-scheme"):
+        raw_value = str(request.headers.get(header_name) or "").strip()
+        if not raw_value:
+            continue
+        first_part = raw_value.split(",", 1)[0].strip().lower()
+        if first_part in {"http", "https"}:
+            return first_part
+    scheme = str(getattr(getattr(request, "url", None), "scheme", "") or "").strip().lower()
+    return scheme if scheme in {"http", "https"} else ""
+
+
+
+def _request_forwarded_host(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    raw_forwarded_host = str(request.headers.get("x-forwarded-host") or "").strip()
+    if raw_forwarded_host:
+        return raw_forwarded_host.split(",", 1)[0].strip()
+    host_header = str(request.headers.get("host") or "").strip()
+    if host_header:
+        return host_header
+    try:
+        return str(getattr(request.url, "netloc", "") or "").strip()
+    except Exception:
+        return ""
+
+
+
+def _request_external_base_url(request: Optional[Request]) -> str:
+    configured_base = str(getattr(settings, "BACKEND_BASE_URL", "") or "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+    if request is None:
+        return ""
+    scheme = _request_forwarded_proto(request) or "https"
+    host = _request_forwarded_host(request)
+    if not host:
+        return ""
+    return f"{scheme}://{host}"
+
+
+
+def _request_is_https(request: Optional[Request]) -> bool:
+    return _request_forwarded_proto(request) == "https"
+
+
+
 def _subscription_public_url(request: Optional[Request] = None, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
     clean_token = _resolve_subscription_token(token=token, code=code)
     if not clean_token:
         return None
-    if request is not None:
-        try:
-            return str(request.url_for("public_subscription", token=clean_token))
-        except Exception:
-            pass
+    external_base = _request_external_base_url(request)
+    if external_base:
+        return _subscription_public_url_from_base(external_base, clean_token)
     return _subscription_public_url_from_base(settings.BACKEND_BASE_URL, clean_token)
 
 
@@ -2406,20 +2463,17 @@ def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, 
             query["platform"] = _normalize_target_platform(platform)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
-    try:
-        return str(request.url_for("open_app_bridge", code=code or "", token=token or "", lang=lang or "ru"))
-    except Exception:
-        base = str(request.base_url).rstrip("/")
-        query = {}
-        if code:
-            query["code"] = code
-        elif token:
-            query["token"] = token
-        if lang:
-            query["lang"] = lang
-        if platform:
-            query["platform"] = _normalize_target_platform(platform)
-        return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
+    base = _request_external_base_url(request)
+    query = {}
+    if code:
+        query["code"] = code
+    elif token:
+        query["token"] = token
+    if lang:
+        query["lang"] = lang
+    if platform:
+        query["platform"] = _normalize_target_platform(platform)
+    return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
 
 
 def _detect_android_app_package(platform: Optional[str] = None) -> str:
@@ -3060,7 +3114,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             max_age=31536000,
             httponly=False,
             samesite="lax",
-            secure=str(request.url.scheme).lower() == "https",
+            secure=_request_is_https(request),
         )
     except Exception:
         pass
@@ -3456,7 +3510,7 @@ def open_app_bridge(
                 max_age=31536000,
                 httponly=False,
                 samesite="lax",
-                secure=str(request.url.scheme).lower() == "https",
+                secure=_request_is_https(request),
             )
         except Exception:
             pass
