@@ -324,6 +324,10 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
+    "UPDATE locations SET name_ru = '★ Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru = 'Авто | Самый быстрый')",
+    "UPDATE locations SET name_en = '★ Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en = 'Auto | Fastest')",
+    "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
+    "UPDATE locations SET name_en = 'Auto | Fastest Reserve' WHERE code = 'auto-reserve' AND (name_en IS NULL OR BTRIM(name_en) = '')",
 ]
 
 SERIAL_SEQUENCE_TARGETS = (
@@ -1163,9 +1167,9 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
 
 
 def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3"}
-    preferred_main_codes = ["ru-lte"]
-    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
+    excluded = {"auto-fastest", "auto-reserve"}
+    preferred_main_codes = ["intl-fast", "ru-lte"]
+    preferred_reserve_codes = ["intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
 
     def is_online(row: Dict[str, Any]) -> bool:
         return str(row.get("status") or "").strip().lower() == "online"
@@ -1173,7 +1177,8 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
     def with_payload(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         valid = []
         for row in items:
-            if row.get("code") in excluded:
+            row_code = str(row.get("code") or "").strip()
+            if row_code in excluded:
                 continue
             payload = _compose_vpn_payload_for_location(dict(row))
             if payload and _config_is_complete(payload):
@@ -1191,33 +1196,70 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
     def measured(predicate) -> List[Dict[str, Any]]:
         return generic(lambda row: predicate(row) and _speed_metrics_present(row))
 
+    def non_lte_main(row: Dict[str, Any]) -> bool:
+        return is_online(row) and not bool(row.get("is_reserve")) and not _is_lte_location(row)
+
+    def non_lte_reserve(row: Dict[str, Any]) -> bool:
+        return is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row)
+
+    lte_main = by_codes([code_item for code_item in preferred_main_codes if code_item == "ru-lte"])
+    lte_reserve = by_codes([code_item for code_item in preferred_reserve_codes if code_item.startswith("ru-lte-")])
+    fast_main = by_codes([code_item for code_item in preferred_main_codes if code_item != "ru-lte"])
+    fast_reserve = by_codes([code_item for code_item in preferred_reserve_codes if not code_item.startswith("ru-lte-")])
+
     if code == "auto-fastest":
-        fastest_non_lte = measured(lambda row: is_online(row) and not row.get("is_reserve") and not _is_lte_location(row))
-        fastest_any_non_lte = measured(lambda row: is_online(row) and not _is_lte_location(row))
-        lte_main = by_codes(preferred_main_codes)
-        lte_reserve = by_codes(preferred_reserve_codes)
         return _dedupe_location_rows(
-            fastest_non_lte[:3]
+            measured(non_lte_main)
+            + fast_main
+            + measured(non_lte_reserve)
+            + fast_reserve
+            + generic(lambda row: is_online(row) and bool(row.get("is_recommended")) and not _is_lte_location(row))
+            + generic(lambda row: is_online(row) and not _is_lte_location(row))
             + lte_main
             + lte_reserve
-            + fastest_non_lte[3:]
-            + fastest_any_non_lte
-            + generic(lambda row: is_online(row) and row.get("is_recommended") and not _is_lte_location(row))
-            + generic(lambda row: is_online(row) and not _is_lte_location(row))
-            + generic(lambda row: is_online(row))
+            + generic(is_online)
         )
 
     if code == "auto-reserve":
         return _dedupe_location_rows(
-            measured(lambda row: is_online(row) and row.get("is_reserve") and not _is_lte_location(row))
-            + by_codes(preferred_reserve_codes)
-            + by_codes(preferred_main_codes)
-            + generic(lambda row: is_online(row) and row.get("is_reserve") and not _is_lte_location(row))
-            + measured(lambda row: is_online(row) and not _is_lte_location(row))
+            measured(non_lte_reserve)
+            + fast_reserve
+            + measured(non_lte_main)
+            + fast_main
+            + generic(lambda row: is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row))
             + generic(lambda row: is_online(row) and not _is_lte_location(row))
-            + generic(lambda row: is_online(row))
+            + lte_main
+            + lte_reserve
+            + generic(is_online)
         )
     return []
+
+
+def _virtual_sibling_code(code: str) -> Optional[str]:
+    if code == "auto-fastest":
+        return "auto-reserve"
+    if code == "auto-reserve":
+        return "auto-fastest"
+    return None
+
+
+def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
+    if len(pool) <= 3:
+        return list(pool)
+
+    primary = list(pool[:3])
+    overflow = list(pool[3:])
+    if not overflow:
+        return primary
+
+    def row_load(row: Dict[str, Any]) -> int:
+        return int(loads.get(str(row.get("code") or "").strip(), 0))
+
+    best_primary_load = min(row_load(row) for row in primary)
+    best_overflow_load = min(row_load(row) for row in overflow)
+    if best_overflow_load + 1 < best_primary_load:
+        return overflow
+    return primary
 
 
 def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1233,22 +1275,35 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not user_id:
         return pool[0]
 
+    sibling_code = _virtual_sibling_code(code)
+    sibling_assigned_code = get_user_virtual_location_assignment(user_id, sibling_code) if sibling_code else None
+
+    if sibling_assigned_code:
+        sibling_filtered_pool = [
+            row for row in pool
+            if str(row.get("code") or "").strip() != sibling_assigned_code
+        ]
+        if sibling_filtered_pool:
+            pool = sibling_filtered_pool
+
     assigned_code = get_user_virtual_location_assignment(user_id, code)
     if assigned_code:
-        for row in pool:
-            if str(row.get("code") or "").strip() == assigned_code:
-                return row
+        sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
+        if not sibling_collision:
+            for row in pool:
+                if str(row.get("code") or "").strip() == assigned_code:
+                    return row
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
+    effective_pool = _prefer_primary_virtual_pool(pool, loads)
     selected = min(
-        enumerate(pool),
+        enumerate(effective_pool),
         key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
     )[1]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
     return selected
-
 
 def sync_locations_catalog() -> None:
     locations = _load_default_locations()
