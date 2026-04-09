@@ -3025,7 +3025,10 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         moved_permanently_to_url=moved_permanently_to_url,
         content_version=content_version,
     )
-    content = "\n".join(inline_headers + lines) + "\n"
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
+    content = "\n".join(lines) + "\n" if suppress_inline_headers else "\n".join(inline_headers + lines) + "\n"
     response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
@@ -3104,9 +3107,23 @@ def open_app_bridge(
     client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
-    native_url = _build_native_open_app_url(request=request, code=code, token=active_token, lang=norm_lang, platform=target_platform) if active_token else ""
-    supports_native_launch = bool(native_url)
+    subscription_client_id = _subscription_cookie_value(request, active_token) if active_token else ""
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
+    tracked_subscription_url = None
+    if subscription_url and subscription_client_id:
+        try:
+            parts = urlsplit(subscription_url)
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            query["client_id"] = subscription_client_id
+            if client_mode:
+                query["client"] = client_mode
+            tracked_subscription_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        except Exception:
+            tracked_subscription_url = subscription_url
+    elif subscription_url:
+        tracked_subscription_url = subscription_url
+    native_url = _build_native_import_url(tracked_subscription_url, platform=target_platform) if tracked_subscription_url else ""
+    supports_native_launch = bool(native_url)
     bot_url = _bot_public_url()
     page_text = {
         "ru": {
@@ -3144,12 +3161,13 @@ def open_app_bridge(
             "bot_button": "Back to bot",
         },
     }[norm_lang]
+    display_subscription_url = tracked_subscription_url or subscription_url
     copy_block = ""
-    if subscription_url:
-        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(subscription_url)}</code></div>'
-    native_url_attr = html.escape(native_url or subscription_url or "", quote=True)
+    if display_subscription_url:
+        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(display_subscription_url)}</code></div>'
+    native_url_attr = html.escape(native_url or display_subscription_url or "", quote=True)
     native_url_js = json.dumps(native_url)
-    subscription_url_js = json.dumps(subscription_url or "")
+    subscription_url_js = json.dumps(display_subscription_url or "")
     client_mode_js = json.dumps(client_mode)
     supports_native_launch_js = json.dumps(supports_native_launch)
     copy_done_js = json.dumps(page_text["copy_done"])
@@ -3247,8 +3265,28 @@ def open_app_bridge(
       window.addEventListener('blur', markHidden);
 
       const getClientId = function () {{
+        const key = 'inet-subscription-client-id';
         try {{
-          const key = 'inet-subscription-client-id';
+          if (baseSubscriptionUrl) {{
+            const parsed = new URL(baseSubscriptionUrl);
+            const fromUrl = parsed.searchParams.get('client_id');
+            if (fromUrl) {{
+              try {{ window.localStorage.setItem(key, fromUrl); }} catch (storageError) {{}}
+              return fromUrl;
+            }}
+          }}
+        }} catch (error) {{}}
+        try {{
+          const cookieMatch = document.cookie.match(/(?:^|; )inet_sub_cid=([^;]+)/);
+          if (cookieMatch && cookieMatch[1]) {{
+            const fromCookie = decodeURIComponent(cookieMatch[1]);
+            if (fromCookie) {{
+              try {{ window.localStorage.setItem(key, fromCookie); }} catch (storageError) {{}}
+              return fromCookie;
+            }}
+          }}
+        }} catch (error) {{}}
+        try {{
           let existing = window.localStorage.getItem(key);
           if (existing) return existing;
           const generated = 'cid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -3410,6 +3448,18 @@ def open_app_bridge(
     response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
     response.headers["Pragma"] = "no-cache"
     response.headers["Expires"] = "0"
+    if active_token and subscription_client_id:
+        try:
+            response.set_cookie(
+                key="inet_sub_cid",
+                value=subscription_client_id,
+                max_age=31536000,
+                httponly=False,
+                samesite="lax",
+                secure=str(request.url.scheme).lower() == "https",
+            )
+        except Exception:
+            pass
     return response
 
 
