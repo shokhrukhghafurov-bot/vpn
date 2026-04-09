@@ -818,6 +818,7 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     grpc_settings = stream_settings.get("grpcSettings") if isinstance(stream_settings.get("grpcSettings"), dict) else {}
     ws_settings = stream_settings.get("wsSettings") if isinstance(stream_settings.get("wsSettings"), dict) else {}
+    xhttp_settings = stream_settings.get("xhttpSettings") if isinstance(stream_settings.get("xhttpSettings"), dict) else {}
     reality_settings = stream_settings.get("realitySettings") if isinstance(stream_settings.get("realitySettings"), dict) else {}
     tls_settings = stream_settings.get("tlsSettings") if isinstance(stream_settings.get("tlsSettings"), dict) else {}
 
@@ -831,7 +832,7 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     converted: Dict[str, Any] = {
         "protocol": "vless",
-        "engine": "nekobox",
+        "engine": "xray",
         "server": str(upstream.get("address") or "").strip(),
         "port": upstream.get("port"),
         "uuid": str(user.get("id") or "").strip(),
@@ -842,6 +843,7 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "sni": server_name or None,
         "server_name": server_name or None,
         "service_name": str(grpc_settings.get("serviceName") or "").strip() or None,
+        "mode": str(xhttp_settings.get("mode") or "").strip() or None,
         "public_key": str(reality_settings.get("publicKey") or "").strip() or None,
         "short_id": str(reality_settings.get("shortId") or "").strip() or None,
         "fingerprint": str(reality_settings.get("fingerprint") or tls_settings.get("fingerprint") or "").strip() or None,
@@ -859,6 +861,9 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     if converted["transport"] in {"ws", "websocket"}:
         converted["host"] = str(ws_settings.get("headers", {}).get("Host") or "").strip() or None
         converted["path"] = str(ws_settings.get("path") or "/").strip() or "/"
+    elif converted["transport"] == "xhttp":
+        converted["host"] = str(xhttp_settings.get("host") or "").strip() or None
+        converted["path"] = str(xhttp_settings.get("path") or "/").strip() or "/"
 
     dns_servers = _extract_dns_servers_from_xray(payload)
     if dns_servers:
@@ -888,8 +893,10 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
                 normalized[key] = value
 
     engine = str(normalized.get("engine") or "").strip().lower()
-    if engine in {"", "xray", "xray-core"}:
-        normalized["engine"] = "nekobox"
+    if not engine:
+        normalized["engine"] = "xray" if normalized.get("raw_xray_config") or normalized.get("rawXrayConfig") else "nekobox"
+    elif engine == "xray-core":
+        normalized["engine"] = "xray"
 
     normalized.setdefault("protocol", "vless")
     normalized.setdefault("transport", normalized.get("network") or "tcp")
