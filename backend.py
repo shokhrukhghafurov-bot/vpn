@@ -505,8 +505,6 @@ def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[st
         reasons.append("grpc_missing_service_name")
     if transport in {"ws", "websocket"} and not path:
         reasons.append("ws_missing_path")
-    if pool == "ru_lte" and transport == "xhttp":
-        reasons.append("xhttp_not_preferred")
     if pool == "ru_lte" and security == "reality" and not short_id:
         reasons.append("missing_short_id")
 
@@ -674,6 +672,20 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
         if host:
             ws_settings["headers"] = {"Host": host}
         stream_settings["wsSettings"] = ws_settings
+    elif transport == "xhttp":
+        xhttp_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or "/").strip() or "/",
+            "mode": str(payload.get("mode") or "auto").strip() or "auto",
+        }
+        host = str(payload.get("host") or server_name or "").strip()
+        if host:
+            xhttp_settings["host"] = host
+        extra = payload.get("xhttp_settings")
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                if key not in xhttp_settings and value not in (None, "", [], {}):
+                    xhttp_settings[key] = value
+        stream_settings["xhttpSettings"] = xhttp_settings
 
     dns_servers = [str(item or "").strip() for item in (payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()]
     if not dns_servers:
@@ -860,6 +872,11 @@ def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
 
 def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str, Any]:
     runner_name, runner_bin = _resolve_probe_runner()
+    transport = _payload_transport(payload)
+    if transport == "xhttp" and runner_name == "singbox":
+        xray_bin = shutil.which(str(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray")
+        if xray_bin:
+            runner_name, runner_bin = "xray", xray_bin
     if not runner_bin:
         return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
 
@@ -2505,12 +2522,14 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
         "type": str(normalized.get("transport") or normalized.get("network") or "tcp").strip() or "tcp",
         "security": str(normalized.get("security") or "reality").strip() or "reality",
     }
+    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
     optional_keys = {
         "flow": normalized.get("flow"),
         "sni": normalized.get("sni") or normalized.get("server_name"),
         "host": normalized.get("host"),
         "path": normalized.get("path"),
         "serviceName": normalized.get("service_name") or normalized.get("serviceName"),
+        "mode": normalized.get("mode") or ("auto" if transport == "xhttp" else None),
         "pbk": normalized.get("public_key") or normalized.get("publicKey"),
         "sid": normalized.get("short_id") or normalized.get("shortId"),
         "fp": normalized.get("fingerprint"),
