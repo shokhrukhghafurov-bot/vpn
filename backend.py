@@ -232,8 +232,10 @@ class AdminVpnSettingsIn(BaseModel):
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
 
-RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2")
-BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2")
+RU_LTE_RESERVE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
+BLACK_RESERVE_LOCATION_CODES: Tuple[str, ...] = ("intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3")
+RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte",) + RU_LTE_RESERVE_LOCATION_CODES
+BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast",) + BLACK_RESERVE_LOCATION_CODES
 PUBLIC_STABLE_LOCATION_CODES: Tuple[str, ...] = RU_LTE_LOCATION_CODES + BLACK_LOCATION_CODES
 PUBLIC_VIRTUAL_LOCATION_CODES: Tuple[str, ...] = ("auto-fastest", "auto-reserve")
 _DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
@@ -1044,9 +1046,11 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "ru-lte": ("Россия LTE", "Russia LTE", False),
         "ru-lte-reserve-1": ("Россия LTE | Резерв 1", "Russia LTE | Reserve 1", True),
         "ru-lte-reserve-2": ("Россия LTE | Резерв 2", "Russia LTE | Reserve 2", True),
+        "ru-lte-reserve-3": ("Россия LTE | Резерв 3", "Russia LTE | Reserve 3", True),
         "intl-fast": ("Fast / International", "Fast / International", False),
         "intl-fast-reserve-1": ("Fast / International | Reserve 1", "Fast / International | Reserve 1", True),
         "intl-fast-reserve-2": ("Fast / International | Reserve 2", "Fast / International | Reserve 2", True),
+        "intl-fast-reserve-3": ("Fast / International | Reserve 3", "Fast / International | Reserve 3", True),
     }
     if code not in default_names:
         return None
@@ -1066,7 +1070,7 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "is_recommended": bool(updates.get("is_recommended", code == "ru-lte")),
         "is_reserve": bool(updates.get("is_reserve", is_reserve)),
         "status": str(updates.get("status") or "offline"),
-        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82}.get(code, 100)),
+        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82, "intl-fast-reserve-3": 83}.get(code, 100)),
         "vpn_payload": base_payload,
         "location_source": "catalog",
     }
@@ -1155,13 +1159,13 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         tested.append(normalized)
 
     tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
-    max_candidates = max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))
+    max_candidates = min(len(RU_LTE_RESERVE_LOCATION_CODES), max(1, int(settings.RU_LTE_MAX_CANDIDATES or len(RU_LTE_RESERVE_LOCATION_CODES))))
     top = _select_diverse_candidates(tested, max_candidates=max_candidates)[:max_candidates]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
     selected_identities = {_candidate_identity_key(item) for item in top}
     if len(top) < max_candidates:
-        for code in RU_LTE_LOCATION_CODES:
+        for code in RU_LTE_RESERVE_LOCATION_CODES:
             existing = existing_by_code.get(code) or {}
             existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
             if not existing_payload or not _config_is_complete(existing_payload):
@@ -1192,12 +1196,12 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
     remarks = {
-        "ru-lte": "Russia LTE",
         "ru-lte-reserve-1": "Russia LTE | Reserve 1",
         "ru-lte-reserve-2": "Russia LTE | Reserve 2",
+        "ru-lte-reserve-3": "Russia LTE | Reserve 3",
     }
 
-    for idx, code in enumerate(RU_LTE_LOCATION_CODES):
+    for idx, code in enumerate(RU_LTE_RESERVE_LOCATION_CODES):
         payload = dict(top[idx]) if idx < len(top) else {}
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
@@ -1211,8 +1215,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "vpn_payload": payload,
                 "status": "online",
                 "is_active": True,
-                "is_recommended": code == "ru-lte",
-                "is_reserve": code != "ru-lte",
+                "is_recommended": False,
+                "is_reserve": True,
                 "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
             }
@@ -1240,8 +1244,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                         _patch_location_by_code(code, {
                             "status": "online",
                             "is_active": True,
-                            "is_recommended": code == "ru-lte",
-                            "is_reserve": code != "ru-lte",
+                            "is_recommended": False,
+                            "is_reserve": True,
                             "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "speed_checked_at": now_iso,
                         })
@@ -1266,7 +1270,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     "status": "offline",
                     "is_active": False,
                     "is_recommended": False,
-                    "is_reserve": code != "ru-lte",
+                    "is_reserve": True,
                     "ping_ms": None,
                     "speed_checked_at": now_iso,
                 })
@@ -1387,7 +1391,7 @@ def refresh_black_locations() -> Dict[str, Any]:
     tested: List[Dict[str, Any]] = []
     probed_total = 0
     probe_errors = 0
-    max_candidates = max(1, int(settings.BLACK_MAX_CANDIDATES or 4))
+    max_candidates = min(len(BLACK_RESERVE_LOCATION_CODES), max(1, int(settings.BLACK_MAX_CANDIDATES or len(BLACK_RESERVE_LOCATION_CODES))))
     probe_budget_seconds = max(8.0, min(float(settings.BLACK_AUTO_REFRESH_TIMEOUT_SEC or 600), 25.0))
     probe_started = time.perf_counter()
     for candidate in candidates[:test_limit]:
@@ -1413,7 +1417,7 @@ def refresh_black_locations() -> Dict[str, Any]:
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
     selected_identities = {_candidate_identity_key(item) for item in top}
     if len(top) < max_candidates:
-        for code in BLACK_LOCATION_CODES:
+        for code in BLACK_RESERVE_LOCATION_CODES:
             existing = existing_by_code.get(code) or {}
             existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
             if not existing_payload or not _config_is_complete(existing_payload):
@@ -1442,12 +1446,12 @@ def refresh_black_locations() -> Dict[str, Any]:
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
     remarks = {
-        "intl-fast": "Fast / International",
         "intl-fast-reserve-1": "Fast / International | Reserve 1",
         "intl-fast-reserve-2": "Fast / International | Reserve 2",
+        "intl-fast-reserve-3": "Fast / International | Reserve 3",
     }
 
-    for idx, code in enumerate(BLACK_LOCATION_CODES):
+    for idx, code in enumerate(BLACK_RESERVE_LOCATION_CODES):
         payload = dict(top[idx]) if idx < len(top) else {}
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
@@ -1463,7 +1467,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                 "status": "online",
                 "is_active": True,
                 "is_recommended": False,
-                "is_reserve": code != "intl-fast",
+                "is_reserve": True,
                 "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
             }
@@ -1494,7 +1498,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                             "status": "online",
                             "is_active": True,
                             "is_recommended": False,
-                            "is_reserve": code != "intl-fast",
+                            "is_reserve": True,
                             "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "speed_checked_at": now_iso,
                         })
@@ -1521,7 +1525,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                     "status": "offline",
                     "is_active": False,
                     "is_recommended": False,
-                    "is_reserve": code != "intl-fast",
+                    "is_reserve": True,
                     "ping_ms": None,
                     "speed_checked_at": now_iso,
                 })
