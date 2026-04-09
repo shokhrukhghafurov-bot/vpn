@@ -2509,6 +2509,10 @@ def _detect_device_platform_and_name(request: Request) -> Tuple[str, str]:
     client_name = "VPN client"
     if "hiddify" in ua:
         client_name = "Hiddify"
+    elif "v2raytun" in ua:
+        client_name = "v2RayTun"
+    elif "happ" in ua:
+        client_name = "Happ"
     elif "nekobox" in ua:
         client_name = "NekoBox"
     elif "nekoray" in ua:
@@ -2559,12 +2563,17 @@ def _client_ip_from_request(request: Request) -> str:
 
 
 def _subscription_client_id_from_request(request: Request) -> str:
-    return _sanitize_tracking_value(
-        request.query_params.get("cid")
+    raw_value = (
+        request.query_params.get("client_id")
+        or request.query_params.get("subcid")
         or request.headers.get("x-client-id")
-        or request.cookies.get("inet_sub_cid"),
-        max_len=120,
+        or request.cookies.get("inet_sub_cid")
     )
+    if not raw_value:
+        legacy_cid = str(request.query_params.get("cid") or "").strip()
+        if legacy_cid.startswith("cid-"):
+            raw_value = legacy_cid
+    return _sanitize_tracking_value(raw_value, max_len=120)
 
 
 
@@ -2808,7 +2817,7 @@ def _subscription_cache_buster_url(request: Optional[Request], token: str, conte
         return base_url
     parts = urlsplit(base_url)
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
-    query["cid"] = version[:16]
+    query["v"] = version[:16]
     return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
 
@@ -3171,7 +3180,7 @@ def open_app_bridge(
         if (!baseSubscriptionUrl) return '';
         try {{
           const url = new URL(baseSubscriptionUrl);
-          url.searchParams.set('cid', getClientId());
+          url.searchParams.set('client_id', getClientId());
           return url.toString();
         }} catch (error) {{
           return baseSubscriptionUrl;
