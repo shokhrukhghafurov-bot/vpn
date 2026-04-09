@@ -219,6 +219,7 @@ class AdminPlanSettingsIn(BaseModel):
 
 class AdminVpnSettingsIn(BaseModel):
     app_name: str
+    client_mode: str = "hiddify"
     app_env: str = "production"
     languages: List[str] = Field(default_factory=lambda: ["ru", "en"])
     bot_name: str
@@ -2207,6 +2208,54 @@ def _bot_public_url() -> str:
     return settings.SUPPORT_TELEGRAM_URL
 
 
+def _selected_client_mode() -> str:
+    mode = str(getattr(settings, "VPN_CLIENT_MODE", "hiddify") or "").strip().lower()
+    return "v2raytun" if mode == "v2raytun" else "hiddify"
+
+
+def _selected_client_name() -> str:
+    return "v2RayTun" if _selected_client_mode() == "v2raytun" else "Hiddify"
+
+
+def _selected_android_app_package() -> str:
+    if _selected_client_mode() == "v2raytun":
+        return str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip()
+    return str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip()
+
+
+def _selected_platform_store_url(platform: str) -> str:
+    key = str(platform or "").strip().lower()
+    mode = _selected_client_mode()
+    if mode == "v2raytun":
+        if key == "android":
+            return str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip()
+        if key in {"ios", "iphone", "ipad"}:
+            return str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip()
+        if key == "windows":
+            return str(getattr(settings, "V2RAYTUN_WINDOWS_APP_URL", "") or "").strip()
+        if key in {"macos", "mac", "osx"}:
+            return str(getattr(settings, "V2RAYTUN_MACOS_APP_URL", "") or "").strip()
+    if key == "android":
+        return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+    if key in {"ios", "iphone", "ipad"}:
+        return str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip()
+    if key == "windows":
+        return str(getattr(settings, "HIDDIFY_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
+    if key in {"macos", "mac", "osx"}:
+        return str(getattr(settings, "HIDDIFY_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip()
+    return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+
+
+def _build_native_import_url(subscription_url: Optional[str]) -> str:
+    clean_url = str(subscription_url or "").strip()
+    if not clean_url:
+        return ""
+    if _selected_client_mode() == "v2raytun":
+        return f"v2raytun://import/{quote(clean_url, safe=':/?&=%#')}"
+    import_name = str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip()
+    return f"hiddify://import/{quote(clean_url, safe=':/?&=%')}#{quote(import_name, safe='')}"
+
+
 def _subscription_public_url_from_base(base_url: str, token: Optional[str]) -> Optional[str]:
     base = str(base_url or "").strip().rstrip("/")
     clean_token = str(token or "").strip()
@@ -2243,10 +2292,7 @@ def _subscription_public_url(request: Optional[Request] = None, token: Optional[
 def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
     del lang
     subscription_url = _subscription_public_url(request, token=token, code=code)
-    if not subscription_url:
-        return ""
-    import_name = str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip()
-    return f"hiddify://import/{quote(subscription_url, safe=':/?&=%')}#{quote(import_name, safe='')}"
+    return _build_native_import_url(subscription_url)
 
 
 def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
@@ -2277,10 +2323,10 @@ def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, 
 
 
 def _detect_android_app_package() -> str:
-    explicit = str(getattr(settings, "ANDROID_APP_PACKAGE", "") or "").strip()
+    explicit = _selected_android_app_package()
     if explicit:
         return explicit
-    parsed = urlsplit(str(settings.ANDROID_APP_URL or "").strip())
+    parsed = urlsplit(_selected_platform_store_url("android"))
     if parsed.scheme and parsed.netloc:
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
         package_name = str(query.get("id") or "").strip()
@@ -2708,6 +2754,8 @@ def open_app_bridge(
     lang: str = Query(default="ru"),
 ) -> HTMLResponse:
     norm_lang = "en" if lang == "en" else "ru"
+    client_mode = _selected_client_mode()
+    client_name = _selected_client_name()
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
     native_url = _build_native_open_app_url(request=request, code=code, token=active_token, lang=norm_lang) if active_token else ""
@@ -2715,28 +2763,28 @@ def open_app_bridge(
     bot_url = _bot_public_url()
     page_text = {
         "ru": {
-            "title": "Подключение через Hiddify",
-            "headline": "Открываем Hiddify…",
-            "body": "Hiddify должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
+            "title": f"Подключение через {client_name}",
+            "headline": f"Открываем {client_name}…",
+            "body": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
             "invalid_link": "Ссылка недействительна или срок доступа истёк. Вернитесь в бота и купите подписку.",
-            "open_button": "Открыть в Hiddify",
-            "android_button": "Скачать Hiddify для Android",
-            "ios_button": "Скачать Hiddify для iPhone / iPad",
-            "windows_button": "Скачать Hiddify для Windows",
-            "macos_button": "Скачать Hiddify для macOS",
+            "open_button": f"Открыть в {client_name}",
+            "android_button": f"Скачать {client_name} для Android",
+            "ios_button": f"Скачать {client_name} для iPhone / iPad",
+            "windows_button": f"Скачать {client_name} для Windows",
+            "macos_button": f"Скачать {client_name} для macOS",
             "copy_label": "Персональная ссылка подписки",
             "bot_button": "Вернуться в бота",
         },
         "en": {
-            "title": "Connect with Hiddify",
-            "headline": "Opening Hiddify…",
-            "body": "Hiddify should open automatically and import your personal subscription. If it does not, use the buttons below.",
+            "title": f"Connect with {client_name}",
+            "headline": f"Opening {client_name}…",
+            "body": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
             "invalid_link": "This link is invalid or access has expired. Return to the bot and buy a subscription.",
-            "open_button": "Open in Hiddify",
-            "android_button": "Download Hiddify for Android",
-            "ios_button": "Download Hiddify for iPhone / iPad",
-            "windows_button": "Download Hiddify for Windows",
-            "macos_button": "Download Hiddify for macOS",
+            "open_button": f"Open in {client_name}",
+            "android_button": f"Download {client_name} for Android",
+            "ios_button": f"Download {client_name} for iPhone / iPad",
+            "windows_button": f"Download {client_name} for Windows",
+            "macos_button": f"Download {client_name} for macOS",
             "copy_label": "Personal subscription link",
             "bot_button": "Back to bot",
         },
@@ -2747,15 +2795,20 @@ def open_app_bridge(
     native_url_attr = html.escape(native_url or subscription_url or "", quote=True)
     native_url_js = json.dumps(native_url)
     subscription_url_js = json.dumps(subscription_url or "")
+    client_mode_js = json.dumps(client_mode)
     import_name_js = json.dumps(str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip())
     android_intent_url = _build_android_intent_url(native_url)
     android_intent_url_js = json.dumps(android_intent_url)
-    android_url = html.escape(str(settings.ANDROID_APP_URL or ""), quote=True)
-    android_url_js = json.dumps(str(settings.ANDROID_APP_URL or ""))
-    ios_url = html.escape(str(settings.IOS_APP_URL or ""), quote=True)
-    ios_url_js = json.dumps(str(settings.IOS_APP_URL or ""))
-    windows_url = html.escape(str(getattr(settings, "WINDOWS_APP_URL", "") or ""), quote=True)
-    macos_url = html.escape(str(getattr(settings, "MACOS_APP_URL", "") or ""), quote=True)
+    selected_android_url = _selected_platform_store_url("android")
+    selected_ios_url = _selected_platform_store_url("ios")
+    selected_windows_url = _selected_platform_store_url("windows")
+    selected_macos_url = _selected_platform_store_url("macos")
+    android_url = html.escape(selected_android_url, quote=True)
+    android_url_js = json.dumps(selected_android_url)
+    ios_url = html.escape(selected_ios_url, quote=True)
+    ios_url_js = json.dumps(selected_ios_url)
+    windows_url = html.escape(selected_windows_url, quote=True)
+    macos_url = html.escape(selected_macos_url, quote=True)
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
@@ -2809,6 +2862,7 @@ def open_app_bridge(
     (function () {{
       const initialNativeUrl = {native_url_js};
       const baseSubscriptionUrl = {subscription_url_js};
+      const clientMode = {client_mode_js};
       const importName = {import_name_js};
       const androidStoreUrl = {android_url_js};
       const iosStoreUrl = {ios_url_js};
@@ -2857,6 +2911,9 @@ def open_app_bridge(
       const buildNativeUrl = function () {{
         const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
         if (!trackedSubscriptionUrl) return initialNativeUrl || '';
+        if (clientMode === 'v2raytun') {{
+          return 'v2raytun://import/' + encodeURIComponent(trackedSubscriptionUrl);
+        }}
         return 'hiddify://import/' + encodeURIComponent(trackedSubscriptionUrl) + '#' + encodeURIComponent(importName || 'Subscription');
       }};
 
@@ -3071,10 +3128,12 @@ def app_config() -> Dict[str, Any]:
         "bot_url": _bot_public_url(),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "payments_enabled": settings.PAYMENTS_ENABLED,
-        "android_app_url": settings.ANDROID_APP_URL,
-        "ios_app_url": settings.IOS_APP_URL,
-        "windows_app_url": getattr(settings, "WINDOWS_APP_URL", ""),
-        "macos_app_url": getattr(settings, "MACOS_APP_URL", ""),
+        "client_mode": _selected_client_mode(),
+        "client_name": _selected_client_name(),
+        "android_app_url": _selected_platform_store_url("android"),
+        "ios_app_url": _selected_platform_store_url("ios"),
+        "windows_app_url": _selected_platform_store_url("windows"),
+        "macos_app_url": _selected_platform_store_url("macos"),
         "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
         "feature_flags": {
             "auth_refresh": True,
