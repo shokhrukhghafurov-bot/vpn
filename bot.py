@@ -40,7 +40,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "devices": "📱 Мои устройства",
         "download": "⬇️ Hiddify / Подключение",
         "support": "🛟 Поддержка",
-        "language": "🌐 Язык",
+        "instructions": "📘 Инструкция",
         "renew": "🔄 Продлить",
         "open_app": "🚀 Открыть в Hiddify",
         "download_app": "⬇️ Скачать Hiddify",
@@ -48,6 +48,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "main_menu": "🏠 Главное меню",
         "choose_language": "🌐 Выберите язык",
         "language_saved": "Язык сохранён.",
+        "instructions_text": "📘 Инструкция\n\n1. Нажмите «Hiddify / Подключение».\n2. Скопируйте вашу персональную ссылку подписки.\n3. Откройте приложение Hiddify.\n4. Нажмите «Добавить профиль» → «Импорт из буфера обмена» или «Импорт по ссылке».\n5. Вставьте ссылку и сохраните профиль.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
         "choose_plan": "💼 Выберите тариф:",
         "plan": "Тариф",
         "price": "Цена",
@@ -113,7 +114,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "devices": "📱 My devices",
         "download": "⬇️ Hiddify / Connect",
         "support": "🛟 Support",
-        "language": "🌐 Language",
+        "instructions": "📘 Instructions",
         "renew": "🔄 Renew",
         "open_app": "🚀 Open in Hiddify",
         "download_app": "⬇️ Download Hiddify",
@@ -121,6 +122,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "main_menu": "🏠 Main menu",
         "choose_language": "🌐 Choose language",
         "language_saved": "Language saved.",
+        "instructions_text": "📘 Instructions\n\n1. Tap \"Hiddify / Connect\".\n2. Copy your personal subscription link.\n3. Open the Hiddify app.\n4. Tap \"Add Profile\" → \"Import from Clipboard\" or \"Import from URL\".\n5. Paste the link and save the profile.\n6. Tap \"Refresh\" to load fresh locations and configs.\n7. Connect to VPN.\n\nIf any location or LTE does not work:\n• tap the \"Refresh\" button\n• wait until the profile updates\n• try another location or a reserve server\n\nIf part of the internet does not work after an air raid alert or blocking:\n• connect to an LTE location\n• then tap \"Refresh\" again\n• if the problem remains, try a reserve LTE\n\nImportant: do not share your personal subscription link with other people.",
         "choose_plan": "💼 Choose a plan:",
         "plan": "Plan",
         "price": "Price",
@@ -396,7 +398,7 @@ def main_menu_inline(lang: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text=t["support"], callback_data="menu:support"),
-                InlineKeyboardButton(text=t["language"], callback_data="menu:language"),
+                InlineKeyboardButton(text=t["instructions"], callback_data="menu:instructions"),
             ],
         ]
     )
@@ -709,6 +711,15 @@ async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
     return text, support_inline(lang)
 
 
+async def render_instructions_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
+    return TEXT[lang]["instructions_text"], InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text=TEXT[lang]["download"], callback_data="menu:download")],
+            [InlineKeyboardButton(text=TEXT[lang]["back"], callback_data="menu:root")],
+        ]
+    )
+
+
 async def render_payment_success_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     del telegram_id
     t = TEXT[lang]
@@ -742,13 +753,8 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
 async def start(message: Message) -> None:
     async def _handler(_lang: str, ctx: Dict[str, Any]) -> None:
         current_lang = "en" if (ctx.get("lang") == "en") else "ru"
-        is_new = bool((ctx.get("auth") or {}).get("is_new"))
-        user_language = (ctx.get("user") or {}).get("language")
-        if is_new or user_language not in {"ru", "en"}:
-            await remove_legacy_reply_keyboard(message)
-            await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_inline())
-            return
-        await send_menu(message, current_lang, welcome=True, cleanup_keyboard=True)
+        await remove_legacy_reply_keyboard(message)
+        await message.answer(TEXT[current_lang]["choose_language"], reply_markup=language_inline())
 
     await with_user_guard(message, _handler)
 
@@ -810,7 +816,16 @@ async def support_from_text(message: Message) -> None:
     await with_user_guard(message, _handler)
 
 
-@dp.message(F.text.in_({TEXT["ru"]["language"], TEXT["en"]["language"], "Русский", "English"}))
+@dp.message(F.text.in_({TEXT["ru"]["instructions"], TEXT["en"]["instructions"]}))
+async def instructions_from_text(message: Message) -> None:
+    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        text, markup = await render_instructions_message(lang)
+        await message.answer(text, reply_markup=markup)
+
+    await with_user_guard(message, _handler)
+
+
+@dp.message(F.text.in_({"Русский", "English"}))
 async def language_from_text(message: Message) -> None:
     if message.text in {"Русский", "English"}:
         lang = "ru" if message.text == "Русский" else "en"
@@ -823,11 +838,6 @@ async def language_from_text(message: Message) -> None:
         await with_user_guard(message, _handler, preferred_lang=lang)
         return
 
-    async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await remove_legacy_reply_keyboard(message)
-        await message.answer(TEXT[lang]["choose_language"], reply_markup=language_inline())
-
-    await with_user_guard(message, _handler)
 
 
 @dp.message(F.text.in_({TEXT["ru"]["renew"], TEXT["en"]["renew"]}))
@@ -1071,10 +1081,11 @@ async def cb_support(callback: CallbackQuery) -> None:
     await with_user_guard(callback, _handler)
 
 
-@dp.callback_query(F.data == "menu:language")
-async def cb_language(callback: CallbackQuery) -> None:
+@dp.callback_query(F.data == "menu:instructions")
+async def cb_instructions(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await safe_edit(callback, TEXT[lang]["choose_language"], language_inline())
+        text, markup = await render_instructions_message(lang)
+        await safe_edit(callback, text, markup)
         await callback.answer()
 
     await with_user_guard(callback, _handler)
