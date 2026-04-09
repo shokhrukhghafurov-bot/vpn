@@ -1222,13 +1222,35 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     selected_live = [item for item in assigned if item.get("server")]
     reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
     effective_candidates_total = max(len(tested), len(selected_live))
+    source_errors = [item for item in source_stats if item.get("error")]
+    source_errors_total = len(source_errors)
+    sources_ok_total = len(source_stats) - source_errors_total
+    display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
+    if raw_parsed_total > 0:
+        refresh_summary = (
+            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
+            f"live {len(tested)} | selected {len(selected_live)}"
+        )
+    elif selected_live:
+        if source_errors_total:
+            refresh_summary = (
+                f"parsed 0 | reused existing {len(selected_live)} | "
+                f"source_errors {source_errors_total}"
+            )
+        else:
+            refresh_summary = (
+                f"parsed 0 | reused existing {len(selected_live)} | "
+                f"live {len(tested)}"
+            )
+    else:
+        refresh_summary = "parsed 0 | selected 0"
 
     return {
         "ok": bool(top),
         "sources": source_stats,
-        # Backward-compatible admin banner field: show raw parsed candidates,
-        # not only the tiny post-probe/live pool.
-        "candidates_total": raw_parsed_total,
+        # Admin banner field: show parsed count when available, otherwise fall back
+        # to the effective/reused live pool so the UI never shows confusing 0|3.
+        "candidates_total": display_candidates_total,
         "raw_parsed_total": raw_parsed_total,
         "parsed_candidates_total": raw_parsed_total,
         "complete_candidates_total": complete_candidates_total,
@@ -1241,15 +1263,16 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "live_total": len(tested),
         "reused_existing_total": reused_existing_total,
         "probe_errors": probe_errors,
+        "source_errors_total": source_errors_total,
+        "sources_total": len(source_stats),
+        "sources_ok_total": sources_ok_total,
+        "source_errors": [{"source": item.get("source"), "error": item.get("error")} for item in source_errors],
         "real_probe_enabled": bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)),
         "real_probe_required": bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)),
         "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
         "selected": assigned,
         "selected_live_total": len(selected_live),
-        "refresh_summary": (
-            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
-            f"live {len(tested)} | selected {len(selected_live)}"
-        ),
+        "refresh_summary": refresh_summary,
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
     }
@@ -1464,13 +1487,35 @@ def refresh_black_locations() -> Dict[str, Any]:
     selected_live = [item for item in assigned if item.get("server")]
     reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
     effective_candidates_total = max(len(tested), len(selected_live))
+    source_errors = [item for item in source_stats if item.get("error")]
+    source_errors_total = len(source_errors)
+    sources_ok_total = len(source_stats) - source_errors_total
+    display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
+    if raw_parsed_total > 0:
+        refresh_summary = (
+            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
+            f"live {len(tested)} | selected {len(selected_live)}"
+        )
+    elif selected_live:
+        if source_errors_total:
+            refresh_summary = (
+                f"parsed 0 | reused existing {len(selected_live)} | "
+                f"source_errors {source_errors_total}"
+            )
+        else:
+            refresh_summary = (
+                f"parsed 0 | reused existing {len(selected_live)} | "
+                f"live {len(tested)}"
+            )
+    else:
+        refresh_summary = "parsed 0 | selected 0"
 
     return {
         "ok": bool(top),
         "sources": source_stats,
-        # Backward-compatible admin banner field: show raw parsed candidates,
-        # not only the tiny post-probe/live pool.
-        "candidates_total": raw_parsed_total,
+        # Admin banner field: show parsed count when available, otherwise fall back
+        # to the effective/reused live pool so the UI never shows confusing 0|3.
+        "candidates_total": display_candidates_total,
         "raw_parsed_total": raw_parsed_total,
         "parsed_candidates_total": raw_parsed_total,
         "complete_candidates_total": complete_candidates_total,
@@ -1483,12 +1528,13 @@ def refresh_black_locations() -> Dict[str, Any]:
         "live_total": len(tested),
         "reused_existing_total": reused_existing_total,
         "probe_errors": probe_errors,
+        "source_errors_total": source_errors_total,
+        "sources_total": len(source_stats),
+        "sources_ok_total": sources_ok_total,
+        "source_errors": [{"source": item.get("source"), "error": item.get("error")} for item in source_errors],
         "selected": assigned,
         "selected_live_total": len(selected_live),
-        "refresh_summary": (
-            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
-            f"live {len(tested)} | selected {len(selected_live)}"
-        ),
+        "refresh_summary": refresh_summary,
         "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
     }
