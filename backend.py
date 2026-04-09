@@ -2092,8 +2092,11 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("dns_servers is empty or still contains placeholders")
         fixes.append("Add dns_servers, for example 1.1.1.1 and 8.8.8.8.")
 
-    if str(platform_label or "").strip().lower() == "windows":
+    platform_key = str(platform_label or "").strip().lower()
+    if platform_key == "windows":
         fixes.append("Run the VPN client as Administrator before enabling TUN on Windows.")
+    elif platform_key == "macos":
+        fixes.append("Allow VPN / Network Extension permissions in macOS System Settings if TUN does not start.")
 
     fatal_prefixes = (
         "vpn_payload is empty",
@@ -2138,17 +2141,30 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
     android = _build_tun_platform_diagnostics(payload, "Android")
     ios = _build_tun_platform_diagnostics(payload, "iOS")
     windows = _build_tun_platform_diagnostics(payload, "Windows")
+    macos = _build_tun_platform_diagnostics(payload, "macOS")
+
+    platform_items = (android, ios, windows, macos)
 
     summary_status = "ready"
-    if any(item["status"] == "error" for item in (android, ios, windows)):
+    if any(item["status"] == "error" for item in platform_items):
         summary_status = "error"
-    elif any(item["status"] == "warning" for item in (android, ios, windows)):
+    elif any(item["status"] == "warning" for item in platform_items):
         summary_status = "warning"
 
-    issues = list(dict.fromkeys(android.get("issues", []) + ios.get("issues", []) + windows.get("issues", [])))
-    fixes = list(dict.fromkeys(android.get("fixes", []) + ios.get("fixes", []) + windows.get("fixes", [])))
+    issues = list(dict.fromkeys(
+        android.get("issues", [])
+        + ios.get("issues", [])
+        + windows.get("issues", [])
+        + macos.get("issues", [])
+    ))
+    fixes = list(dict.fromkeys(
+        android.get("fixes", [])
+        + ios.get("fixes", [])
+        + windows.get("fixes", [])
+        + macos.get("fixes", [])
+    ))
     if summary_status == "ready":
-        summary_text = "TUN payload is ready for Android, iOS, and Windows."
+        summary_text = "TUN payload is ready for Android, iOS, Windows, and macOS."
     else:
         summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
 
@@ -2160,6 +2176,7 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "android": android,
         "ios": ios,
         "windows": windows,
+        "macos": macos,
     }
 
 
