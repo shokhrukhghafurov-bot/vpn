@@ -238,18 +238,47 @@ PUBLIC_STABLE_LOCATION_CODES: Tuple[str, ...] = RU_LTE_LOCATION_CODES + BLACK_LO
 PUBLIC_VIRTUAL_LOCATION_CODES: Tuple[str, ...] = ("auto-fastest", "auto-reserve")
 _DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
 _DEAD_CANDIDATE_LOCK = threading.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+_LOCAL_SOURCE_FALLBACKS: Dict[str, Path] = {
+    "Vless-Reality-White-Lists-Rus-Mobile.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+    "WHITE-CIDR-RU-checked.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-checked.txt",
+    "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
+}
+
+
+def _resolve_local_source_path(source: str) -> Path:
+    raw = str(source or "").strip()
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    return (_PROJECT_ROOT / path).resolve()
 
 
 def _read_text_from_source(source: str) -> str:
     raw = str(source or "").strip()
     if not raw:
         return ""
+    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(Path(urlsplit(raw).path or raw).name)
     if raw.startswith(("http://", "https://")):
-        response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
-        response.raise_for_status()
-        return response.text
-    with open(raw, "r", encoding="utf-8") as fh:
-        return fh.read()
+        try:
+            response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            if fallback_path and fallback_path.is_file():
+                return fallback_path.read_text(encoding="utf-8")
+            raise
+    path = _resolve_local_source_path(raw)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    if fallback_path and fallback_path.is_file():
+        return fallback_path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Source file not found: {raw}")
 
 
 def _decode_vless_name(fragment: str) -> str:
@@ -749,12 +778,36 @@ def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
     return {"ok": True, "latency_ms": latency_ms, "http_code": http_code}
 
 
+def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+
+    def _append(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        if text.startswith(("http://", "https://")):
+            url = text
+        else:
+            host = text.split("/")[0].strip()
+            if not host or ":" in host or " " in host:
+                return
+            url = f"https://{host}/"
+        if url not in candidates:
+            candidates.append(url)
+
+    _append(payload.get("host"))
+    _append(payload.get("server_name") or payload.get("sni"))
+    for item in (settings.RU_LTE_REAL_PROBE_URLS or []):
+        _append(item)
+    return candidates
+
+
 def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str, Any]:
     runner_name, runner_bin = _resolve_probe_runner()
     if not runner_bin:
         return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
 
-    urls = [str(item or "").strip() for item in (settings.RU_LTE_REAL_PROBE_URLS or []) if str(item or "").strip()]
+    urls = _ru_lte_candidate_probe_urls(payload)
     if not urls:
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
