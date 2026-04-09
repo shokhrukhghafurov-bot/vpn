@@ -228,8 +228,10 @@ class AdminVpnSettingsIn(BaseModel):
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
 
-RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
-BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3")
+RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2")
+BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2")
+PUBLIC_STABLE_LOCATION_CODES: Tuple[str, ...] = RU_LTE_LOCATION_CODES + BLACK_LOCATION_CODES
+PUBLIC_VIRTUAL_LOCATION_CODES: Tuple[str, ...] = ("auto-fastest", "auto-reserve")
 _DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
 _DEAD_CANDIDATE_LOCK = threading.Lock()
 
@@ -637,11 +639,9 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "ru-lte": ("Россия LTE", "Russia LTE", False),
         "ru-lte-reserve-1": ("Россия LTE | Резерв 1", "Russia LTE | Reserve 1", True),
         "ru-lte-reserve-2": ("Россия LTE | Резерв 2", "Russia LTE | Reserve 2", True),
-        "ru-lte-reserve-3": ("Россия LTE | Резерв 3", "Russia LTE | Reserve 3", True),
         "intl-fast": ("Fast / International", "Fast / International", False),
         "intl-fast-reserve-1": ("Fast / International | Reserve 1", "Fast / International | Reserve 1", True),
         "intl-fast-reserve-2": ("Fast / International | Reserve 2", "Fast / International | Reserve 2", True),
-        "intl-fast-reserve-3": ("Fast / International | Reserve 3", "Fast / International | Reserve 3", True),
     }
     if code not in default_names:
         return None
@@ -661,7 +661,7 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "is_recommended": bool(updates.get("is_recommended", code == "ru-lte")),
         "is_reserve": bool(updates.get("is_reserve", is_reserve)),
         "status": str(updates.get("status") or "offline"),
-        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82, "intl-fast-reserve-3": 83}.get(code, 100)),
+        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82}.get(code, 100)),
         "vpn_payload": base_payload,
         "location_source": "catalog",
     }
@@ -767,7 +767,6 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "ru-lte": "Russia LTE",
         "ru-lte-reserve-1": "Russia LTE | Reserve 1",
         "ru-lte-reserve-2": "Russia LTE | Reserve 2",
-        "ru-lte-reserve-3": "Russia LTE | Reserve 3",
     }
 
     for idx, code in enumerate(RU_LTE_LOCATION_CODES):
@@ -831,9 +830,11 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
             if not keep_old:
                 row = _patch_location_by_code(code, {
                     "status": "offline",
-                    "is_active": True,
+                    "is_active": False,
                     "is_recommended": False,
                     "is_reserve": code != "ru-lte",
+                    "ping_ms": None,
+                    "speed_checked_at": now_iso,
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
@@ -958,7 +959,6 @@ def refresh_black_locations() -> Dict[str, Any]:
         "intl-fast": "Fast / International",
         "intl-fast-reserve-1": "Fast / International | Reserve 1",
         "intl-fast-reserve-2": "Fast / International | Reserve 2",
-        "intl-fast-reserve-3": "Fast / International | Reserve 3",
     }
 
     for idx, code in enumerate(BLACK_LOCATION_CODES):
@@ -1033,9 +1033,11 @@ def refresh_black_locations() -> Dict[str, Any]:
                     "name_en": remarks.get(code, code),
                     "country_code": None,
                     "status": "offline",
-                    "is_active": True,
+                    "is_active": False,
                     "is_recommended": False,
                     "is_reserve": code != "intl-fast",
+                    "ping_ms": None,
+                    "speed_checked_at": now_iso,
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "security": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
@@ -1082,7 +1084,7 @@ app.add_middleware(
 
 app.add_middleware(GZipMiddleware, minimum_size=500)
 
-_LOCATIONS_CACHE_TTL_SEC = 15
+_LOCATIONS_CACHE_TTL_SEC = 5
 _locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
 _ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
 _black_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
@@ -1225,13 +1227,62 @@ def _start_black_auto_refresh_loop() -> None:
     thread.start()
 
 
+def _location_status_is_online(row: Dict[str, Any]) -> bool:
+    return str(row.get("status") or "").strip().lower() == "online"
+
+
+def _public_location_code_allowed(code: str) -> bool:
+    clean = str(code or "").strip()
+    return clean in PUBLIC_VIRTUAL_LOCATION_CODES or clean in PUBLIC_STABLE_LOCATION_CODES
+
+
+def _row_has_ready_payload(row: Dict[str, Any]) -> bool:
+    payload = _compose_vpn_payload_for_location(dict(row))
+    return bool(payload) and _config_is_complete(payload)
+
+
+def _public_location_rows() -> List[Dict[str, Any]]:
+    rows = list_locations(active_only=True)
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        if not _public_location_code_allowed(code):
+            continue
+        if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            resolved = _pick_virtual_location(code)
+            if resolved is not None:
+                items.append(dict(row))
+            continue
+        if not _location_status_is_online(row):
+            continue
+        if not _row_has_ready_payload(row):
+            continue
+        items.append(dict(row))
+    return items
+
+
+def _public_locations_health_snapshot() -> Dict[str, Any]:
+    rows = _public_location_rows()
+    online_codes = [str(row.get("code") or "").strip() for row in rows if str(row.get("code") or "").strip() in PUBLIC_STABLE_LOCATION_CODES]
+    online_set = set(online_codes)
+    ru_online = [code for code in RU_LTE_LOCATION_CODES if code in online_set]
+    intl_online = [code for code in BLACK_LOCATION_CODES if code in online_set]
+    return {
+        "public_total": len(rows),
+        "ru_lte_online": ru_online,
+        "intl_online": intl_online,
+        "healthy": bool(ru_online or intl_online),
+        "degraded": not (RU_LTE_LOCATION_CODES[0] in online_set and BLACK_LOCATION_CODES[0] in online_set),
+    }
+
+
 def _cached_locations_payload() -> List[Dict[str, Any]]:
     now = time.monotonic()
     cached_items = _locations_cache.get("items")
     expires_at = float(_locations_cache.get("expires_at") or 0.0)
     if cached_items is not None and expires_at > now:
         return cached_items
-    items = [serialize_location(row) for row in list_locations(active_only=True)]
+    items = [serialize_location(row) for row in _public_location_rows()]
     _locations_cache["items"] = items
     _locations_cache["expires_at"] = now + _LOCATIONS_CACHE_TTL_SEC
     return items
@@ -1919,20 +1970,14 @@ def _subscription_location_rows() -> List[Dict[str, Any]]:
     concrete: List[Dict[str, Any]] = []
     for row in list_locations(active_only=True):
         code = str(row.get("code") or "").strip()
-        if code in {"auto-fastest", "auto-reserve"}:
+        if code not in PUBLIC_STABLE_LOCATION_CODES:
             continue
-        if str(row.get("status") or "").strip().lower() != "online":
+        if not _location_status_is_online(row):
             continue
         payload = _compose_vpn_payload_for_location(dict(row))
         if payload and _config_is_complete(payload) and _hiddify_subscription_transport_allowed(payload):
             concrete.append(dict(row))
-    priority = {
-        "ru-lte": 0,
-        "ru-lte-reserve-1": 1,
-        "ru-lte-reserve-2": 2,
-        "ru-lte-reserve-3": 3,
-        "se": 4,
-    }
+    priority = {code: idx for idx, code in enumerate(PUBLIC_STABLE_LOCATION_CODES)}
     concrete.sort(key=lambda row: (priority.get(str(row.get("code") or ""), 1000), int(row.get("sort_order") or 9999), str(row.get("name_en") or row.get("code") or "")))
     return concrete
 
@@ -2329,7 +2374,15 @@ def open_app_bridge(
 
 @app.get("/health")
 def health() -> Dict[str, Any]:
-    return {"ok": True, "service": settings.APP_NAME}
+    locations = _public_locations_health_snapshot()
+    return {
+        "ok": bool(locations.get("healthy")),
+        "service": settings.APP_NAME,
+        "locations": locations,
+        "ru_lte_refresh": dict(_ru_lte_refresh_state),
+        "black_refresh": dict(_black_refresh_state),
+        "locations_cache_ttl_sec": int(_LOCATIONS_CACHE_TTL_SEC),
+    }
 
 
 @app.post("/auth/telegram")
