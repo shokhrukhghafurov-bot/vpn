@@ -641,8 +641,6 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
             f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
             f"{t['devices_used']}: {used} / {limit}",
             "",
-            subscription_url or "",
-            "",
             t["manual_import_hint"],
         ]
     ).strip()
