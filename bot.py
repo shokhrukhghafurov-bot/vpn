@@ -1142,6 +1142,15 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
             ]
         )
         return text, markup
+    if event_type == "subscription_expiring_12h":
+        text = f"{t['twelve_hours_left']}\n\n{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}"
+        markup = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")],
+                [InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")],
+            ]
+        )
+        return text, markup
     if event_type == "subscription_expired":
         text = "\n".join([t["expired_notice"], "", t["expired_access_disabled"], t["expired_buy_cta"]]).strip()
         markup = InlineKeyboardMarkup(
