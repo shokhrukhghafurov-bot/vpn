@@ -70,6 +70,10 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
     return None
 
 
+VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
+VIRTUAL_LOCATION_POOL_SIZE = 3
+VIRTUAL_LOCATION_MAX_POOL_SIZE = 5
+
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
@@ -209,6 +213,16 @@ CREATE TABLE IF NOT EXISTS vpn_runtime_settings (
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS virtual_location_assignments (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    virtual_code TEXT NOT NULL,
+    concrete_code TEXT NOT NULL,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, virtual_code)
+);
 """
 
 MIGRATION_SQL = [
@@ -287,6 +301,8 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
+    "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
 ]
 
 POST_MIGRATION_SQL = [
@@ -308,6 +324,7 @@ POST_MIGRATION_SQL = [
     "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
+    "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
 ]
 
 SERIAL_SEQUENCE_TARGETS = (
@@ -1056,11 +1073,80 @@ def _location_speed_rank(row: Dict[str, Any]) -> tuple:
     return (has_speed, download, upload, ping_score, recommended, -reserve, -(int(row.get("sort_order") or 9999)))
 
 
-def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
-    rows = list_locations(active_only=True)
-    if not rows:
-        return None
+def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    unique: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        if not code or code in seen:
+            continue
+        seen.add(code)
+        unique.append(row)
+    return unique
 
+
+def get_user_virtual_location_assignment(user_id: int, virtual_code: str) -> Optional[str]:
+    code = str(virtual_code or "").strip()
+    if not code:
+        return None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT concrete_code FROM virtual_location_assignments WHERE user_id = %s AND virtual_code = %s LIMIT 1",
+                (user_id, code),
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    return str(row.get("concrete_code") or "").strip() or None
+
+
+def upsert_user_virtual_location_assignment(user_id: int, virtual_code: str, concrete_code: str) -> None:
+    virtual_clean = str(virtual_code or "").strip()
+    concrete_clean = str(concrete_code or "").strip()
+    if not virtual_clean or not concrete_clean:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO virtual_location_assignments (user_id, virtual_code, concrete_code)
+                VALUES (%s, %s, %s)
+                ON CONFLICT (user_id, virtual_code) DO UPDATE SET
+                    concrete_code = EXCLUDED.concrete_code,
+                    updated_at = NOW()
+                """,
+                (user_id, virtual_clean, concrete_clean),
+            )
+        conn.commit()
+
+
+def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[str, int]:
+    clean_codes = [str(code or "").strip() for code in concrete_codes if str(code or "").strip()]
+    if not clean_codes:
+        return {}
+    placeholders = ", ".join(["%s"] * len(clean_codes))
+    query = f"""
+        SELECT vla.concrete_code, COUNT(DISTINCT vla.user_id) AS assigned_users
+        FROM virtual_location_assignments vla
+        JOIN users u ON u.id = vla.user_id
+        JOIN subscriptions s ON s.user_id = vla.user_id
+        WHERE vla.concrete_code IN ({placeholders})
+          AND COALESCE(u.status, 'active') <> 'blocked'
+          AND s.starts_at <= NOW()
+          AND s.expires_at >= NOW()
+        GROUP BY vla.concrete_code
+    """
+    counts: Dict[str, int] = {}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(clean_codes))
+            for row in cur.fetchall():
+                counts[str(row.get("concrete_code") or "").strip()] = int(row.get("assigned_users") or 0)
+    return counts
+
+
+def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3"}
     preferred_main_codes = ["ru-lte"]
     preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
@@ -1073,7 +1159,7 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
         for row in items:
             if row.get("code") in excluded:
                 continue
-            payload = _compose_vpn_payload_for_location(row)
+            payload = _compose_vpn_payload_for_location(dict(row))
             if payload and _config_is_complete(payload):
                 valid.append(row)
         return valid
@@ -1095,49 +1181,66 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
         )
 
     if code == "auto-fastest":
-        picks = measured(lambda row: is_online(row) and not row.get("is_reserve"))
-        if picks:
-            return picks[0]
-        picks = measured(lambda row: is_online(row))
-        if picks:
-            return picks[0]
-        picks = by_codes(preferred_main_codes)
-        if picks:
-            return picks[0]
-        picks = by_codes(preferred_reserve_codes)
-        if picks:
-            return picks[0]
-        picks = generic(lambda row: is_online(row) and row.get("is_recommended"))
-        if picks:
-            return picks[0]
-        picks = generic(lambda row: is_online(row))
-        if picks:
-            return picks[0]
+        return _dedupe_location_rows(
+            measured(lambda row: is_online(row) and not row.get("is_reserve"))
+            + measured(lambda row: is_online(row))
+            + by_codes(preferred_main_codes)
+            + by_codes(preferred_reserve_codes)
+            + generic(lambda row: is_online(row) and row.get("is_recommended"))
+            + generic(lambda row: is_online(row))
+        )
 
     if code == "auto-reserve":
-        picks = measured(lambda row: is_online(row) and row.get("is_reserve"))
-        if picks:
-            return picks[0]
-        picks = by_codes(preferred_reserve_codes)
-        if picks:
-            return picks[0]
-        picks = generic(lambda row: is_online(row) and row.get("is_reserve"))
-        if picks:
-            return picks[0]
-        picks = by_codes(preferred_main_codes)
-        if picks:
-            return picks[0]
-        picks = measured(lambda row: is_online(row))
-        if len(picks) >= 2:
-            return picks[1]
-        if picks:
-            return picks[0]
-        picks = generic(lambda row: is_online(row))
-        if len(picks) >= 2:
-            return picks[1]
-        if picks:
-            return picks[0]
-    return None
+        return _dedupe_location_rows(
+            measured(lambda row: is_online(row) and row.get("is_reserve"))
+            + by_codes(preferred_reserve_codes)
+            + generic(lambda row: is_online(row) and row.get("is_reserve"))
+            + by_codes(preferred_main_codes)
+            + measured(lambda row: is_online(row))
+            + generic(lambda row: is_online(row))
+        )
+    return []
+
+
+def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
+    rows = list_locations(active_only=True)
+    if not rows:
+        return None
+
+    ranked_candidates = _virtual_location_candidates(code, rows)
+    if not ranked_candidates:
+        return None
+
+    primary_pool_size = max(1, VIRTUAL_LOCATION_POOL_SIZE)
+    max_pool_size = max(primary_pool_size, VIRTUAL_LOCATION_MAX_POOL_SIZE)
+    primary_pool = ranked_candidates[:primary_pool_size]
+    candidate_pool = ranked_candidates[:max_pool_size]
+    if not candidate_pool:
+        return None
+
+    if not user_id:
+        return primary_pool[0] if primary_pool else candidate_pool[0]
+
+    assigned_code = get_user_virtual_location_assignment(user_id, code)
+    if assigned_code:
+        for row in candidate_pool:
+            if str(row.get("code") or "").strip() == assigned_code:
+                return row
+
+    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in candidate_pool])
+
+    def load_rank(item: tuple[int, Dict[str, Any]]) -> tuple[int, int, int]:
+        index, row = item
+        concrete_code = str(row.get("code") or "").strip()
+        current_load = int(loads.get(concrete_code, 0))
+        outside_primary_penalty = 0 if index < primary_pool_size else 1
+        return (current_load, outside_primary_penalty, index)
+
+    selected = min(enumerate(candidate_pool), key=load_rank)[1]
+    selected_code = str(selected.get("code") or "").strip()
+    if selected_code:
+        upsert_user_virtual_location_assignment(user_id, code, selected_code)
+    return selected
 
 
 def sync_locations_catalog() -> None:
@@ -1886,7 +1989,7 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         raise PermissionError("Active subscription required")
 
     if location_code in {"auto-fastest", "auto-reserve"}:
-        row = _pick_virtual_location(location_code)
+        row = _pick_virtual_location(location_code, user_id=user_id)
         if not row:
             raise ValueError("No active VLESS node is available for auto selection")
     else:
