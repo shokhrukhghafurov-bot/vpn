@@ -1018,9 +1018,9 @@ def _pick_virtual_location(code: str) -> Optional[Dict[str, Any]]:
     if not rows:
         return None
 
-    excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2"}
+    excluded = {"auto-fastest", "auto-reserve", "intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3"}
     preferred_main_codes = ["ru-lte"]
-    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2"]
+    preferred_reserve_codes = ["ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
 
     def is_online(row: Dict[str, Any]) -> bool:
         return str(row.get("status") or "").strip().lower() == "online"
