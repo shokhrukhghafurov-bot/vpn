@@ -1771,12 +1771,41 @@ def _location_status_is_online(row: Dict[str, Any]) -> bool:
 
 def _public_location_code_allowed(code: str) -> bool:
     clean = str(code or "").strip()
-    return clean in PUBLIC_VIRTUAL_LOCATION_CODES or clean in PUBLIC_STABLE_LOCATION_CODES
+    return bool(clean)
 
 
 def _row_has_ready_payload(row: Dict[str, Any]) -> bool:
     payload = _compose_vpn_payload_for_location(dict(row))
     return bool(payload) and _config_is_complete(payload)
+
+
+def _public_concrete_location_allowed(row: Dict[str, Any]) -> bool:
+    code = str(row.get("code") or "").strip()
+    if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        return False
+    if not _location_status_is_online(row):
+        return False
+    if not _row_has_ready_payload(row):
+        return False
+    return True
+
+
+def _public_location_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
+    code = str(row.get("code") or "").strip()
+    is_virtual = code in PUBLIC_VIRTUAL_LOCATION_CODES
+    is_recommended = bool(row.get("is_recommended"))
+    sort_order = int(row.get("sort_order") or 9999)
+    stable_priority = PUBLIC_STABLE_LOCATION_CODES.index(code) if code in PUBLIC_STABLE_LOCATION_CODES else 1000
+    reserve_rank = 1 if bool(row.get("is_reserve")) else 0
+    display_name = str(row.get("name_en") or row.get("name_ru") or code or "").strip().lower()
+    return (
+        0 if is_virtual else 1,
+        0 if is_recommended else 1,
+        sort_order,
+        stable_priority,
+        reserve_rank,
+        display_name,
+    )
 
 
 def _public_location_rows() -> List[Dict[str, Any]]:
@@ -1791,11 +1820,10 @@ def _public_location_rows() -> List[Dict[str, Any]]:
             if resolved is not None:
                 items.append(dict(row))
             continue
-        if not _location_status_is_online(row):
-            continue
-        if not _row_has_ready_payload(row):
+        if not _public_concrete_location_allowed(row):
             continue
         items.append(dict(row))
+    items.sort(key=_public_location_sort_key)
     return items
 
 
@@ -2562,6 +2590,21 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
 
 
 
+def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    base_name = str(
+        normalized.get("remark")
+        or normalized.get("display_name")
+        or row.get("name_en")
+        or row.get("name_ru")
+        or row.get("code")
+        or "VLESS"
+    ).strip() or "VLESS"
+    if bool(row.get("is_recommended")) and not base_name.startswith(("★ ", "⭐ ")):
+        return f"★ {base_name}"
+    return base_name
+
+
 def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
     normalized = _normalize_vpn_payload_keys(payload)
     if not normalized or not _config_is_complete(normalized):
@@ -2608,17 +2651,13 @@ def _hiddify_subscription_transport_allowed(payload: Dict[str, Any]) -> bool:
 
 def _subscription_location_rows() -> List[Dict[str, Any]]:
     concrete: List[Dict[str, Any]] = []
-    for row in list_locations(active_only=True):
+    for row in _public_location_rows():
         code = str(row.get("code") or "").strip()
-        if code not in PUBLIC_STABLE_LOCATION_CODES:
-            continue
-        if not _location_status_is_online(row):
+        if code in PUBLIC_VIRTUAL_LOCATION_CODES:
             continue
         payload = _compose_vpn_payload_for_location(dict(row))
-        if payload and _config_is_complete(payload) and _hiddify_subscription_transport_allowed(payload):
+        if payload and _hiddify_subscription_transport_allowed(payload):
             concrete.append(dict(row))
-    priority = {code: idx for idx, code in enumerate(PUBLIC_STABLE_LOCATION_CODES)}
-    concrete.sort(key=lambda row: (priority.get(str(row.get("code") or ""), 1000), int(row.get("sort_order") or 9999), str(row.get("name_en") or row.get("code") or "")))
     return concrete
 
 
@@ -2726,8 +2765,13 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     lines: List[str] = []
     for row in rows:
         payload = _compose_vpn_payload_for_location(dict(row))
+        if not payload:
+            continue
+        payload_for_subscription = dict(payload)
+        payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
+        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
         try:
-            lines.append(_build_vless_subscription_line(payload, fallback_name=str(row.get("name_en") or row.get("name_ru") or row.get("code") or "VLESS")))
+            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=_subscription_remark_for_row(row, payload_for_subscription)))
         except Exception:
             continue
 
