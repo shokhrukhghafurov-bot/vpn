@@ -2092,6 +2092,9 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("dns_servers is empty or still contains placeholders")
         fixes.append("Add dns_servers, for example 1.1.1.1 and 8.8.8.8.")
 
+    if str(platform_label or "").strip().lower() == "windows":
+        fixes.append("Run the VPN client as Administrator before enabling TUN on Windows.")
+
     fatal_prefixes = (
         "vpn_payload is empty",
         "server is missing or still contains a placeholder",
@@ -2134,17 +2137,18 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
     payload = resolved_payload if isinstance(resolved_payload, dict) else _compose_vpn_payload_for_location(dict(row))
     android = _build_tun_platform_diagnostics(payload, "Android")
     ios = _build_tun_platform_diagnostics(payload, "iOS")
+    windows = _build_tun_platform_diagnostics(payload, "Windows")
 
     summary_status = "ready"
-    if android["status"] == "error" or ios["status"] == "error":
+    if any(item["status"] == "error" for item in (android, ios, windows)):
         summary_status = "error"
-    elif android["status"] == "warning" or ios["status"] == "warning":
+    elif any(item["status"] == "warning" for item in (android, ios, windows)):
         summary_status = "warning"
 
-    issues = list(dict.fromkeys(android.get("issues", []) + ios.get("issues", [])))
-    fixes = list(dict.fromkeys(android.get("fixes", []) + ios.get("fixes", [])))
+    issues = list(dict.fromkeys(android.get("issues", []) + ios.get("issues", []) + windows.get("issues", [])))
+    fixes = list(dict.fromkeys(android.get("fixes", []) + ios.get("fixes", []) + windows.get("fixes", [])))
     if summary_status == "ready":
-        summary_text = "TUN payload is ready for Android and iOS."
+        summary_text = "TUN payload is ready for Android, iOS, and Windows."
     else:
         summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
 
@@ -2155,8 +2159,8 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "fixes": fixes,
         "android": android,
         "ios": ios,
+        "windows": windows,
     }
-
 
 
 def _location_error_created_at(row: Dict[str, Any]) -> str:
@@ -2521,6 +2525,7 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
     query: Dict[str, Any] = {
         "type": str(normalized.get("transport") or normalized.get("network") or "tcp").strip() or "tcp",
         "security": str(normalized.get("security") or "reality").strip() or "reality",
+        "encryption": str(normalized.get("encryption") or "none").strip() or "none",
     }
     transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
     optional_keys = {
