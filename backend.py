@@ -1025,11 +1025,24 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     seen: set[str] = set()
     source_stats: List[Dict[str, Any]] = []
+    raw_parsed_total = 0
+    complete_candidates_total = 0
+    duplicate_skipped_total = 0
     quality_rejected_total = 0
     cooldown_skipped_total = 0
 
     for source in sources:
-        stat = {"source": source, "lines": 0, "accepted": 0, "quality_rejected": 0, "cooldown_skipped": 0, "error": None}
+        stat = {
+            "source": source,
+            "lines": 0,
+            "parsed": 0,
+            "complete": 0,
+            "accepted": 0,
+            "duplicates": 0,
+            "quality_rejected": 0,
+            "cooldown_skipped": 0,
+            "error": None,
+        }
         try:
             content = _read_text_from_source(source)
             for line in content.splitlines():
@@ -1037,9 +1050,13 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 payload = _parse_vless_subscription_line(line)
                 if not payload:
                     continue
+                stat["parsed"] += 1
+                raw_parsed_total += 1
                 normalized = _normalize_vpn_payload_keys(payload)
                 if not _config_is_complete(normalized):
                     continue
+                stat["complete"] += 1
+                complete_candidates_total += 1
                 reasons = _candidate_quality_reasons(normalized, pool="ru_lte")
                 if reasons:
                     stat["quality_rejected"] += 1
@@ -1047,6 +1064,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     continue
                 key = _candidate_identity_key(normalized)
                 if key in seen:
+                    stat["duplicates"] += 1
+                    duplicate_skipped_total += 1
                     continue
                 if _is_candidate_recently_dead("ru_lte", normalized):
                     stat["cooldown_skipped"] += 1
@@ -1207,10 +1226,16 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     return {
         "ok": bool(top),
         "sources": source_stats,
-        "candidates_total": effective_candidates_total,
-        "parsed_candidates_total": len(candidates),
+        # Backward-compatible admin banner field: show raw parsed candidates,
+        # not only the tiny post-probe/live pool.
+        "candidates_total": raw_parsed_total,
+        "raw_parsed_total": raw_parsed_total,
+        "parsed_candidates_total": raw_parsed_total,
+        "complete_candidates_total": complete_candidates_total,
+        "unique_candidates_total": len(candidates),
         "effective_candidates_total": effective_candidates_total,
         "quality_rejected_total": quality_rejected_total,
+        "duplicate_skipped_total": duplicate_skipped_total,
         "cooldown_skipped_total": cooldown_skipped_total,
         "tested_total": probed_total,
         "live_total": len(tested),
@@ -1221,6 +1246,10 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
         "selected": assigned,
         "selected_live_total": len(selected_live),
+        "refresh_summary": (
+            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
+            f"live {len(tested)} | selected {len(selected_live)}"
+        ),
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
     }
@@ -1231,11 +1260,24 @@ def refresh_black_locations() -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     seen: set[str] = set()
     source_stats: List[Dict[str, Any]] = []
+    raw_parsed_total = 0
+    complete_candidates_total = 0
+    duplicate_skipped_total = 0
     quality_rejected_total = 0
     cooldown_skipped_total = 0
 
     for source in sources:
-        stat = {"source": source, "lines": 0, "accepted": 0, "quality_rejected": 0, "cooldown_skipped": 0, "error": None}
+        stat = {
+            "source": source,
+            "lines": 0,
+            "parsed": 0,
+            "complete": 0,
+            "accepted": 0,
+            "duplicates": 0,
+            "quality_rejected": 0,
+            "cooldown_skipped": 0,
+            "error": None,
+        }
         try:
             content = _read_text_from_source(source)
             for line in content.splitlines():
@@ -1243,9 +1285,13 @@ def refresh_black_locations() -> Dict[str, Any]:
                 payload = _parse_vless_subscription_line(line)
                 if not payload:
                     continue
+                stat["parsed"] += 1
+                raw_parsed_total += 1
                 normalized = _normalize_vpn_payload_keys(payload)
                 if not _config_is_complete(normalized):
                     continue
+                stat["complete"] += 1
+                complete_candidates_total += 1
                 reasons = _candidate_quality_reasons(normalized, pool="black")
                 if reasons:
                     stat["quality_rejected"] += 1
@@ -1253,6 +1299,8 @@ def refresh_black_locations() -> Dict[str, Any]:
                     continue
                 key = _candidate_identity_key(normalized)
                 if key in seen:
+                    stat["duplicates"] += 1
+                    duplicate_skipped_total += 1
                     continue
                 if _is_candidate_recently_dead("black", normalized):
                     stat["cooldown_skipped"] += 1
@@ -1420,10 +1468,16 @@ def refresh_black_locations() -> Dict[str, Any]:
     return {
         "ok": bool(top),
         "sources": source_stats,
-        "candidates_total": effective_candidates_total,
-        "parsed_candidates_total": len(candidates),
+        # Backward-compatible admin banner field: show raw parsed candidates,
+        # not only the tiny post-probe/live pool.
+        "candidates_total": raw_parsed_total,
+        "raw_parsed_total": raw_parsed_total,
+        "parsed_candidates_total": raw_parsed_total,
+        "complete_candidates_total": complete_candidates_total,
+        "unique_candidates_total": len(candidates),
         "effective_candidates_total": effective_candidates_total,
         "quality_rejected_total": quality_rejected_total,
+        "duplicate_skipped_total": duplicate_skipped_total,
         "cooldown_skipped_total": cooldown_skipped_total,
         "tested_total": probed_total,
         "live_total": len(tested),
@@ -1431,6 +1485,10 @@ def refresh_black_locations() -> Dict[str, Any]:
         "probe_errors": probe_errors,
         "selected": assigned,
         "selected_live_total": len(selected_live),
+        "refresh_summary": (
+            f"parsed {raw_parsed_total} | unique {len(candidates)} | "
+            f"live {len(tested)} | selected {len(selected_live)}"
+        ),
         "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
     }
