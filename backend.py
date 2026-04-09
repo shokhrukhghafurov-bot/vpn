@@ -230,6 +230,8 @@ class AdminVpnSettingsIn(BaseModel):
 
 RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
 BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast", "intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3")
+_DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
+_DEAD_CANDIDATE_LOCK = threading.Lock()
 
 
 def _read_text_from_source(source: str) -> str:
@@ -302,6 +304,160 @@ def _transport_allowed(payload: Dict[str, Any], allowed_values: List[str]) -> bo
     allowed = {item.strip().lower() for item in (allowed_values or []) if str(item or "").strip()}
     transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
     return transport in allowed if allowed else True
+
+
+def _payload_transport(payload: Dict[str, Any]) -> str:
+    return str(payload.get("transport") or payload.get("network") or "tcp").strip().lower() or "tcp"
+
+
+def _payload_security(payload: Dict[str, Any]) -> str:
+    return str(payload.get("security") or "").strip().lower()
+
+
+def _candidate_identity_key(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        str(payload.get("server") or "").strip().lower(),
+        str(payload.get("port") or "").strip(),
+        str(payload.get("uuid") or "").strip().lower(),
+        str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+        str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+        str(payload.get("server_name") or payload.get("sni") or "").strip().lower(),
+        str(payload.get("path") or "").strip(),
+        str(payload.get("service_name") or "").strip(),
+    ])
+
+
+def _candidate_server_key(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        str(payload.get("server") or "").strip().lower(),
+        str(payload.get("port") or "").strip(),
+    ])
+
+
+def _candidate_sni_key(payload: Dict[str, Any]) -> str:
+    return str(payload.get("server_name") or payload.get("sni") or "").strip().lower()
+
+
+def _dead_candidate_cooldown_seconds(pool: str) -> float:
+    if pool == "black":
+        return max(5, int(settings.BLACK_DEAD_COOLDOWN_MINUTES or 30)) * 60.0
+    return max(5, int(settings.RU_LTE_DEAD_COOLDOWN_MINUTES or 45)) * 60.0
+
+
+def _cleanup_dead_candidate_cache(pool: str) -> None:
+    now = time.time()
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        expired = [key for key, expires_at in bucket.items() if expires_at <= now]
+        for key in expired:
+            bucket.pop(key, None)
+
+
+def _is_candidate_recently_dead(pool: str, payload: Dict[str, Any]) -> bool:
+    _cleanup_dead_candidate_cache(pool)
+    identity = _candidate_identity_key(payload)
+    server_key = _candidate_server_key(payload)
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        return bool(bucket.get(identity) or bucket.get(f"server:{server_key}"))
+
+
+def _mark_candidate_dead(pool: str, payload: Dict[str, Any]) -> None:
+    identity = _candidate_identity_key(payload)
+    server_key = _candidate_server_key(payload)
+    expires_at = time.time() + _dead_candidate_cooldown_seconds(pool)
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        if identity:
+            bucket[identity] = expires_at
+        if server_key:
+            bucket[f"server:{server_key}"] = expires_at
+
+
+def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[str]:
+    reasons: List[str] = []
+    protocol = str(payload.get("protocol") or "vless").strip().lower()
+    transport = _payload_transport(payload)
+    security = _payload_security(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
+    public_key = str(payload.get("public_key") or payload.get("publicKey") or "").strip()
+    short_id = str(payload.get("short_id") or payload.get("shortId") or "").strip()
+    flow = str(payload.get("flow") or "").strip().lower()
+    service_name = str(payload.get("service_name") or "").strip()
+    path = str(payload.get("path") or "").strip()
+
+    if protocol != "vless":
+        reasons.append("protocol")
+    if not str(payload.get("server") or "").strip():
+        reasons.append("server")
+    if int(payload.get("port") or 0) <= 0:
+        reasons.append("port")
+    if not str(payload.get("uuid") or "").strip():
+        reasons.append("uuid")
+
+    allowed = settings.BLACK_ALLOWED_TRANSPORTS if pool == "black" else settings.RU_LTE_ALLOWED_TRANSPORTS
+    if not _transport_allowed(payload, allowed or []):
+        reasons.append("transport_not_allowed")
+
+    if pool == "ru_lte" and security != "reality":
+        reasons.append("security_not_reality")
+    if pool == "black" and security not in {"reality", "tls"}:
+        reasons.append("security_unsupported")
+
+    if security in {"reality", "tls"} and not server_name:
+        reasons.append("missing_sni")
+    if security == "reality" and not public_key:
+        reasons.append("missing_public_key")
+    if security == "reality" and transport == "tcp" and flow != "xtls-rprx-vision":
+        reasons.append("tcp_missing_vision_flow")
+    if transport == "grpc" and not service_name:
+        reasons.append("grpc_missing_service_name")
+    if transport in {"ws", "websocket"} and not path:
+        reasons.append("ws_missing_path")
+    if pool == "ru_lte" and transport == "xhttp":
+        reasons.append("xhttp_not_preferred")
+    if pool == "ru_lte" and security == "reality" and not short_id:
+        reasons.append("missing_short_id")
+
+    return reasons
+
+
+def _is_candidate_strong(payload: Dict[str, Any], *, pool: str) -> bool:
+    return not _candidate_quality_reasons(payload, pool=pool)
+
+
+def _candidate_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
+    return (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), str(item.get("remark") or ""))
+
+
+def _select_diverse_candidates(candidates: List[Dict[str, Any]], *, max_candidates: int) -> List[Dict[str, Any]]:
+    chosen: List[Dict[str, Any]] = []
+    used_servers: set[str] = set()
+    used_sni: set[str] = set()
+
+    for candidate in candidates:
+        server_key = _candidate_server_key(candidate)
+        sni_key = _candidate_sni_key(candidate)
+        if server_key and server_key in used_servers:
+            continue
+        if sni_key and sni_key in used_sni:
+            continue
+        chosen.append(candidate)
+        if server_key:
+            used_servers.add(server_key)
+        if sni_key:
+            used_sni.add(sni_key)
+        if len(chosen) >= max_candidates:
+            return chosen
+
+    for candidate in candidates:
+        identity = _candidate_identity_key(candidate)
+        if any(_candidate_identity_key(item) == identity for item in chosen):
+            continue
+        chosen.append(candidate)
+        if len(chosen) >= max_candidates:
+            return chosen
+    return chosen
 
 
 def _probe_candidate_with_timeout(payload: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
@@ -427,31 +583,46 @@ def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ru_lte_payload_score(payload: Dict[str, Any]) -> int:
     score = 0
+    transport = _payload_transport(payload)
+    security = _payload_security(payload)
     score += _ru_lte_transport_bonus(payload)
-    security = str(payload.get("security") or "").strip().lower()
     if security == "reality":
-        score += 30
+        score += 35
     elif security == "tls":
-        score += 20
+        score += 10
     if str(payload.get("flow") or "").strip().lower() == "xtls-rprx-vision":
-        score += 15
+        score += 20
+    elif transport == "tcp":
+        score -= 35
     remark = str(payload.get("remark") or "").lower()
     if "cidr" in remark:
         score += 20
-    if payload.get("server_name"):
-        score += 5
-    if payload.get("public_key") and payload.get("short_id"):
-        score += 5
+    if "mobile" in remark or "lte" in remark:
+        score += 15
+    if payload.get("server_name") or payload.get("sni"):
+        score += 10
+    if payload.get("public_key"):
+        score += 10
+    if payload.get("short_id"):
+        score += 8
+    if transport == "grpc" and payload.get("service_name"):
+        score += 12
+    if transport in {"ws", "websocket"} and payload.get("path"):
+        score += 10
+    quality_penalty = len(_candidate_quality_reasons(payload, pool="black" if security == "tls" else "ru_lte")) * 20
+    score -= quality_penalty
     latency = payload.get("_latency_ms")
     if isinstance(latency, int):
-        if latency <= 150:
-            score += 35
-        elif latency <= 300:
-            score += 20
+        if latency <= 120:
+            score += 40
+        elif latency <= 200:
+            score += 28
+        elif latency <= 350:
+            score += 15
         elif latency <= 600:
             score += 5
         else:
-            score -= 20
+            score -= 25
     if payload.get("_probe_ok"):
         score += 50
     return score
@@ -467,6 +638,10 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "ru-lte-reserve-1": ("Россия LTE | Резерв 1", "Russia LTE | Reserve 1", True),
         "ru-lte-reserve-2": ("Россия LTE | Резерв 2", "Russia LTE | Reserve 2", True),
         "ru-lte-reserve-3": ("Россия LTE | Резерв 3", "Russia LTE | Reserve 3", True),
+        "intl-fast": ("Fast / International", "Fast / International", False),
+        "intl-fast-reserve-1": ("Fast / International | Reserve 1", "Fast / International | Reserve 1", True),
+        "intl-fast-reserve-2": ("Fast / International | Reserve 2", "Fast / International | Reserve 2", True),
+        "intl-fast-reserve-3": ("Fast / International | Reserve 3", "Fast / International | Reserve 3", True),
     }
     if code not in default_names:
         return None
@@ -481,12 +656,12 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "code": code,
         "name_ru": str(updates.get("name_ru") or name_ru),
         "name_en": str(updates.get("name_en") or name_en),
-        "country_code": "RU",
+        "country_code": updates.get("country_code", "RU" if code.startswith("ru-lte") else None),
         "is_active": bool(updates.get("is_active", True)),
         "is_recommended": bool(updates.get("is_recommended", code == "ru-lte")),
         "is_reserve": bool(updates.get("is_reserve", is_reserve)),
         "status": str(updates.get("status") or "offline"),
-        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33}.get(code, 100)),
+        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82, "intl-fast-reserve-3": 83}.get(code, 100)),
         "vpn_payload": base_payload,
         "location_source": "catalog",
     }
@@ -498,9 +673,11 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     seen: set[str] = set()
     source_stats: List[Dict[str, Any]] = []
+    quality_rejected_total = 0
+    cooldown_skipped_total = 0
 
     for source in sources:
-        stat = {"source": source, "lines": 0, "accepted": 0, "error": None}
+        stat = {"source": source, "lines": 0, "accepted": 0, "quality_rejected": 0, "cooldown_skipped": 0, "error": None}
         try:
             content = _read_text_from_source(source)
             for line in content.splitlines():
@@ -508,22 +685,20 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 payload = _parse_vless_subscription_line(line)
                 if not payload:
                     continue
-                if str(payload.get("security") or "").strip().lower() != "reality":
-                    continue
                 normalized = _normalize_vpn_payload_keys(payload)
                 if not _config_is_complete(normalized):
                     continue
-                if not _ru_lte_transport_allowed(normalized):
+                reasons = _candidate_quality_reasons(normalized, pool="ru_lte")
+                if reasons:
+                    stat["quality_rejected"] += 1
+                    quality_rejected_total += 1
                     continue
-                key = "|".join([
-                    str(normalized.get("server") or ""),
-                    str(normalized.get("port") or ""),
-                    str(normalized.get("uuid") or ""),
-                    str(normalized.get("public_key") or ""),
-                    str(normalized.get("short_id") or ""),
-                    str(normalized.get("server_name") or normalized.get("sni") or ""),
-                ])
+                key = _candidate_identity_key(normalized)
                 if key in seen:
+                    continue
+                if _is_candidate_recently_dead("ru_lte", normalized):
+                    stat["cooldown_skipped"] += 1
+                    cooldown_skipped_total += 1
                     continue
                 seen.add(key)
                 normalized["_source"] = source
@@ -535,14 +710,17 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
             stat["error"] = str(exc)
         source_stats.append(stat)
 
-    candidates.sort(key=lambda item: (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), str(item.get("remark") or "")), reverse=True)
+    candidates.sort(key=_candidate_sort_key, reverse=True)
     test_limit = max(1, int(settings.RU_LTE_TEST_LIMIT or 40))
     tested: List[Dict[str, Any]] = []
+    probed_total = 0
     probe_errors = 0
     for candidate in candidates[:test_limit]:
+        probed_total += 1
         probe = _ru_lte_probe_candidate(candidate)
         if not probe.get("ok"):
             probe_errors += 1
+            _mark_candidate_dead("ru_lte", candidate)
             continue
         normalized = dict(candidate)
         normalized["_probe_ok"] = True
@@ -551,9 +729,38 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         tested.append(normalized)
 
     tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
-    top = tested[: max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))]
+    max_candidates = max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4))
+    top = _select_diverse_candidates(tested, max_candidates=max_candidates)[:max_candidates]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
+    selected_identities = {_candidate_identity_key(item) for item in top}
+    if len(top) < max_candidates:
+        for code in RU_LTE_LOCATION_CODES:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            if not existing_payload or not _config_is_complete(existing_payload):
+                continue
+            existing_payload = _normalize_vpn_payload_keys(existing_payload)
+            if _candidate_identity_key(existing_payload) in selected_identities:
+                continue
+            if not _is_candidate_strong(existing_payload, pool="ru_lte"):
+                continue
+            if _is_candidate_recently_dead("ru_lte", existing_payload):
+                continue
+            probe = _ru_lte_probe_candidate(existing_payload)
+            if not probe.get("ok"):
+                _mark_candidate_dead("ru_lte", existing_payload)
+                continue
+            existing_payload["_probe_ok"] = True
+            existing_payload["_latency_ms"] = int(probe.get("latency_ms") or existing.get("ping_ms") or 0)
+            existing_payload["_source_priority"] = -1
+            existing_payload["_score"] = _ru_lte_payload_score(existing_payload)
+            top.append(existing_payload)
+            selected_identities.add(_candidate_identity_key(existing_payload))
+            if len(top) >= max_candidates:
+                break
+        top = _select_diverse_candidates(top, max_candidates=max_candidates)[:max_candidates]
+
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
     remarks = {
@@ -588,28 +795,40 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "remark": payload.get("remark"),
                 "latency_ms": latency_ms,
                 "updated": bool(row),
-                "kept_old": False,
+                "kept_old": idx >= len(tested),
             })
         else:
             existing = existing_by_code.get(code) or {}
             existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            keep_old = False
             if existing_payload and _config_is_complete(existing_payload):
-                _patch_location_by_code(code, {
-                    "status": "online",
-                    "is_active": True,
-                    "is_recommended": code == "ru-lte",
-                    "is_reserve": code != "ru-lte",
-                })
-                assigned.append({
-                    "code": code,
-                    "server": existing_payload.get("server"),
-                    "transport": existing_payload.get("transport"),
-                    "remark": remarks.get(code, code),
-                    "latency_ms": existing.get("ping_ms"),
-                    "updated": True,
-                    "kept_old": True,
-                })
-            else:
+                existing_payload = _normalize_vpn_payload_keys(existing_payload)
+                if _is_candidate_strong(existing_payload, pool="ru_lte") and not _is_candidate_recently_dead("ru_lte", existing_payload):
+                    probe = _ru_lte_probe_candidate(existing_payload)
+                    if probe.get("ok"):
+                        _patch_location_by_code(code, {
+                            "status": "online",
+                            "is_active": True,
+                            "is_recommended": code == "ru-lte",
+                            "is_reserve": code != "ru-lte",
+                            "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "speed_checked_at": now_iso,
+                        })
+                        assigned.append({
+                            "code": code,
+                            "server": existing_payload.get("server"),
+                            "transport": existing_payload.get("transport"),
+                            "remark": remarks.get(code, code),
+                            "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "updated": True,
+                            "kept_old": True,
+                        })
+                        keep_old = True
+                    else:
+                        _mark_candidate_dead("ru_lte", existing_payload)
+                else:
+                    _mark_candidate_dead("ru_lte", existing_payload)
+            if not keep_old:
                 row = _patch_location_by_code(code, {
                     "status": "offline",
                     "is_active": True,
@@ -622,7 +841,9 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "ok": bool(top),
         "sources": source_stats,
         "candidates_total": len(candidates),
-        "tested_total": min(len(candidates), test_limit),
+        "quality_rejected_total": quality_rejected_total,
+        "cooldown_skipped_total": cooldown_skipped_total,
+        "tested_total": probed_total,
         "live_total": len(tested),
         "probe_errors": probe_errors,
         "selected": assigned,
@@ -637,9 +858,11 @@ def refresh_black_locations() -> Dict[str, Any]:
     candidates: List[Dict[str, Any]] = []
     seen: set[str] = set()
     source_stats: List[Dict[str, Any]] = []
+    quality_rejected_total = 0
+    cooldown_skipped_total = 0
 
     for source in sources:
-        stat = {"source": source, "lines": 0, "accepted": 0, "error": None}
+        stat = {"source": source, "lines": 0, "accepted": 0, "quality_rejected": 0, "cooldown_skipped": 0, "error": None}
         try:
             content = _read_text_from_source(source)
             for line in content.splitlines():
@@ -650,19 +873,17 @@ def refresh_black_locations() -> Dict[str, Any]:
                 normalized = _normalize_vpn_payload_keys(payload)
                 if not _config_is_complete(normalized):
                     continue
-                if not _black_transport_allowed(normalized):
+                reasons = _candidate_quality_reasons(normalized, pool="black")
+                if reasons:
+                    stat["quality_rejected"] += 1
+                    quality_rejected_total += 1
                     continue
-                key = "|".join([
-                    str(normalized.get("server") or ""),
-                    str(normalized.get("port") or ""),
-                    str(normalized.get("uuid") or ""),
-                    str(normalized.get("public_key") or ""),
-                    str(normalized.get("short_id") or ""),
-                    str(normalized.get("server_name") or normalized.get("sni") or ""),
-                    str(normalized.get("path") or ""),
-                    str(normalized.get("service_name") or ""),
-                ])
+                key = _candidate_identity_key(normalized)
                 if key in seen:
+                    continue
+                if _is_candidate_recently_dead("black", normalized):
+                    stat["cooldown_skipped"] += 1
+                    cooldown_skipped_total += 1
                     continue
                 seen.add(key)
                 normalized["_source"] = source
@@ -674,9 +895,10 @@ def refresh_black_locations() -> Dict[str, Any]:
             stat["error"] = str(exc)
         source_stats.append(stat)
 
-    candidates.sort(key=lambda item: (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), str(item.get("remark") or "")), reverse=True)
+    candidates.sort(key=_candidate_sort_key, reverse=True)
     test_limit = max(1, int(settings.BLACK_TEST_LIMIT or 40))
     tested: List[Dict[str, Any]] = []
+    probed_total = 0
     probe_errors = 0
     max_candidates = max(1, int(settings.BLACK_MAX_CANDIDATES or 4))
     probe_budget_seconds = max(8.0, min(float(settings.BLACK_AUTO_REFRESH_TIMEOUT_SEC or 600), 25.0))
@@ -686,9 +908,11 @@ def refresh_black_locations() -> Dict[str, Any]:
             break
         if (time.perf_counter() - probe_started) >= probe_budget_seconds:
             break
+        probed_total += 1
         probe = _black_probe_candidate(candidate)
         if not probe.get("ok"):
             probe_errors += 1
+            _mark_candidate_dead("black", candidate)
             continue
         normalized = dict(candidate)
         normalized["_probe_ok"] = True
@@ -697,9 +921,37 @@ def refresh_black_locations() -> Dict[str, Any]:
         tested.append(normalized)
 
     tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
-    top = tested[:max_candidates]
+    top = _select_diverse_candidates(tested, max_candidates=max_candidates)[:max_candidates]
 
     existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
+    selected_identities = {_candidate_identity_key(item) for item in top}
+    if len(top) < max_candidates:
+        for code in BLACK_LOCATION_CODES:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            if not existing_payload or not _config_is_complete(existing_payload):
+                continue
+            existing_payload = _normalize_vpn_payload_keys(existing_payload)
+            if _candidate_identity_key(existing_payload) in selected_identities:
+                continue
+            if not _is_candidate_strong(existing_payload, pool="black"):
+                continue
+            if _is_candidate_recently_dead("black", existing_payload):
+                continue
+            probe = _black_probe_candidate(existing_payload)
+            if not probe.get("ok"):
+                _mark_candidate_dead("black", existing_payload)
+                continue
+            existing_payload["_probe_ok"] = True
+            existing_payload["_latency_ms"] = int(probe.get("latency_ms") or existing.get("ping_ms") or 0)
+            existing_payload["_source_priority"] = -1
+            existing_payload["_score"] = _ru_lte_payload_score(existing_payload)
+            top.append(existing_payload)
+            selected_identities.add(_candidate_identity_key(existing_payload))
+            if len(top) >= max_candidates:
+                break
+        top = _select_diverse_candidates(top, max_candidates=max_candidates)[:max_candidates]
+
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
     remarks = {
@@ -738,32 +990,44 @@ def refresh_black_locations() -> Dict[str, Any]:
                 "remark": payload.get("remark"),
                 "latency_ms": latency_ms,
                 "updated": bool(row),
-                "kept_old": False,
+                "kept_old": idx >= len(tested),
             })
         else:
             existing = existing_by_code.get(code) or {}
             existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            keep_old = False
             if existing_payload and _config_is_complete(existing_payload):
-                _patch_location_by_code(code, {
-                    "name_ru": remarks.get(code, code),
-                    "name_en": remarks.get(code, code),
-                    "country_code": None,
-                    "status": "online",
-                    "is_active": True,
-                    "is_recommended": False,
-                    "is_reserve": code != "intl-fast",
-                })
-                assigned.append({
-                    "code": code,
-                    "server": existing_payload.get("server"),
-                    "transport": existing_payload.get("transport"),
-                    "security": existing_payload.get("security"),
-                    "remark": remarks.get(code, code),
-                    "latency_ms": existing.get("ping_ms"),
-                    "updated": True,
-                    "kept_old": True,
-                })
-            else:
+                existing_payload = _normalize_vpn_payload_keys(existing_payload)
+                if _is_candidate_strong(existing_payload, pool="black") and not _is_candidate_recently_dead("black", existing_payload):
+                    probe = _black_probe_candidate(existing_payload)
+                    if probe.get("ok"):
+                        _patch_location_by_code(code, {
+                            "name_ru": remarks.get(code, code),
+                            "name_en": remarks.get(code, code),
+                            "country_code": None,
+                            "status": "online",
+                            "is_active": True,
+                            "is_recommended": False,
+                            "is_reserve": code != "intl-fast",
+                            "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "speed_checked_at": now_iso,
+                        })
+                        assigned.append({
+                            "code": code,
+                            "server": existing_payload.get("server"),
+                            "transport": existing_payload.get("transport"),
+                            "security": existing_payload.get("security"),
+                            "remark": remarks.get(code, code),
+                            "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "updated": True,
+                            "kept_old": True,
+                        })
+                        keep_old = True
+                    else:
+                        _mark_candidate_dead("black", existing_payload)
+                else:
+                    _mark_candidate_dead("black", existing_payload)
+            if not keep_old:
                 row = _patch_location_by_code(code, {
                     "name_ru": remarks.get(code, code),
                     "name_en": remarks.get(code, code),
@@ -779,7 +1043,9 @@ def refresh_black_locations() -> Dict[str, Any]:
         "ok": bool(top),
         "sources": source_stats,
         "candidates_total": len(candidates),
-        "tested_total": min(len(candidates), test_limit),
+        "quality_rejected_total": quality_rejected_total,
+        "cooldown_skipped_total": cooldown_skipped_total,
+        "tested_total": probed_total,
         "live_total": len(tested),
         "probe_errors": probe_errors,
         "selected": assigned,
@@ -889,16 +1155,25 @@ def _run_ru_lte_refresh_safe(*, source: str = "manual") -> Dict[str, Any]:
 def _start_ru_lte_auto_refresh_loop() -> None:
     if not settings.RU_LTE_AUTO_REFRESH_ENABLED:
         return
-    interval_minutes = max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30))
-    timeout_seconds = max(60, int(settings.RU_LTE_AUTO_REFRESH_TIMEOUT_SEC or 600))
+    interval_seconds = max(60, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30) * 60)
+    retry_seconds = min(90, max(20, int(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4) * 10))
+    initial_delay = interval_seconds if settings.RU_LTE_REFRESH_ON_STARTUP else 0
 
     def worker() -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
         while True:
+            started = time.monotonic()
+            degraded = False
             try:
-                _run_ru_lte_refresh_safe(source="auto")
+                result = _run_ru_lte_refresh_safe(source="auto")
+                degraded = bool(result.get("selected_live_total", 0) < max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4)))
             except Exception as exc:
                 _set_ru_lte_refresh_error(exc)
-            time.sleep(timeout_seconds if timeout_seconds > interval_minutes * 60 else interval_minutes * 60)
+                degraded = True
+            elapsed = time.monotonic() - started
+            sleep_for = retry_seconds if degraded else interval_seconds
+            time.sleep(max(5.0, sleep_for - elapsed))
 
     thread = threading.Thread(target=worker, name="ru-lte-auto-refresh", daemon=True)
     thread.start()
@@ -926,16 +1201,25 @@ def _run_black_refresh_safe(*, source: str = "manual") -> Dict[str, Any]:
 def _start_black_auto_refresh_loop() -> None:
     if not settings.BLACK_AUTO_REFRESH_ENABLED:
         return
-    interval_minutes = max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30))
-    timeout_seconds = max(60, int(settings.BLACK_AUTO_REFRESH_TIMEOUT_SEC or 600))
+    interval_seconds = max(60, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30) * 60)
+    retry_seconds = min(120, max(30, int(settings.BLACK_CONNECT_TIMEOUT_SEC or 4) * 12))
+    initial_delay = interval_seconds if settings.BLACK_REFRESH_ON_STARTUP else 0
 
     def worker() -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
         while True:
+            started = time.monotonic()
+            degraded = False
             try:
-                _run_black_refresh_safe(source="auto")
+                result = _run_black_refresh_safe(source="auto")
+                degraded = bool(result.get("selected_live_total", 0) < max(1, int(settings.BLACK_MAX_CANDIDATES or 4)))
             except Exception as exc:
                 _set_black_refresh_error(exc)
-            time.sleep(timeout_seconds if timeout_seconds > interval_minutes * 60 else interval_minutes * 60)
+                degraded = True
+            elapsed = time.monotonic() - started
+            sleep_for = retry_seconds if degraded else interval_seconds
+            time.sleep(max(5.0, sleep_for - elapsed))
 
     thread = threading.Thread(target=worker, name="black-auto-refresh", daemon=True)
     thread.start()
