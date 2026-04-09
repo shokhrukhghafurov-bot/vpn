@@ -274,12 +274,12 @@ class Settings:
         if self.RU_LTE_SOURCE_URLS is None:
             self.RU_LTE_SOURCE_URLS = _env_list(
                 "RU_LTE_SOURCE_URLS",
-                "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
+                "sources/ru_lte/Vless-Reality-White-Lists-Rus-Mobile.txt,sources/ru_lte/Vless-Reality-White-Lists-Rus-Mobile-2.txt,sources/ru_lte/WHITE-CIDR-RU-checked.txt,sources/ru_lte/WHITE-CIDR-RU-all.txt",
             )
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
-                "https://cp.cloudflare.com/generate_204,https://www.gstatic.com/generate_204",
+                "https://www.vk.com/,https://ya.ru/",
             )
         if self.BLACK_ALLOWED_TRANSPORTS is None:
             self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
