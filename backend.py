@@ -743,8 +743,8 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
 
 
 def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
-    connect_timeout = max(2, int(settings.RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC or 6))
-    max_time = max(connect_timeout + 1, int(settings.RU_LTE_REAL_PROBE_MAX_TIME_SEC or 12))
+    connect_timeout = max(2, int(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
+    max_time = max(connect_timeout + 1, int(getattr(settings, "RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12) or 12))
     command = [
         "curl",
         "--silent",
@@ -797,7 +797,7 @@ def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
 
     _append(payload.get("host"))
     _append(payload.get("server_name") or payload.get("sni"))
-    for item in (settings.RU_LTE_REAL_PROBE_URLS or []):
+    for item in (getattr(settings, "RU_LTE_REAL_PROBE_URLS", []) or []):
         _append(item)
     return candidates
 
@@ -812,7 +812,7 @@ def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
     socks_port = _pick_free_local_port()
-    warmup_ms = max(0, int(settings.RU_LTE_REAL_PROBE_WARMUP_MS or 1200))
+    warmup_ms = max(0, int(getattr(settings, "RU_LTE_REAL_PROBE_WARMUP_MS", 1200) or 1200))
     process: Optional[subprocess.Popen[str]] = None
     stdout_tail = ""
     with tempfile.TemporaryDirectory(prefix="inet_ru_lte_probe_") as temp_dir:
@@ -831,7 +831,7 @@ def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str
                 stderr=subprocess.STDOUT,
                 text=True,
             )
-            if not _wait_for_local_socks_port(socks_port, max(2.0, float(settings.RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC or 6))):
+            if not _wait_for_local_socks_port(socks_port, max(2.0, float(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))):
                 if process.poll() is not None:
                     stdout_tail = (process.stdout.read() if process.stdout else "").strip()[-700:]
                     return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real"}
@@ -923,11 +923,11 @@ def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if bool(settings.RU_LTE_REAL_PROBE_ENABLED):
+    if bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)):
         real_probe = _probe_ru_lte_candidate_via_real_tunnel(payload)
         if real_probe.get("ok"):
             return real_probe
-        if bool(settings.RU_LTE_REAL_PROBE_REQUIRED):
+        if bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)):
             return real_probe
 
     fallback_probe = _probe_candidate_with_timeout(payload, float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
@@ -1216,8 +1216,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "live_total": len(tested),
         "reused_existing_total": reused_existing_total,
         "probe_errors": probe_errors,
-        "real_probe_enabled": bool(settings.RU_LTE_REAL_PROBE_ENABLED),
-        "real_probe_required": bool(settings.RU_LTE_REAL_PROBE_REQUIRED),
+        "real_probe_enabled": bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)),
+        "real_probe_required": bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)),
         "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
         "selected": assigned,
         "selected_live_total": len(selected_live),
