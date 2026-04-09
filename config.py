@@ -42,6 +42,16 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    value = os.getenv(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
+
+
 def _env_list(name: str, default: str = "") -> List[str]:
     value = os.getenv(name, default)
     return [item.strip() for item in value.split(",") if item.strip()]
@@ -222,7 +232,7 @@ class Settings:
     RU_LTE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_CONNECT_TIMEOUT_SEC", 4)
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
     HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS: List[str] = None
-    HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS: int = _env_int("HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1)
+    HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS: float = _env_float("HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)
 
     BLACK_SOURCE_URLS: List[str] = None
     BLACK_REFRESH_ON_STARTUP: bool = _env_bool("BLACK_REFRESH_ON_STARTUP", False)
