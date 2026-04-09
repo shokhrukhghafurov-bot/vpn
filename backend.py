@@ -2255,40 +2255,69 @@ def _selected_client_name() -> str:
     return "v2RayTun" if _selected_client_mode() == "v2raytun" else "Hiddify"
 
 
-def _selected_android_app_package() -> str:
-    if _selected_client_mode() == "v2raytun":
+def _normalize_target_platform(platform: Optional[str]) -> str:
+    raw = str(platform or "").strip().lower()
+    if raw in {"android"}:
+        return "android"
+    if raw in {"ios", "iphone", "ipad"}:
+        return "ios"
+    if raw in {"windows", "win"}:
+        return "windows"
+    if raw in {"macos", "mac", "osx", "darwin"}:
+        return "macos"
+    if raw == "linux":
+        return "linux"
+    return "client"
+
+
+def _client_mode_for_platform(platform: Optional[str]) -> str:
+    normalized = _normalize_target_platform(platform)
+    if normalized in {"windows", "macos"}:
+        return "happ"
+    return _selected_client_mode()
+
+
+def _client_name_for_platform(platform: Optional[str]) -> str:
+    mode = _client_mode_for_platform(platform)
+    if mode == "happ":
+        return "Happ"
+    return "v2RayTun" if mode == "v2raytun" else "Hiddify"
+
+
+def _selected_android_app_package(platform: Optional[str] = None) -> str:
+    mode = _client_mode_for_platform(platform or "android")
+    if mode == "v2raytun":
         return str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip()
     return str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip()
 
 
 def _selected_platform_store_url(platform: str) -> str:
-    key = str(platform or "").strip().lower()
-    mode = _selected_client_mode()
+    key = _normalize_target_platform(platform)
+    mode = _client_mode_for_platform(key)
+    if key == "windows":
+        return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
+    if key == "macos":
+        return str(getattr(settings, "HAPP_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip()
     if mode == "v2raytun":
         if key == "android":
             return str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip()
-        if key in {"ios", "iphone", "ipad"}:
+        if key in {"ios"}:
             return str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip()
-        if key == "windows":
-            return str(getattr(settings, "V2RAYTUN_WINDOWS_APP_URL", "") or "").strip()
-        if key in {"macos", "mac", "osx"}:
-            return str(getattr(settings, "V2RAYTUN_MACOS_APP_URL", "") or "").strip()
     if key == "android":
         return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
-    if key in {"ios", "iphone", "ipad"}:
+    if key in {"ios"}:
         return str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip()
-    if key == "windows":
-        return str(getattr(settings, "HIDDIFY_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
-    if key in {"macos", "mac", "osx"}:
-        return str(getattr(settings, "HIDDIFY_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip()
-    return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+    return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
 
 
-def _build_native_import_url(subscription_url: Optional[str]) -> str:
+def _build_native_import_url(subscription_url: Optional[str], platform: Optional[str] = None) -> str:
     clean_url = str(subscription_url or "").strip()
     if not clean_url:
         return ""
-    if _selected_client_mode() == "v2raytun":
+    mode = _client_mode_for_platform(platform)
+    if mode == "happ":
+        return ""
+    if mode == "v2raytun":
         return f"v2raytun://import/{quote(clean_url, safe=':/?&=%#')}"
     import_name = str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip()
     return f"hiddify://import/{quote(clean_url, safe=':/?&=%')}#{quote(import_name, safe='')}"
@@ -2327,13 +2356,13 @@ def _subscription_public_url(request: Optional[Request] = None, token: Optional[
     return _subscription_public_url_from_base(settings.BACKEND_BASE_URL, clean_token)
 
 
-def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None, platform: Optional[str] = None) -> str:
     del lang
     subscription_url = _subscription_public_url(request, token=token, code=code)
-    return _build_native_import_url(subscription_url)
+    return _build_native_import_url(subscription_url, platform=platform)
 
 
-def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None) -> str:
+def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None, platform: Optional[str] = None) -> str:
     bridge = (settings.OPEN_APP_BRIDGE_URL or "").strip()
     if bridge:
         parts = urlsplit(bridge)
@@ -2344,6 +2373,8 @@ def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, 
             query["token"] = token
         if lang:
             query["lang"] = lang
+        if platform:
+            query["platform"] = _normalize_target_platform(platform)
         return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
 
     try:
@@ -2357,11 +2388,13 @@ def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, 
             query["token"] = token
         if lang:
             query["lang"] = lang
+        if platform:
+            query["platform"] = _normalize_target_platform(platform)
         return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
 
 
-def _detect_android_app_package() -> str:
-    explicit = _selected_android_app_package()
+def _detect_android_app_package(platform: Optional[str] = None) -> str:
+    explicit = _selected_android_app_package(platform=platform)
     if explicit:
         return explicit
     parsed = urlsplit(_selected_platform_store_url("android"))
@@ -2793,40 +2826,52 @@ def open_app_bridge(
     code: Optional[str] = Query(default=None),
     token: Optional[str] = Query(default=None),
     lang: str = Query(default="ru"),
+    platform: Optional[str] = Query(default=None),
 ) -> HTMLResponse:
     norm_lang = "en" if lang == "en" else "ru"
-    client_mode = _selected_client_mode()
-    client_name = _selected_client_name()
+    detected_platform, _ = _detect_device_platform_and_name(request)
+    target_platform = _normalize_target_platform(platform or detected_platform)
+    client_mode = _client_mode_for_platform(target_platform)
+    client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
-    native_url = _build_native_open_app_url(request=request, code=code, token=active_token, lang=norm_lang) if active_token else ""
+    native_url = _build_native_open_app_url(request=request, code=code, token=active_token, lang=norm_lang, platform=target_platform) if active_token else ""
+    supports_native_launch = bool(native_url)
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     bot_url = _bot_public_url()
     page_text = {
         "ru": {
             "title": f"Подключение через {client_name}",
-            "headline": f"Открываем {client_name}…",
-            "body": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
+            "headline": f"Подключение через {client_name}",
+            "body_auto": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
+            "body_manual": f"Для {client_name} на этой платформе используйте ручной импорт: скопируйте персональную ссылку ниже и добавьте её в приложение как Subscription / URL. Токен уже зашит в ссылку.",
             "invalid_link": "Ссылка недействительна или срок доступа истёк. Вернитесь в бота и купите подписку.",
             "open_button": f"Открыть в {client_name}",
-            "android_button": f"Скачать {client_name} для Android",
-            "ios_button": f"Скачать {client_name} для iPhone / iPad",
-            "windows_button": f"Скачать {client_name} для Windows",
-            "macos_button": f"Скачать {client_name} для macOS",
+            "copy_button": f"Скопировать ссылку для {client_name}",
+            "android_button": f"Скачать {_client_name_for_platform('android')} для Android",
+            "ios_button": f"Скачать {_client_name_for_platform('ios')} для iPhone / iPad",
+            "windows_button": "Скачать Happ для Windows",
+            "macos_button": "Скачать Happ для macOS",
             "copy_label": "Персональная ссылка подписки",
+            "copy_done": "Ссылка подписки скопирована.",
+            "copy_failed": "Не удалось скопировать автоматически. Скопируйте ссылку ниже вручную.",
             "bot_button": "Вернуться в бота",
         },
         "en": {
             "title": f"Connect with {client_name}",
-            "headline": f"Opening {client_name}…",
-            "body": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
+            "headline": f"Connect with {client_name}",
+            "body_auto": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
+            "body_manual": f"On this platform, use manual import for {client_name}: copy the personal subscription link below and add it inside the app as Subscription / URL. The token is already embedded in the link.",
             "invalid_link": "This link is invalid or access has expired. Return to the bot and buy a subscription.",
             "open_button": f"Open in {client_name}",
-            "android_button": f"Download {client_name} for Android",
-            "ios_button": f"Download {client_name} for iPhone / iPad",
-            "windows_button": f"Download {client_name} for Windows",
-            "macos_button": f"Download {client_name} for macOS",
+            "copy_button": f"Copy link for {client_name}",
+            "android_button": f"Download {_client_name_for_platform('android')} for Android",
+            "ios_button": f"Download {_client_name_for_platform('ios')} for iPhone / iPad",
+            "windows_button": "Download Happ for Windows",
+            "macos_button": "Download Happ for macOS",
             "copy_label": "Personal subscription link",
+            "copy_done": "Subscription link copied.",
+            "copy_failed": "Could not copy automatically. Copy the link below manually.",
             "bot_button": "Back to bot",
         },
     }[norm_lang]
@@ -2837,6 +2882,9 @@ def open_app_bridge(
     native_url_js = json.dumps(native_url)
     subscription_url_js = json.dumps(subscription_url or "")
     client_mode_js = json.dumps(client_mode)
+    supports_native_launch_js = json.dumps(supports_native_launch)
+    copy_done_js = json.dumps(page_text["copy_done"])
+    copy_failed_js = json.dumps(page_text["copy_failed"])
     import_name_js = json.dumps(str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip())
     android_intent_url = _build_android_intent_url(native_url)
     android_intent_url_js = json.dumps(android_intent_url)
@@ -2853,9 +2901,9 @@ def open_app_bridge(
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
-    body_value = page_text["body"] if subscription_url else page_text["invalid_link"]
+    body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
     body = html.escape(body_value)
-    open_button = html.escape(page_text["open_button"])
+    open_button = html.escape(page_text["open_button"] if supports_native_launch else page_text["copy_button"])
     android_button = html.escape(page_text["android_button"])
     ios_button = html.escape(page_text["ios_button"])
     windows_button = html.escape(page_text["windows_button"])
@@ -2904,10 +2952,14 @@ def open_app_bridge(
       const initialNativeUrl = {native_url_js};
       const baseSubscriptionUrl = {subscription_url_js};
       const clientMode = {client_mode_js};
+      const supportsNativeLaunch = {supports_native_launch_js};
       const importName = {import_name_js};
+      const copyDoneText = {copy_done_js};
+      const copyFailedText = {copy_failed_js};
       const androidStoreUrl = {android_url_js};
       const iosStoreUrl = {ios_url_js};
       const primaryButton = document.querySelector('.btn-primary');
+      const buttonDefaultText = primaryButton ? primaryButton.textContent : '';
       const subscriptionCode = document.getElementById('subscription-link-value');
       const userAgent = navigator.userAgent || '';
       const isAndroid = /Android/i.test(userAgent);
@@ -2952,6 +3004,9 @@ def open_app_bridge(
       const buildNativeUrl = function () {{
         const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
         if (!trackedSubscriptionUrl) return initialNativeUrl || '';
+        if (clientMode === 'happ') {{
+          return '';
+        }}
         if (clientMode === 'v2raytun') {{
           return 'v2raytun://import/' + encodeURIComponent(trackedSubscriptionUrl);
         }}
@@ -2965,7 +3020,7 @@ def open_app_bridge(
       const currentAndroidIntentUrl = function () {{
         const nativeUrl = currentNativeUrl();
         if (!nativeUrl || !isAndroid) return '';
-        const packageId = {json.dumps(_detect_android_app_package())};
+        const packageId = {json.dumps(_detect_android_app_package(platform=target_platform))};
         if (!packageId) return '';
         try {{
           const parsed = new URL(nativeUrl);
@@ -2990,6 +3045,38 @@ def open_app_bridge(
         }}, 250);
       }};
 
+      const copySubscriptionLink = async function () {{
+        const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
+        if (!trackedSubscriptionUrl) return false;
+        try {{
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            await navigator.clipboard.writeText(trackedSubscriptionUrl);
+          }} else {{
+            const temp = document.createElement('textarea');
+            temp.value = trackedSubscriptionUrl;
+            temp.setAttribute('readonly', 'readonly');
+            temp.style.position = 'fixed';
+            temp.style.opacity = '0';
+            document.body.appendChild(temp);
+            temp.focus();
+            temp.select();
+            document.execCommand('copy');
+            temp.remove();
+          }}
+          if (primaryButton) primaryButton.textContent = copyDoneText;
+          window.setTimeout(function () {{
+            if (primaryButton) primaryButton.textContent = buttonDefaultText;
+          }}, 1600);
+          return true;
+        }} catch (error) {{
+          if (primaryButton) primaryButton.textContent = copyFailedText;
+          window.setTimeout(function () {{
+            if (primaryButton) primaryButton.textContent = buttonDefaultText;
+          }}, 1800);
+          return false;
+        }}
+      }};
+
       const openStoreIfNeeded = function () {{
         if (Date.now() - hiddenAt < 1200) {{
           return;
@@ -3001,6 +3088,10 @@ def open_app_bridge(
       }};
 
       const tryOpen = function () {{
+        if (!supportsNativeLaunch) {{
+          copySubscriptionLink();
+          return;
+        }}
         const nativeUrl = currentNativeUrl();
         if (!nativeUrl) return;
         if (primaryButton) {{
@@ -3033,9 +3124,11 @@ def open_app_bridge(
         subscriptionCode.textContent = buildTrackedSubscriptionUrl() || subscriptionCode.textContent || '';
       }}
       if (primaryButton) {{
-        primaryButton.href = currentNativeUrl() || primaryButton.href;
+        primaryButton.href = currentNativeUrl() || '#';
       }}
-      window.setTimeout(tryOpen, 80);
+      if (supportsNativeLaunch) {{
+        window.setTimeout(tryOpen, 80);
+      }}
       primaryButton?.addEventListener('click', function (event) {{
         event.preventDefault();
         tryOpen();
@@ -3171,6 +3264,10 @@ def app_config() -> Dict[str, Any]:
         "payments_enabled": settings.PAYMENTS_ENABLED,
         "client_mode": _selected_client_mode(),
         "client_name": _selected_client_name(),
+        "mobile_client_mode": _selected_client_mode(),
+        "mobile_client_name": _selected_client_name(),
+        "desktop_client_mode": "happ",
+        "desktop_client_name": "Happ",
         "android_app_url": _selected_platform_store_url("android"),
         "ios_app_url": _selected_platform_store_url("ios"),
         "windows_app_url": _selected_platform_store_url("windows"),
