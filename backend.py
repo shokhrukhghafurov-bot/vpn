@@ -19,7 +19,7 @@ from psycopg.rows import dict_row
 from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
 from pydantic import BaseModel, Field
 
@@ -820,6 +820,46 @@ _LOCATIONS_CACHE_TTL_SEC = 15
 _locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
 _ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
 _black_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+
+
+def _json_no_cache_headers(*, etag_seed: Optional[str] = None) -> Dict[str, str]:
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    if etag_seed is not None:
+        headers["ETag"] = f'W/"{hashlib.sha256(etag_seed.encode("utf-8")).hexdigest()}"'
+    return headers
+
+
+def _runtime_config_version() -> str:
+    parts: List[str] = []
+    for row in list_locations(active_only=False):
+        code = str(row.get("code") or "").strip()
+        updated_at = str(row.get("updated_at") or "").strip()
+        status = str(row.get("status") or "").strip().lower()
+        is_active = "1" if bool(row.get("is_active")) else "0"
+        is_deleted = "1" if bool(row.get("is_deleted")) else "0"
+        payload = _compose_vpn_payload_for_location(dict(row)) or {}
+        payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        parts.append("|".join([code, updated_at, status, is_active, is_deleted, payload_json]))
+    digest = hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()
+    return digest
+
+
+def _config_version_payload() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "version": _runtime_config_version(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "locations_cache_ttl_sec": int(_LOCATIONS_CACHE_TTL_SEC),
+        "supports": {
+            "sync": True,
+            "vpn_config": True,
+            "subscription": True,
+        },
+    }
 
 
 def _invalidate_locations_cache() -> None:
@@ -2114,22 +2154,45 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
     return {"ok": True, "device": item}
 
 
+@app.get("/config/version")
+def config_version() -> JSONResponse:
+    payload = _config_version_payload()
+    version = str(payload.get("version") or "")
+    return JSONResponse(content=payload, headers=_json_no_cache_headers(etag_seed=version))
+
+
+@app.get("/sync")
+def sync_state(user: Dict[str, Any] = Depends(get_current_user)) -> JSONResponse:
+    items = _cached_locations_payload()
+    payload = {
+        **_config_version_payload(),
+        "user_id": int(user["id"]),
+        "items": items,
+    }
+    version = str(payload.get("version") or "")
+    return JSONResponse(content=payload, headers=_json_no_cache_headers(etag_seed=version))
+
+
 @app.get("/locations")
-def locations() -> Dict[str, Any]:
-    return {"ok": True, "items": _cached_locations_payload()}
+def locations() -> JSONResponse:
+    items = _cached_locations_payload()
+    seed = json.dumps(items, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return JSONResponse(content={"ok": True, "items": items}, headers=_json_no_cache_headers(etag_seed=seed))
 
 
 @app.get("/locations/status")
-def locations_status() -> Dict[str, Any]:
-    items = _cached_locations_payload()
-    return {"ok": True, "items": [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in items]}
+def locations_status() -> JSONResponse:
+    items = [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in _cached_locations_payload()]
+    seed = json.dumps(items, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return JSONResponse(content={"ok": True, "items": items}, headers=_json_no_cache_headers(etag_seed=seed))
 
 
 @app.get("/vpn/config/{location_code}")
-def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> JSONResponse:
     try:
         config = get_vpn_config_for_user(user["id"], location_code)
-        return {"ok": True, "config": config}
+        seed = json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return JSONResponse(content={"ok": True, "config": config}, headers=_json_no_cache_headers(etag_seed=seed))
     except PermissionError as exc:
         raise HTTPException(status_code=403, detail=str(exc)) from exc
     except ValueError as exc:
