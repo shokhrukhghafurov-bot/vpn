@@ -2375,10 +2375,11 @@ def enqueue_notification(user_id: int, event_type: str, unique_key: str, payload
 
 
 def purge_stale_subscription_notifications() -> None:
+    warning_hours = max(1, int(getattr(settings, "SUBSCRIPTION_WARNING_HOURS", 12) or 12))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                """
+                f"""
                 DELETE FROM bot_notifications n
                 WHERE n.sent_at IS NULL
                   AND n.event_type = 'subscription_expiring'
@@ -2392,6 +2393,29 @@ def purge_stale_subscription_notifications() -> None:
                       ) latest
                       WHERE latest.user_id = n.user_id
                         AND latest.expires_at <= NOW() + INTERVAL '1 day'
+                        AND latest.id = CASE
+                            WHEN COALESCE(n.payload->>'subscription_id', '') ~ '^[0-9]+$'
+                                THEN (n.payload->>'subscription_id')::BIGINT
+                            ELSE NULL
+                        END
+                  )
+                """
+            )
+            cur.execute(
+                f"""
+                DELETE FROM bot_notifications n
+                WHERE n.sent_at IS NULL
+                  AND n.event_type = 'subscription_expiring_12h'
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM (
+                          SELECT DISTINCT ON (s.user_id) s.id, s.user_id, s.expires_at
+                          FROM subscriptions s
+                          WHERE s.status = 'active' AND s.expires_at > NOW()
+                          ORDER BY s.user_id, s.expires_at DESC, s.id DESC
+                      ) latest
+                      WHERE latest.user_id = n.user_id
+                        AND latest.expires_at <= NOW() + INTERVAL '{warning_hours} hour'
                         AND latest.id = CASE
                             WHEN COALESCE(n.payload->>'subscription_id', '') ~ '^[0-9]+$'
                                 THEN (n.payload->>'subscription_id')::BIGINT
@@ -2420,8 +2444,7 @@ def purge_stale_subscription_notifications() -> None:
 def enqueue_subscription_notifications() -> None:
     refresh_subscription_statuses()
     purge_stale_subscription_notifications()
-    now = now_utc()
-    soon = now + timedelta(days=1)
+    warning_hours = max(1, int(getattr(settings, "SUBSCRIPTION_WARNING_HOURS", 12) or 12))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
@@ -2439,6 +2462,21 @@ def enqueue_subscription_notifications() -> None:
                 """
             )
             expiring = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                f"""
+                SELECT latest.id, latest.user_id, latest.expires_at, latest.plan_code, latest.name_ru, latest.name_en, latest.duration_days, latest.device_limit
+                FROM (
+                    SELECT DISTINCT ON (s.user_id)
+                        s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
+                    FROM subscriptions s
+                    JOIN plans p ON p.id = s.plan_id
+                    WHERE s.status = 'active' AND s.expires_at > NOW()
+                    ORDER BY s.user_id, s.expires_at DESC, s.id DESC
+                ) latest
+                WHERE latest.expires_at <= NOW() + INTERVAL '{warning_hours} hour'
+                """
+            )
+            expiring_critical = [dict(row) for row in cur.fetchall()]
             cur.execute(
                 """
                 SELECT DISTINCT ON (s.user_id)
@@ -2471,6 +2509,23 @@ def enqueue_subscription_notifications() -> None:
                 "plan_name_en": row["name_en"],
                 "duration_days": int(row["duration_days"]),
                 "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
+            },
+        )
+    for row in expiring_critical:
+        user = get_user_by_id(int(row["user_id"])) or {}
+        enqueue_notification(
+            user_id=row["user_id"],
+            event_type="subscription_expiring_12h",
+            unique_key=f"subscription_expiring_12h:{row['id']}",
+            payload={
+                "subscription_id": row["id"],
+                "expires_at": row["expires_at"].isoformat(),
+                "plan_code": row["plan_code"],
+                "plan_name_ru": row["name_ru"],
+                "plan_name_en": row["name_en"],
+                "duration_days": int(row["duration_days"]),
+                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
+                "warning_hours": warning_hours,
             },
         )
     for row in expired:
