@@ -3,6 +3,7 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
 import base64
 import hashlib
+import ipaddress
 import html
 import json
 import secrets
@@ -2527,31 +2528,122 @@ def _detect_device_platform_and_name(request: Request) -> Tuple[str, str]:
 
 
 
+def _is_public_ip_address(value: Optional[str]) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_reserved or parsed.is_multicast or parsed.is_unspecified:
+        return False
+    return True
+
+
+
 def _client_ip_from_request(request: Request) -> str:
     for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
         raw = str(request.headers.get(header_name) or "").strip()
-        if raw:
-            return raw.split(",", 1)[0].strip()
+        if not raw:
+            continue
+        candidate = raw.split(",", 1)[0].strip()
+        if _is_public_ip_address(candidate):
+            return candidate
     client = getattr(request, "client", None)
-    host = getattr(client, "host", None)
-    return str(host or "").strip()
+    host = str(getattr(client, "host", None) or "").strip()
+    if _is_public_ip_address(host):
+        return host
+    return ""
+
+
+
+def _subscription_client_id_from_request(request: Request) -> str:
+    return _sanitize_tracking_value(
+        request.query_params.get("cid")
+        or request.headers.get("x-client-id")
+        or request.cookies.get("inet_sub_cid"),
+        max_len=120,
+    )
+
+
+
+def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    if normalized_client_id:
+        return (f"cid:{normalized_client_id}", "client_id")
+    user_agent = str(request.headers.get("user-agent") or "").strip()
+    accept_language = str(request.headers.get("accept-language") or "").strip()
+    sec_ch_ua = str(request.headers.get("sec-ch-ua") or "").strip()
+    sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
+    sec_mobile = str(request.headers.get("sec-ch-ua-mobile") or "").strip()
+    client_ip = _client_ip_from_request(request)
+    parts = [user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile]
+    normalized_parts = [part.strip() for part in parts if part and part.strip()]
+    if client_ip:
+        normalized_parts.append(client_ip)
+    if not normalized_parts:
+        return None
+    return ("fallback:" + "|".join(normalized_parts), "fallback")
 
 
 
 def _build_subscription_device_fingerprint(request: Request, token: str, client_id: Optional[str] = None) -> Optional[str]:
-    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
-    if normalized_client_id:
-        source = f"cid:{normalized_client_id}"
-    else:
-        user_agent = str(request.headers.get("user-agent") or "").strip()
-        accept_language = str(request.headers.get("accept-language") or "").strip()
-        sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
-        client_ip = _client_ip_from_request(request)
-        parts = [user_agent, accept_language, sec_platform, client_ip]
-        if not any(part.strip() for part in parts):
-            return None
-        source = "fallback:" + "|".join(part.strip() for part in parts)
-    return hashlib.sha256(f"sub-device:v2:{token}:{source}".encode("utf-8")).hexdigest()
+    fingerprint_source = _subscription_fingerprint_source(request, token, client_id)
+    if not fingerprint_source:
+        return None
+    source, _ = fingerprint_source
+    return hashlib.sha256(f"sub-device:v3:{token}:{source}".encode("utf-8")).hexdigest()
+
+
+
+def _subscription_cookie_value(request: Request, token: str) -> str:
+    current = _subscription_client_id_from_request(request)
+    if current:
+        return current
+    ua = str(request.headers.get("user-agent") or "").strip()
+    platform, _ = _detect_device_platform_and_name(request)
+    seed = f"{token}|{platform}|{ua}|{uuid4().hex}"
+    return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+
+def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, Any]], gate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not gate or gate.get("allowed"):
+        return gate
+    if not access or access.get("kind") != "user":
+        return gate
+    if _subscription_client_id_from_request(request):
+        return gate
+    used = int(gate.get("devices_used") or 0)
+    limit = int(gate.get("device_limit") or 0)
+    if limit <= 0 or used <= limit:
+        return gate
+    platform, device_name = _detect_device_platform_and_name(request)
+    if platform not in {"windows", "macos", "linux"}:
+        return gate
+    user = access.get("user") or {}
+    user_id = int(user.get("id") or 0)
+    if user_id <= 0:
+        return gate
+    try:
+        view = get_user_subscription_view(user_id)
+    except Exception:
+        return gate
+    devices = list(view.get("devices") or [])
+    soft_match = any(
+        str(item.get("platform") or "").strip().lower() == platform
+        or str(item.get("device_name") or "").strip() == device_name
+        for item in devices
+    )
+    if not soft_match:
+        return gate
+    relaxed = dict(gate)
+    relaxed["allowed"] = True
+    relaxed["known_device"] = True
+    relaxed["reason"] = "desktop_soft_match"
+    relaxed["detail"] = "Desktop subscription refresh allowed by platform match"
+    return relaxed
 
 
 
@@ -2561,7 +2653,7 @@ def _track_subscription_device_access(request: Request, token: str, access: Opti
     user = access.get("user") or {}
     if not user or user.get("status") == "blocked":
         return
-    client_id = request.query_params.get("cid") or request.headers.get("x-client-id")
+    client_id = _subscription_client_id_from_request(request)
     fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
     if not fingerprint:
         return
@@ -2579,14 +2671,15 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
     user = access.get("user") or {}
     if not user or user.get("status") == "blocked":
         return None
-    client_id = request.query_params.get("cid") or request.headers.get("x-client-id")
+    client_id = _subscription_client_id_from_request(request)
     fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
     if not fingerprint:
         return None
     try:
-        return get_subscription_device_gate_by_token(token, fingerprint)
+        gate = get_subscription_device_gate_by_token(token, fingerprint)
     except Exception:
         return None
+    return _subscription_soft_gate_allow(request, access, gate)
 
 
 
@@ -2863,9 +2956,19 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         "x-subscription-version": content_version,
         "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
     }
-    if head_only:
-        return Response(status_code=200, headers=headers)
-    return Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+    response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+    try:
+        response.set_cookie(
+            key="inet_sub_cid",
+            value=_subscription_cookie_value(request, token),
+            max_age=31536000,
+            httponly=False,
+            samesite="lax",
+            secure=str(request.url.scheme).lower() == "https",
+        )
+    except Exception:
+        pass
+    return response
 
 
 @app.get("/sub/{token}")
