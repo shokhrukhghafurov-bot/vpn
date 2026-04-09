@@ -98,6 +98,28 @@ def _normalize_android_package(value: str) -> str:
     return raw
 
 
+def _vpn_configs_repo_raw_base() -> str:
+    return (os.getenv("VPN_CONFIGS_REPO_RAW_BASE", "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main") or "").strip().rstrip("/")
+
+
+def _default_ru_lte_source_urls() -> str:
+    base = _vpn_configs_repo_raw_base()
+    return ",".join([
+        f"{base}/Vless-Reality-White-Lists-Rus-Mobile.txt",
+        f"{base}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+        f"{base}/WHITE-CIDR-RU-checked.txt",
+        f"{base}/WHITE-CIDR-RU-all.txt",
+    ])
+
+
+def _default_black_source_urls() -> str:
+    base = _vpn_configs_repo_raw_base()
+    return ",".join([
+        f"{base}/BLACK_VLESS_RUS_mobile.txt",
+        f"{base}/BLACK_VLESS_RUS.txt",
+    ])
+
+
 @dataclass
 class Settings:
     PORT: int = _env_int("PORT", 3000)
@@ -274,7 +296,7 @@ class Settings:
         if self.RU_LTE_SOURCE_URLS is None:
             self.RU_LTE_SOURCE_URLS = _env_list(
                 "RU_LTE_SOURCE_URLS",
-                "sources/ru_lte/Vless-Reality-White-Lists-Rus-Mobile.txt,sources/ru_lte/Vless-Reality-White-Lists-Rus-Mobile-2.txt,sources/ru_lte/WHITE-CIDR-RU-checked.txt,sources/ru_lte/WHITE-CIDR-RU-all.txt",
+                _default_ru_lte_source_urls(),
             )
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
@@ -286,7 +308,7 @@ class Settings:
         if self.BLACK_SOURCE_URLS is None:
             self.BLACK_SOURCE_URLS = _env_list(
                 "BLACK_SOURCE_URLS",
-                "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt",
+                _default_black_source_urls(),
             )
 
     def default_vpn_payload(self) -> Dict[str, Any]:
