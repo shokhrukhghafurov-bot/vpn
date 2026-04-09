@@ -2516,6 +2516,47 @@ def _hiddify_profile_update_interval_header_value() -> str:
     return str(normalized_hours)
 
 
+def _subscription_cache_buster_url(request: Optional[Request], token: str, content_version: str) -> Optional[str]:
+    base_url = _subscription_public_url(request, token=token)
+    if not base_url:
+        return None
+    version = str(content_version or "").strip()
+    if not version:
+        return base_url
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["cid"] = version[:16]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _subscription_inline_comment_headers(
+    *,
+    profile_title: str,
+    update_interval_hours: str,
+    subscription_userinfo: str,
+    support_url: str,
+    profile_web_page_url: str,
+    moved_permanently_to_url: Optional[str],
+    content_version: str,
+) -> List[str]:
+    title_b64 = base64.b64encode(profile_title.encode("utf-8")).decode("ascii")
+    lines: List[str] = [
+        f"#profile-title: base64:{title_b64}",
+        f"#profile-update-interval: {update_interval_hours}",
+        f"#subscription-userinfo: {subscription_userinfo}",
+    ]
+    if support_url:
+        lines.append(f"#support-url: {support_url}")
+    if profile_web_page_url:
+        lines.append(f"#profile-web-page-url: {profile_web_page_url}")
+    if moved_permanently_to_url:
+        lines.append(f"#moved-permanently-to: {moved_permanently_to_url}")
+    version = str(content_version or "").strip()
+    if version:
+        lines.append(f"#x-subscription-version: {version[:16]}")
+    return lines[:10]
+
+
 def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     if value is None:
         return None
@@ -2574,7 +2615,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
 
     content = "\n".join(lines) + "\n"
-    content_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
     last_modified_dt: Optional[datetime] = None
     for row in rows:
         raw_updated = row.get("updated_at")
@@ -2592,22 +2633,42 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     if last_modified_dt is None:
         last_modified_dt = datetime.now(timezone.utc)
     profile_web_page_url = str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
+    support_url = str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+    update_interval_hours = _hiddify_profile_update_interval_header_value()
+    subscription_userinfo = f"upload=0; download=0; total=0; expire={expires_ts}"
+    moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
+    inline_headers = _subscription_inline_comment_headers(
+        profile_title=profile_title,
+        update_interval_hours=update_interval_hours,
+        subscription_userinfo=subscription_userinfo,
+        support_url=support_url,
+        profile_web_page_url=profile_web_page_url,
+        moved_permanently_to_url=moved_permanently_to_url,
+        content_version=content_version,
+    )
+    content = "\n".join(inline_headers + lines) + "\n"
+    response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
         "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
-        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
-        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0, s-maxage=0",
-        "CDN-Cache-Control": "no-store",
+        "Subscription-Userinfo": subscription_userinfo,
+        "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
+        "CDN-Cache-Control": "no-store, no-cache, max-age=0",
+        "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
         "Surrogate-Control": "no-store",
         "Pragma": "no-cache",
         "Expires": "0",
-        "ETag": f'W/"{content_etag}"',
+        "ETag": f'W/"{response_etag}"',
         "Last-Modified": _http_date_from_datetime(last_modified_dt) or "",
-        "profile-update-interval": _hiddify_profile_update_interval_header_value(),
-        "support-url": str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip(),
+        "Vary": "*",
+        "X-Accel-Expires": "0",
+        "profile-update-interval": update_interval_hours,
+        "support-url": support_url,
         "profile-web-page-url": profile_web_page_url,
+        "moved-permanently-to": moved_permanently_to_url or "",
         "x-hiddify-source": "subscription",
-        "x-subscription-version": content_etag,
+        "x-subscription-version": content_version,
+        "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
     }
     if head_only:
         return Response(status_code=200, headers=headers)
