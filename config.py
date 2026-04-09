@@ -304,9 +304,9 @@ class Settings:
         if self.VLESS_ALPN is None:
             self.VLESS_ALPN = _env_list("VLESS_ALPN", "")
         if self.RU_LTE_ALLOWED_TRANSPORTS is None:
-            self.RU_LTE_ALLOWED_TRANSPORTS = _env_list("RU_LTE_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
+            self.RU_LTE_ALLOWED_TRANSPORTS = _env_list("RU_LTE_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
         if self.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS is None:
-            self.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS = _env_list("HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
+            self.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS = _env_list("HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
         if self.RU_LTE_SOURCE_URLS is None:
             self.RU_LTE_SOURCE_URLS = _env_list(
                 "RU_LTE_SOURCE_URLS",
@@ -318,7 +318,7 @@ class Settings:
                 "https://www.vk.com/,https://ya.ru/",
             )
         if self.BLACK_ALLOWED_TRANSPORTS is None:
-            self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws")
+            self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
         if self.BLACK_SOURCE_URLS is None:
             self.BLACK_SOURCE_URLS = _env_list(
                 "BLACK_SOURCE_URLS",
