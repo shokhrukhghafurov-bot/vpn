@@ -2532,6 +2532,38 @@ def _detect_device_platform_and_name(request: Request) -> Tuple[str, str]:
 
 
 
+def _device_platform_family(platform: Optional[str]) -> str:
+    normalized = str(platform or "").strip().lower()
+    if normalized in {"android", "ios"}:
+        return "mobile"
+    if normalized in {"windows", "macos", "linux"}:
+        return "desktop"
+    if normalized == "client":
+        return "generic"
+    return normalized or "generic"
+
+
+
+def _device_client_family(device_name: Optional[str]) -> str:
+    normalized = str(device_name or "").strip().lower()
+    if "v2raytun" in normalized:
+        return "v2raytun"
+    if "hiddify" in normalized:
+        return "hiddify"
+    if "happ" in normalized:
+        return "happ"
+    if "nekobox" in normalized:
+        return "nekobox"
+    if "nekoray" in normalized:
+        return "nekoray"
+    if "sing-box" in normalized or "singbox" in normalized:
+        return "sing-box"
+    if "vpn client" in normalized:
+        return "generic"
+    return normalized or "generic"
+
+
+
 def _is_public_ip_address(value: Optional[str]) -> bool:
     raw = str(value or "").strip()
     if not raw:
@@ -2640,6 +2672,9 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
     devices = list(view.get("devices") or [])
     normalized_platform = str(platform or "").strip().lower()
     normalized_name = str(device_name or "").strip()
+    platform_family = _device_platform_family(normalized_platform)
+    client_family = _device_client_family(normalized_name)
+
     exact_matches = [
         item
         for item in devices
@@ -2654,22 +2689,54 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         relaxed["detail"] = f"Subscription refresh allowed for existing {normalized_name or normalized_platform or 'device'} slot"
         return relaxed
 
-    desktopish_platforms = {"windows", "macos", "linux", "client"}
-    if normalized_platform not in desktopish_platforms:
-        return gate
-    soft_match = any(
-        str(item.get("platform") or "").strip().lower() in desktopish_platforms
-        or str(item.get("device_name") or "").strip() == normalized_name
+    same_platform_matches = [
+        item
         for item in devices
-    )
-    if not soft_match:
-        return gate
-    relaxed = dict(gate)
-    relaxed["allowed"] = True
-    relaxed["known_device"] = True
-    relaxed["reason"] = "desktop_soft_match"
-    relaxed["detail"] = "Desktop subscription refresh allowed by platform match"
-    return relaxed
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+    ]
+    if len(same_platform_matches) == 1:
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {normalized_platform or 'device'} slot"
+        return relaxed
+
+    same_family_matches = []
+    for item in devices:
+        item_platform = str(item.get("platform") or "").strip().lower()
+        item_name = str(item.get("device_name") or "").strip()
+        item_family = _device_platform_family(item_platform)
+        item_client_family = _device_client_family(item_name)
+        same_family = item_family == platform_family
+        compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
+        if same_family and compatible_client:
+            same_family_matches.append(item)
+    if len(same_family_matches) == 1:
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_family_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {platform_family or normalized_platform or 'device'} slot"
+        return relaxed
+
+    if len(devices) == 1:
+        only_item = devices[0]
+        only_platform = str(only_item.get("platform") or "").strip().lower()
+        only_name = str(only_item.get("device_name") or "").strip()
+        only_family = _device_platform_family(only_platform)
+        only_client_family = _device_client_family(only_name)
+        compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
+        compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
+        if compatible_family and compatible_client:
+            relaxed = dict(gate)
+            relaxed["allowed"] = True
+            relaxed["known_device"] = True
+            relaxed["reason"] = "single_slot_soft_match"
+            relaxed["detail"] = "Subscription refresh allowed for existing single device slot"
+            return relaxed
+
+    return gate
 
 
 
