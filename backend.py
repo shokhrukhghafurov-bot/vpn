@@ -2166,7 +2166,53 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
 
 
 def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    payload = resolved_payload if isinstance(resolved_payload, dict) else _compose_vpn_payload_for_location(dict(row))
+    code = _diagnostic_text(row.get("code"))
+    preview_row = dict(row)
+    preview_payload = dict(resolved_payload) if isinstance(resolved_payload, dict) else {}
+    preview_target_code = code
+    preview_target_name = _diagnostic_text(row.get("name_en") or row.get("name_ru") or code)
+    is_virtual = code in PUBLIC_VIRTUAL_LOCATION_CODES
+
+    if is_virtual and not preview_payload:
+        picked = _pick_virtual_location(code)
+        if picked is not None:
+            preview_row = dict(picked)
+            preview_target_code = _diagnostic_text(preview_row.get("code")) or code
+            preview_target_name = _diagnostic_text(preview_row.get("name_en") or preview_row.get("name_ru") or preview_target_code)
+            preview_payload = _compose_vpn_payload_for_location(preview_row, requested_location_code=code or None)
+            if preview_payload:
+                virtual_name = _diagnostic_text(row.get("name_en") or row.get("name_ru") or code) or code or "VLESS"
+                resolved_name = preview_target_name or preview_target_code or "VLESS"
+                preview_payload = dict(preview_payload)
+                preview_payload["remark"] = f"{virtual_name} → {resolved_name}"
+                preview_payload["display_name"] = preview_payload["remark"]
+        else:
+            issue = "no live auto candidate available"
+            fix = "Bring at least one online concrete location with a complete payload so virtual auto routing can resolve."
+            platform_items = {}
+            for platform_label in ("Android", "iOS", "Windows", "macOS"):
+                platform_items[platform_label.lower()] = {
+                    "status": "error",
+                    "label": f"{platform_label}: no live candidate",
+                    "issues": [issue],
+                    "fixes": [fix],
+                }
+            return {
+                "summary_status": "error",
+                "summary_text": issue,
+                "issues": [issue],
+                "fixes": [fix],
+                "android": platform_items["android"],
+                "ios": platform_items["ios"],
+                "windows": platform_items["windows"],
+                "macos": platform_items["macos"],
+                "preview_payload": {},
+                "preview_target_code": None,
+                "preview_target_name": None,
+                "preview_is_virtual": True,
+            }
+
+    payload = preview_payload if preview_payload else _compose_vpn_payload_for_location(dict(row))
     android = _build_tun_platform_diagnostics(payload, "Android")
     ios = _build_tun_platform_diagnostics(payload, "iOS")
     windows = _build_tun_platform_diagnostics(payload, "Windows")
@@ -2193,7 +2239,10 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         + macos.get("fixes", [])
     ))
     if summary_status == "ready":
-        summary_text = "TUN payload is ready for Android, iOS, Windows, and macOS."
+        if is_virtual and preview_target_name and preview_target_code and preview_target_code != code:
+            summary_text = f"Virtual auto route is ready. Admin preview resolves to {preview_target_name}."
+        else:
+            summary_text = "TUN payload is ready for Android, iOS, Windows, and macOS."
     else:
         summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
 
@@ -2206,6 +2255,10 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "ios": ios,
         "windows": windows,
         "macos": macos,
+        "preview_payload": payload if isinstance(payload, dict) else {},
+        "preview_target_code": preview_target_code,
+        "preview_target_name": preview_target_name,
+        "preview_is_virtual": is_virtual,
     }
 
 
@@ -2249,7 +2302,6 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item = dict(row)
     raw_vpn_payload = item.pop("vpn_payload", None)
     normalized_payload = dict(raw_vpn_payload) if isinstance(raw_vpn_payload, dict) else {}
-    item["has_vpn_payload"] = bool(normalized_payload)
     meta = _location_meta(item)
     item.update(meta)
     item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
@@ -2258,12 +2310,16 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
     item["location_source"] = str(item.get("location_source") or "catalog")
-    resolved_payload = _compose_vpn_payload_for_location(dict(row))
+    diagnostics = build_location_tun_diagnostics(row)
+    resolved_payload = diagnostics.get("preview_payload") if isinstance(diagnostics.get("preview_payload"), dict) else {}
+    item["has_vpn_payload"] = bool(normalized_payload) or bool(resolved_payload)
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
+    item["resolved_target_code"] = diagnostics.get("preview_target_code")
+    item["resolved_target_name"] = diagnostics.get("preview_target_name")
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
-        item["tun_diagnostics"] = build_location_tun_diagnostics(row, resolved_payload=resolved_payload)
+        item["tun_diagnostics"] = diagnostics
     return item
 
 
