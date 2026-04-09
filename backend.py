@@ -248,6 +248,13 @@ _LOCAL_SOURCE_FALLBACKS: Dict[str, Path] = {
     "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
 }
 
+_LOCAL_SOURCE_REMOTE_FALLBACKS: Dict[str, str] = {
+    "Vless-Reality-White-Lists-Rus-Mobile.txt": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+    "WHITE-CIDR-RU-checked.txt": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt",
+    "WHITE-CIDR-RU-all.txt": "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt",
+}
+
 
 def _resolve_local_source_path(source: str) -> Path:
     raw = str(source or "").strip()
@@ -263,21 +270,31 @@ def _read_text_from_source(source: str) -> str:
     raw = str(source or "").strip()
     if not raw:
         return ""
-    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(Path(urlsplit(raw).path or raw).name)
+    source_name = Path(urlsplit(raw).path or raw).name
+    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(source_name)
+    remote_fallback_url = _LOCAL_SOURCE_REMOTE_FALLBACKS.get(source_name)
+
+    def _fetch_remote(url: str) -> str:
+        response = requests.get(url, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
+        response.raise_for_status()
+        return response.text
+
     if raw.startswith(("http://", "https://")):
         try:
-            response = requests.get(raw, timeout=20, headers={"Accept": "text/plain, text/html;q=0.9, */*;q=0.8"})
-            response.raise_for_status()
-            return response.text
+            return _fetch_remote(raw)
         except Exception:
             if fallback_path and fallback_path.is_file():
                 return fallback_path.read_text(encoding="utf-8")
+            if remote_fallback_url and remote_fallback_url != raw:
+                return _fetch_remote(remote_fallback_url)
             raise
     path = _resolve_local_source_path(raw)
     if path.is_file():
         return path.read_text(encoding="utf-8")
     if fallback_path and fallback_path.is_file():
         return fallback_path.read_text(encoding="utf-8")
+    if remote_fallback_url:
+        return _fetch_remote(remote_fallback_url)
     raise FileNotFoundError(f"Source file not found: {raw}")
 
 
@@ -537,8 +554,10 @@ def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
         raw = str(raw_value or default_name).strip() or default_name
         if raw.startswith("/"):
             probe_path = Path(raw)
-            return str(probe_path) if probe_path.is_file() else None
-        return shutil.which(raw)
+            if probe_path.is_file():
+                return str(probe_path)
+            return shutil.which(probe_path.name) or shutil.which(default_name)
+        return shutil.which(raw) or shutil.which(default_name)
 
     xray_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray"), "xray")
     singbox_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"), "sing-box")
@@ -1138,14 +1157,43 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
 
     assigned: List[Dict[str, Any]] = []
     now_iso = datetime.now(timezone.utc).isoformat()
-    remarks = {
-        "ru-lte": "Russia LTE",
-        "ru-lte-reserve-1": "Russia LTE | Reserve 1",
-        "ru-lte-reserve-2": "Russia LTE | Reserve 2",
+    managed_meta = {
+        "ru-lte": {
+            "name_ru": "Россия LTE",
+            "name_en": "Russia LTE",
+            "country_code": "RU",
+            "is_reserve": False,
+            "sort_order": 30,
+            "remark": "Russia LTE",
+        },
+        "ru-lte-reserve-1": {
+            "name_ru": "Россия LTE | Резерв 1",
+            "name_en": "Russia LTE | Reserve 1",
+            "country_code": "RU",
+            "is_reserve": True,
+            "sort_order": 31,
+            "remark": "Russia LTE | Reserve 1",
+        },
+        "ru-lte-reserve-2": {
+            "name_ru": "Россия LTE | Резерв 2",
+            "name_en": "Russia LTE | Reserve 2",
+            "country_code": "RU",
+            "is_reserve": True,
+            "sort_order": 32,
+            "remark": "Russia LTE | Reserve 2",
+        },
     }
 
     for idx, code in enumerate(RU_LTE_LOCATION_CODES):
         payload = dict(top[idx]) if idx < len(top) else {}
+        meta = managed_meta.get(code, {
+            "name_ru": code,
+            "name_en": code,
+            "country_code": "RU",
+            "is_reserve": code != "ru-lte",
+            "sort_order": 100,
+            "remark": code,
+        })
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
                 payload.pop(key, None)
@@ -1153,13 +1201,17 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
             probe_url = str(payload.pop("_probe_url", "") or "")
             latency_ms = int(payload.pop("_latency_ms", 0) or 0)
             payload["location_code"] = code
-            payload["remark"] = remarks.get(code, code)
+            payload["remark"] = str(meta.get("remark") or code)
             updates = {
+                "name_ru": str(meta.get("name_ru") or code),
+                "name_en": str(meta.get("name_en") or code),
+                "country_code": meta.get("country_code"),
+                "sort_order": int(meta.get("sort_order") or 100),
                 "vpn_payload": payload,
                 "status": "online",
                 "is_active": True,
                 "is_recommended": code == "ru-lte",
-                "is_reserve": code != "ru-lte",
+                "is_reserve": bool(meta.get("is_reserve", code != "ru-lte")),
                 "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
             }
@@ -1185,10 +1237,14 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     probe = _ru_lte_probe_candidate(existing_payload)
                     if probe.get("ok"):
                         _patch_location_by_code(code, {
+                            "name_ru": str(meta.get("name_ru") or code),
+                            "name_en": str(meta.get("name_en") or code),
+                            "country_code": meta.get("country_code"),
+                            "sort_order": int(meta.get("sort_order") or 100),
                             "status": "online",
                             "is_active": True,
                             "is_recommended": code == "ru-lte",
-                            "is_reserve": code != "ru-lte",
+                            "is_reserve": bool(meta.get("is_reserve", code != "ru-lte")),
                             "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "speed_checked_at": now_iso,
                         })
@@ -1196,7 +1252,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                             "code": code,
                             "server": existing_payload.get("server"),
                             "transport": existing_payload.get("transport"),
-                            "remark": remarks.get(code, code),
+                            "remark": str(meta.get("remark") or code),
                             "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "probe_method": probe.get("method"),
                             "probe_url": probe.get("probe_url"),
@@ -1210,10 +1266,14 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     _mark_candidate_dead("ru_lte", existing_payload)
             if not keep_old:
                 row = _patch_location_by_code(code, {
+                    "name_ru": str(meta.get("name_ru") or code),
+                    "name_en": str(meta.get("name_en") or code),
+                    "country_code": meta.get("country_code"),
+                    "sort_order": int(meta.get("sort_order") or 100),
                     "status": "offline",
                     "is_active": False,
                     "is_recommended": False,
-                    "is_reserve": code != "ru-lte",
+                    "is_reserve": bool(meta.get("is_reserve", code != "ru-lte")),
                     "ping_ms": None,
                     "speed_checked_at": now_iso,
                 })
