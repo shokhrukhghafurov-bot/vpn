@@ -1,6 +1,7 @@
 import contextlib
 import asyncio
 import logging
+import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
@@ -187,6 +188,40 @@ TEXT: Dict[str, Dict[str, str]] = {
 bot: Optional[Bot] = None
 dp = Dispatcher()
 
+_APP_CONFIG_CACHE: Dict[str, float] = {"ts": 0.0}
+
+
+def selected_client_mode() -> str:
+    mode = str(getattr(settings, "VPN_CLIENT_MODE", "hiddify") or "").strip().lower()
+    return "v2raytun" if mode == "v2raytun" else "hiddify"
+
+
+def selected_client_name() -> str:
+    return "v2RayTun" if selected_client_mode() == "v2raytun" else "Hiddify"
+
+
+def tx(lang: str, key: str) -> str:
+    raw = TEXT[lang][key]
+    if key in {"download", "open_app", "download_app", "instructions_text", "choose_platform", "download_android", "download_ios", "download_windows", "download_macos", "manual_import_hint"}:
+        return raw.replace("Hiddify", selected_client_name())
+    return raw
+
+
+async def refresh_app_config(force: bool = False) -> None:
+    now = time.time()
+    if not force and now - float(_APP_CONFIG_CACHE.get("ts") or 0.0) < 60:
+        return
+    try:
+        data = await api_request("GET", "/app/config")
+    except Exception:
+        return
+    settings.VPN_CLIENT_MODE = str(data.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
+    settings.ANDROID_APP_URL = str(data.get("android_app_url") or settings.ANDROID_APP_URL)
+    settings.IOS_APP_URL = str(data.get("ios_app_url") or settings.IOS_APP_URL)
+    settings.WINDOWS_APP_URL = str(data.get("windows_app_url") or getattr(settings, "WINDOWS_APP_URL", ""))
+    settings.MACOS_APP_URL = str(data.get("macos_app_url") or getattr(settings, "MACOS_APP_URL", ""))
+    _APP_CONFIG_CACHE["ts"] = now
+
 
 def require_bot() -> Bot:
     if bot is None:
@@ -249,6 +284,7 @@ async def auth_user(tg_user: Any, language: Optional[str] = None) -> Dict[str, A
 
 
 async def get_user_ctx(tg_user: Any, language_override: Optional[str] = None) -> Dict[str, Any]:
+    await refresh_app_config()
     auth = await auth_user(tg_user, language_override)
     user = auth.get("user") or {}
     lang = "en" if (user.get("language") == "en") else "ru"
@@ -396,7 +432,7 @@ def main_menu_inline(lang: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(text=t["devices"], callback_data="menu:devices"),
-                InlineKeyboardButton(text=t["download"], callback_data="menu:download"),
+                InlineKeyboardButton(text=tx(lang, "download"), callback_data="menu:download"),
             ],
             [
                 InlineKeyboardButton(text=t["support"], callback_data="menu:support"),
@@ -475,8 +511,8 @@ def activated_inline(
     rows.extend(subscription_copy_rows(lang, subscription_url))
     final_open_url = open_app_url or build_open_app_url(lang=lang, token=subscription_token)
     if is_supported_telegram_url(final_open_url):
-        rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
-    rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
+        rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=final_open_url)])
+    rows.append([InlineKeyboardButton(text=tx(lang, "download_app"), callback_data="menu:download")])
     rows.append([InlineKeyboardButton(text=t["sub"], callback_data="menu:sub")])
     rows.append([InlineKeyboardButton(text=t["main_menu"], callback_data="menu:root")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -529,10 +565,10 @@ def platform_open_inline(
 ) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     url = platform_store_url(platform)
-    rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=t["download_app"], url=url)]]
+    rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=tx(lang, "download_app"), url=url)]]
     final_open_url = open_app_url or build_open_app_url(lang=lang, token=subscription_token)
     if is_supported_telegram_url(final_open_url):
-        rows.append([InlineKeyboardButton(text=t["open_app"], url=final_open_url)])
+        rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=final_open_url)])
     rows.extend(subscription_copy_rows(lang, subscription_url))
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:download")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -645,15 +681,15 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
             f"{t['valid_until']}: {_fmt_dt(sub.get('expires_at'))}",
             f"{t['devices_used']}: {used} / {limit}",
             "",
-            t["manual_import_hint"],
+            tx(lang, "manual_import_hint"),
         ]
     ).strip()
     rows: List[List[InlineKeyboardButton]] = []
     rows.extend(subscription_copy_rows(lang, subscription_url))
     rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
     if is_supported_telegram_url(open_app_url):
-        rows.append([InlineKeyboardButton(text=t["open_app"], url=open_app_url)])
-    rows.append([InlineKeyboardButton(text=t["download_app"], callback_data="menu:download")])
+        rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=open_app_url)])
+    rows.append([InlineKeyboardButton(text=tx(lang, "download_app"), callback_data="menu:download")])
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
     markup = InlineKeyboardMarkup(inline_keyboard=rows)
     return text, markup
@@ -714,9 +750,9 @@ async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
 
 
 async def render_instructions_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
-    return TEXT[lang]["instructions_text"], InlineKeyboardMarkup(
+    return tx(lang, "instructions_text"), InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text=TEXT[lang]["download"], callback_data="menu:download")],
+            [InlineKeyboardButton(text=tx(lang, "download"), callback_data="menu:download")],
             [InlineKeyboardButton(text=TEXT[lang]["back"], callback_data="menu:root")],
         ]
     )
@@ -731,7 +767,7 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
     subscription_token = (data.get("subscription_token") or "").strip() or None
     open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
     if not sub:
-        text = "\n".join([t["payment_received"], t["manual_import_hint"], subscription_url or ""]).strip()
+        text = "\n".join([t["payment_received"], tx(lang, "manual_import_hint"), subscription_url or ""]).strip()
         return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
@@ -745,7 +781,7 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
             "",
             subscription_url or "",
             "",
-            t["manual_import_hint"],
+            tx(lang, "manual_import_hint"),
         ]
     ).strip()
     return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
@@ -804,7 +840,7 @@ async def devices_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["download"], TEXT["en"]["download"]}))
 async def download_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await message.answer(TEXT[lang]["choose_platform"], reply_markup=download_platforms_inline(lang))
+        await message.answer(tx(lang, "choose_platform"), reply_markup=download_platforms_inline(lang))
 
     await with_user_guard(message, _handler)
 
@@ -864,7 +900,7 @@ async def download_android_from_text(message: Message) -> None:
             await message.answer(text, reply_markup=markup)
             return
         access = await fetch_subscription_access(_ctx["token"])
-        await message.answer(TEXT[lang]["download_android"], reply_markup=platform_open_inline(lang, "android", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+        await message.answer(tx(lang, "download_android"), reply_markup=platform_open_inline(lang, "android", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -878,7 +914,7 @@ async def download_ios_from_text(message: Message) -> None:
             await message.answer(text, reply_markup=markup)
             return
         access = await fetch_subscription_access(_ctx["token"])
-        await message.answer(TEXT[lang]["download_ios"], reply_markup=platform_open_inline(lang, "ios", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+        await message.answer(tx(lang, "download_ios"), reply_markup=platform_open_inline(lang, "ios", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -892,7 +928,7 @@ async def download_windows_from_text(message: Message) -> None:
             await message.answer(text, reply_markup=markup)
             return
         access = await fetch_subscription_access(_ctx["token"])
-        await message.answer(TEXT[lang]["download_windows"], reply_markup=platform_open_inline(lang, "windows", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+        await message.answer(tx(lang, "download_windows"), reply_markup=platform_open_inline(lang, "windows", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -906,7 +942,7 @@ async def download_macos_from_text(message: Message) -> None:
             await message.answer(text, reply_markup=markup)
             return
         access = await fetch_subscription_access(_ctx["token"])
-        await message.answer(TEXT[lang]["download_macos"], reply_markup=platform_open_inline(lang, "macos", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
+        await message.answer(tx(lang, "download_macos"), reply_markup=platform_open_inline(lang, "macos", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
 
@@ -1042,7 +1078,7 @@ async def cb_download(callback: CallbackQuery) -> None:
             await safe_edit(callback, text, markup)
             await callback.answer()
             return
-        await safe_edit(callback, TEXT[lang]["choose_platform"], download_platforms_inline(lang))
+        await safe_edit(callback, tx(lang, "choose_platform"), download_platforms_inline(lang))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
@@ -1059,13 +1095,13 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
             return
         platform = callback.data.split(":", 1)[1]
         if platform == "android":
-            text = TEXT[lang]["download_android"]
+            text = tx(lang, "download_android")
         elif platform == "ios":
-            text = TEXT[lang]["download_ios"]
+            text = tx(lang, "download_ios")
         elif platform == "windows":
-            text = TEXT[lang]["download_windows"]
+            text = tx(lang, "download_windows")
         else:
-            text = TEXT[lang]["download_macos"]
+            text = tx(lang, "download_macos")
         access = await fetch_subscription_access(_ctx["token"])
         await safe_edit(callback, text, platform_open_inline(lang, platform, access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
         await callback.answer()
@@ -1131,7 +1167,7 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
                 "",
                 subscription_url or "",
                 "",
-                t["manual_import_hint"],
+                tx(lang, "manual_import_hint"),
             ]
         ).strip()
         return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
