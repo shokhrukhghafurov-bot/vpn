@@ -2649,13 +2649,43 @@ def _hiddify_subscription_transport_allowed(payload: Dict[str, Any]) -> bool:
     return transport in allowed if allowed else True
 
 
-def _subscription_location_rows() -> List[Dict[str, Any]]:
+def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+    code = str(row.get("code") or "").strip()
+    resolved_row = dict(row)
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        picked = _pick_virtual_location(code, user_id=user_id)
+        if not picked:
+            return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
+        resolved_row = dict(picked)
+
+    payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
+    if not payload:
+        return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
+
+    payload_for_subscription = dict(payload)
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        virtual_name = str(row.get("name_en") or row.get("name_ru") or code or "VLESS").strip() or "VLESS"
+        resolved_name = str(
+            resolved_row.get("name_en")
+            or resolved_row.get("name_ru")
+            or resolved_row.get("code")
+            or payload_for_subscription.get("resolved_location_code")
+            or "VLESS"
+        ).strip() or "VLESS"
+        payload_for_subscription["remark"] = f"{virtual_name} → {resolved_name}"
+        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+    else:
+        payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
+        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+
+    fallback_name = _subscription_remark_for_row(row, payload_for_subscription)
+    return payload_for_subscription, fallback_name
+
+
+def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
     concrete: List[Dict[str, Any]] = []
     for row in _public_location_rows():
-        code = str(row.get("code") or "").strip()
-        if code in PUBLIC_VIRTUAL_LOCATION_CODES:
-            continue
-        payload = _compose_vpn_payload_for_location(dict(row))
+        payload, _ = _subscription_payload_and_fallback_name(dict(row), user_id=user_id)
         if payload and _hiddify_subscription_transport_allowed(payload):
             concrete.append(dict(row))
     return concrete
@@ -2730,6 +2760,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
 
     expires_ts = int(time.time()) + 86400 * 3650
     profile_title = f"{settings.APP_NAME} Subscription"
+    subscription_user_id: Optional[int] = None
     if access["kind"] == "user":
         user = access["user"]
         if not user or user.get("status") == "blocked":
@@ -2747,6 +2778,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             except Exception:
                 pass
         profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
+        subscription_user_id = int(user["id"])
 
         gate = _subscription_device_gate(request, token, access)
         if gate and not gate.get("allowed"):
@@ -2761,17 +2793,14 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     if not head_only:
         _track_subscription_device_access(request, token, access)
 
-    rows = _subscription_location_rows()
+    rows = _subscription_location_rows(subscription_user_id)
     lines: List[str] = []
     for row in rows:
-        payload = _compose_vpn_payload_for_location(dict(row))
-        if not payload:
+        payload_for_subscription, fallback_name = _subscription_payload_and_fallback_name(dict(row), user_id=subscription_user_id)
+        if not payload_for_subscription:
             continue
-        payload_for_subscription = dict(payload)
-        payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
-        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
         try:
-            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=_subscription_remark_for_row(row, payload_for_subscription)))
+            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=fallback_name))
         except Exception:
             continue
 
