@@ -324,8 +324,10 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
-    "UPDATE locations SET name_ru = '★ Авто | Самый быстрый', name_en = '★ Auto | Fastest', is_active = TRUE, is_recommended = TRUE, is_reserve = FALSE, status = 'online', sort_order = 10, is_deleted = FALSE, location_source = 'catalog' WHERE code = 'auto-fastest'",
-    "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв', name_en = 'Auto | Fastest Reserve', is_active = TRUE, is_recommended = FALSE, is_reserve = TRUE, status = 'online', sort_order = 20, is_deleted = FALSE, location_source = 'catalog' WHERE code = 'auto-reserve'",
+    "UPDATE locations SET name_ru = '★ Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru = 'Авто | Самый быстрый')",
+    "UPDATE locations SET name_en = '★ Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en = 'Auto | Fastest')",
+    "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
+    "UPDATE locations SET name_en = 'Auto | Fastest Reserve' WHERE code = 'auto-reserve' AND (name_en IS NULL OR BTRIM(name_en) = '')",
 ]
 
 SERIAL_SEQUENCE_TARGETS = (
@@ -769,50 +771,12 @@ def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
 
 
 
-def _required_virtual_default_locations() -> List[Dict[str, Any]]:
-    builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
-    return [item for item in builtin_locations if str(item.get("code") or "").strip() in VIRTUAL_LOCATION_CODES]
-
-
-def _merge_required_virtual_locations(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    merged: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    required_virtual = {str(item.get("code") or "").strip(): dict(item) for item in _required_virtual_default_locations()}
-
-    for item in locations:
-        code = str(item.get("code") or "").strip()
-        if not code:
-            continue
-        row = dict(item)
-        if code in required_virtual:
-            defaults = required_virtual[code]
-            row["name_ru"] = defaults.get("name_ru") or row.get("name_ru")
-            row["name_en"] = defaults.get("name_en") or row.get("name_en")
-            row["country_code"] = defaults.get("country_code")
-            row["is_active"] = True
-            row["is_recommended"] = bool(defaults.get("is_recommended", False))
-            row["is_reserve"] = bool(defaults.get("is_reserve", False))
-            row["status"] = str(defaults.get("status") or "online").strip() or "online"
-            row["sort_order"] = int(defaults.get("sort_order") or row.get("sort_order") or 100)
-            row["is_deleted"] = False
-            row["location_source"] = "catalog"
-        merged.append(row)
-        seen.add(code)
-
-    for code, defaults in required_virtual.items():
-        if code in seen:
-            continue
-        merged.append(dict(defaults))
-
-    return merged
-
-
 def _load_default_locations() -> List[Dict[str, Any]]:
-    builtin_locations = _merge_required_virtual_locations(_parse_locations_json(settings.DEFAULT_LOCATIONS_JSON))
+    builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
     if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED:
         env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
         if env_locations:
-            return _merge_required_virtual_locations(env_locations)
+            return env_locations
     return builtin_locations
 
 
@@ -1218,17 +1182,16 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
                 continue
             payload = _compose_vpn_payload_for_location(dict(row))
             if payload and _config_is_complete(payload):
-                valid.append(dict(row))
+                valid.append(row)
         return valid
 
     def by_codes(codes: List[str]) -> List[Dict[str, Any]]:
-        mapped = {str(row.get("code") or "").strip(): dict(row) for row in rows}
-        return with_payload([mapped[code] for code in codes if code in mapped])
+        order = {code_item: idx for idx, code_item in enumerate(codes)}
+        found = [row for row in rows if is_online(row) and str(row.get("code") or "") in order]
+        return sorted(with_payload(found), key=lambda row: order.get(str(row.get("code") or ""), 999))
 
     def generic(predicate) -> List[Dict[str, Any]]:
-        filtered = [dict(row) for row in rows if predicate(row)]
-        filtered.sort(key=_location_speed_sort_key)
-        return with_payload(filtered)
+        return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
 
     def measured(predicate) -> List[Dict[str, Any]]:
         return generic(lambda row: predicate(row) and _speed_metrics_present(row))
@@ -1308,12 +1271,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    top_limit = max(3, int(getattr(settings, "AUTO_FASTEST_TOP_LIMIT", 3) or 3))
-    overflow_limit = max(top_limit, int(getattr(settings, "AUTO_FASTEST_OVERFLOW_LIMIT", 5) or 5))
-    pool = ranked_candidates[:overflow_limit]
-    if not pool:
-        return None
-
+    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not user_id:
         return pool[0]
 
@@ -1337,7 +1295,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
                     return row
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
-    effective_pool = _prefer_primary_virtual_pool(pool[:top_limit] + pool[top_limit:overflow_limit], loads)
+    effective_pool = _prefer_primary_virtual_pool(pool, loads)
     selected = min(
         enumerate(effective_pool),
         key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
@@ -1347,9 +1305,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
     return selected
 
-
 def sync_locations_catalog() -> None:
-
     locations = _load_default_locations()
     if not locations:
         return
@@ -1363,7 +1319,6 @@ def sync_locations_catalog() -> None:
                 data["is_deleted"] = bool(data.get("is_deleted", False))
                 if not data.get("vpn_payload"):
                     data["vpn_payload"] = _compose_vpn_payload_for_location(data)
-                data["virtual_codes"] = list(VIRTUAL_LOCATION_CODES)
                 data["download_mbps"] = _normalize_optional_float(data.get("download_mbps"))
                 data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
                 data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
@@ -1389,25 +1344,14 @@ def sync_locations_catalog() -> None:
                             WHEN COALESCE(NULLIF(BTRIM(locations.country_code), ''), NULL) IS NULL THEN EXCLUDED.country_code
                             ELSE locations.country_code
                         END,
-                        is_active = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN EXCLUDED.is_active
-                            ELSE locations.is_active
-                        END,
-                        is_recommended = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN EXCLUDED.is_recommended
-                            ELSE locations.is_recommended
-                        END,
-                        is_reserve = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN EXCLUDED.is_reserve
-                            ELSE locations.is_reserve
-                        END,
+                        is_active = locations.is_active,
+                        is_recommended = locations.is_recommended,
+                        is_reserve = locations.is_reserve,
                         status = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN EXCLUDED.status
                             WHEN COALESCE(NULLIF(BTRIM(locations.status), ''), NULL) IS NULL THEN EXCLUDED.status
                             ELSE locations.status
                         END,
                         sort_order = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN EXCLUDED.sort_order
                             WHEN locations.sort_order IS NULL THEN EXCLUDED.sort_order
                             ELSE locations.sort_order
                         END,
@@ -1431,12 +1375,8 @@ def sync_locations_catalog() -> None:
                             WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
                             ELSE locations.vpn_payload
                         END,
-                        is_deleted = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN FALSE
-                            ELSE locations.is_deleted
-                        END,
+                        is_deleted = locations.is_deleted,
                         location_source = CASE
-                            WHEN EXCLUDED.code = ANY(%(virtual_codes)s) THEN 'catalog'
                             WHEN COALESCE(NULLIF(BTRIM(locations.location_source), ''), 'catalog') = 'admin' THEN 'admin'
                             ELSE 'catalog'
                         END,
