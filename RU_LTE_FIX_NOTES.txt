@@ -1,0 +1,11 @@
+RU LTE fix bundle
+
+Changes included:
+- Added local source files under sources/ru_lte/ so RU_LTE_SOURCE_URLS works on Railway with local paths.
+- Added remote fallback to raw.githubusercontent.com if a local RU LTE source file is missing.
+- Improved Xray probe binary resolution: if /app/bin/xray is absent, code now falls back to xray from PATH.
+- Refresh now restores canonical names/order for managed RU LTE rows (ru-lte, ru-lte-reserve-1, ru-lte-reserve-2).
+
+Recommended env note:
+- Keep RU_LTE_SOURCE_URLS as local paths only if these source files are deployed with the app. This bundle already includes them.
+- If you do not ship /app/bin/xray, the code can now still use system xray from PATH when available.
