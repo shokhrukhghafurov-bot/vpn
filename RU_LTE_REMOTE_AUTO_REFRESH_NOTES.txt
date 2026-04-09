@@ -1,0 +1,15 @@
+RU LTE remote auto-refresh
+
+What changed:
+- RU_LTE_SOURCE_URLS default now points to raw GitHub files from igareck/vpn-configs-for-russia.
+- If RU_LTE_SOURCE_URLS still contains local aliases like sources/ru_lte/*.txt, backend now resolves them to the matching raw GitHub URLs automatically.
+- Backend fetches remote source files with cache-busting query param and no-cache headers on every refresh.
+- If remote fetch fails and a local fallback file exists, backend can still reuse the local copy.
+- BLACK source refresh uses the same raw-base helper too.
+
+Suggested env for your Railway service:
+RU_LTE_SOURCE_URLS=https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/Vless-Reality-White-Lists-Rus-Mobile-2.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-checked.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/WHITE-CIDR-RU-all.txt
+BLACK_SOURCE_URLS=https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS_mobile.txt,https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main/BLACK_VLESS_RUS.txt
+
+Optional:
+VPN_CONFIGS_REPO_RAW_BASE=https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main
