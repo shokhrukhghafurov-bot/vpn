@@ -2617,10 +2617,11 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         return gate
     used = int(gate.get("devices_used") or 0)
     limit = int(gate.get("device_limit") or 0)
-    if limit <= 0 or used <= limit:
+    if limit <= 0 or used < limit:
         return gate
     platform, device_name = _detect_device_platform_and_name(request)
-    if platform not in {"windows", "macos", "linux"}:
+    desktopish_platforms = {"windows", "macos", "linux", "client"}
+    if platform not in desktopish_platforms:
         return gate
     user = access.get("user") or {}
     user_id = int(user.get("id") or 0)
@@ -2632,7 +2633,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         return gate
     devices = list(view.get("devices") or [])
     soft_match = any(
-        str(item.get("platform") or "").strip().lower() == platform
+        str(item.get("platform") or "").strip().lower() in desktopish_platforms
         or str(item.get("device_name") or "").strip() == device_name
         for item in devices
     )
