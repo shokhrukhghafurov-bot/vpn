@@ -1256,6 +1256,25 @@ def _virtual_strict_candidate_pool(rows: List[Dict[str, Any]]) -> List[Dict[str,
     return []
 
 
+def _virtual_role_preferred_pool(code: str, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not pool:
+        return []
+
+    non_reserve = [row for row in pool if not bool(row.get("is_reserve"))]
+    reserve = [row for row in pool if bool(row.get("is_reserve"))]
+
+    # User expectation:
+    # - Auto | Fastest should first try real/manual/LTE locations and only fall
+    #   back to reserve rows when there is no better primary candidate.
+    # - Auto | Fastest Reserve should do the opposite and stay in the reserve
+    #   pool whenever at least one usable reserve candidate exists.
+    if code == "auto-fastest" and non_reserve:
+        return list(non_reserve)
+    if code == "auto-reserve" and reserve:
+        return list(reserve)
+    return list(pool)
+
+
 def _virtual_sibling_code(code: str) -> Optional[str]:
     if code == "auto-fastest":
         return "auto-reserve"
@@ -1394,6 +1413,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not pool:
         pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     pool = _virtual_pool_best_quality(pool)
+    pool = _virtual_role_preferred_pool(code, pool)
     if not pool:
         return None
     if not user_id:
@@ -1409,6 +1429,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
         ]
         if sibling_filtered_pool:
             pool = _virtual_pool_best_quality(sibling_filtered_pool)
+            pool = _virtual_role_preferred_pool(code, pool)
             if not pool:
                 return None
 
@@ -1424,8 +1445,10 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
                 return assigned_row
 
     effective_pool = _virtual_pool_best_quality(_prefer_primary_virtual_pool(pool, loads))
+    effective_pool = _virtual_role_preferred_pool(code, effective_pool)
     if not effective_pool:
         effective_pool = _virtual_pool_best_quality(pool)
+        effective_pool = _virtual_role_preferred_pool(code, effective_pool)
     if not effective_pool:
         return None
     selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
