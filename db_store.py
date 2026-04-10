@@ -1,1008 +1,2047 @@
-import csv
-import io
-import json
-import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
+import base64
+import hashlib
+import ipaddress
+import html
+import json
+import secrets
 from uuid import uuid4
+import time
+import threading
+import socket
+import shutil
+import subprocess
+import tempfile
+from pathlib import Path
 
+
+import jwt
+import requests
 import psycopg
-from psycopg import sql
 from psycopg.rows import dict_row
-from psycopg.types.json import Jsonb
+from fastapi import Depends, FastAPI, Header, HTTPException, Query, Request, Response
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBasic, HTTPBasicCredentials, HTTPBearer
+from pydantic import BaseModel, Field
 
 from config import settings
-
-
-def _normalize_optional_float(value: Any) -> Optional[float]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if isinstance(value, str):
-        raw = value.strip().replace(',', '.')
-        if not raw:
-            return None
-        try:
-            return float(raw)
-        except ValueError:
-            return None
-    return None
-
-
-def _normalize_optional_int(value: Any) -> Optional[int]:
-    if value is None:
-        return None
-    if isinstance(value, bool):
-        return None
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return int(round(value))
-    if isinstance(value, str):
-        raw = value.strip().replace(',', '.')
-        if not raw:
-            return None
-        try:
-            return int(round(float(raw)))
-        except ValueError:
-            return None
-    return None
-
-
-def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
-    if value is None:
-        return None
-    if isinstance(value, datetime):
-        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
-    if isinstance(value, str):
-        raw = value.strip()
-        if not raw:
-            return None
-        normalized = raw.replace('Z', '+00:00')
-        try:
-            dt = datetime.fromisoformat(normalized)
-        except ValueError:
-            return None
-        return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-    return None
-
-
-VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
-VIRTUAL_LOCATION_POOL_SIZE = 5
-
-SCHEMA_TABLES_SQL = """
-CREATE TABLE IF NOT EXISTS users (
-    id SERIAL PRIMARY KEY,
-    telegram_id BIGINT NOT NULL UNIQUE,
-    username TEXT,
-    first_name TEXT,
-    last_name TEXT,
-    language TEXT NOT NULL DEFAULT 'ru',
-    status TEXT NOT NULL DEFAULT 'active',
-    device_limit_override INTEGER,
-    subscription_token TEXT UNIQUE,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS plans (
-    id SERIAL PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ru TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    price_rub NUMERIC(10,2) NOT NULL,
-    duration_days INTEGER NOT NULL,
-    device_limit INTEGER NOT NULL,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    source_env_key TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS subscriptions (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    plan_id INTEGER NOT NULL REFERENCES plans(id),
-    starts_at TIMESTAMPTZ NOT NULL,
-    expires_at TIMESTAMPTZ NOT NULL,
-    status TEXT NOT NULL DEFAULT 'active',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS devices (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    platform TEXT NOT NULL,
-    device_name TEXT,
-    device_fingerprint TEXT NOT NULL,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, device_fingerprint)
-);
-
-CREATE TABLE IF NOT EXISTS locations (
-    id SERIAL PRIMARY KEY,
-    code TEXT NOT NULL UNIQUE,
-    name_ru TEXT NOT NULL,
-    name_en TEXT NOT NULL,
-    country_code TEXT,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    is_recommended BOOLEAN NOT NULL DEFAULT FALSE,
-    is_reserve BOOLEAN NOT NULL DEFAULT FALSE,
-    status TEXT NOT NULL DEFAULT 'online',
-    sort_order INTEGER NOT NULL DEFAULT 100,
-    download_mbps DOUBLE PRECISION,
-    upload_mbps DOUBLE PRECISION,
-    ping_ms INTEGER,
-    speed_checked_at TIMESTAMPTZ,
-    vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    is_deleted BOOLEAN NOT NULL DEFAULT FALSE,
-    location_source TEXT NOT NULL DEFAULT 'catalog',
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS payments (
-    id TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    plan_id INTEGER NOT NULL REFERENCES plans(id),
-    provider TEXT NOT NULL,
-    method TEXT,
-    amount NUMERIC(10,2) NOT NULL,
-    currency TEXT NOT NULL DEFAULT 'RUB',
-    status TEXT NOT NULL DEFAULT 'created',
-    external_payment_id TEXT UNIQUE,
-    checkout_url TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    paid_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS auth_codes (
-    code TEXT PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    expires_at TIMESTAMPTZ NOT NULL,
-    used_at TIMESTAMPTZ,
-    meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS admin_notes (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER REFERENCES users(id) ON DELETE CASCADE,
-    admin_name TEXT NOT NULL,
-    note TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS manual_extensions (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    days_added INTEGER NOT NULL,
-    reason TEXT,
-    admin_name TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS bot_notifications (
-    id BIGSERIAL PRIMARY KEY,
-    unique_key TEXT NOT NULL UNIQUE,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    event_type TEXT NOT NULL,
-    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent_at TIMESTAMPTZ
-);
-
-CREATE TABLE IF NOT EXISTS bot_error_log (
-    id BIGSERIAL PRIMARY KEY,
-    source TEXT NOT NULL,
-    context TEXT,
-    error_message TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS vpn_runtime_settings (
-    id INTEGER PRIMARY KEY CHECK (id = 1),
-    payload JSONB NOT NULL DEFAULT '{}'::jsonb,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE TABLE IF NOT EXISTS virtual_location_assignments (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    virtual_code TEXT NOT NULL,
-    concrete_code TEXT NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, virtual_code)
-);
-"""
-
-MIGRATION_SQL = [
-    # users
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS username TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS language TEXT DEFAULT 'ru'",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS device_limit_override INTEGER",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS subscription_token TEXT",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE users ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # plans
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS device_limit INTEGER DEFAULT 2",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS source_env_key TEXT",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE plans ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # subscriptions
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'active'",
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # devices
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS device_name TEXT",
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE devices ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # locations
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS country_code TEXT",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_recommended BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_reserve BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'online'",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS sort_order INTEGER DEFAULT 100",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS download_mbps DOUBLE PRECISION",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS upload_mbps DOUBLE PRECISION",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS ping_ms INTEGER",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS speed_checked_at TIMESTAMPTZ",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS vpn_payload JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_deleted BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS location_source TEXT DEFAULT 'catalog'",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE locations ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # payments
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS method TEXT",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS currency TEXT DEFAULT 'RUB'",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'created'",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS external_payment_id TEXT",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS checkout_url TEXT",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE payments ADD COLUMN IF NOT EXISTS paid_at TIMESTAMPTZ",
-
-    # notifications/errors
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ",
-    "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS context TEXT",
-    "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # runtime settings
-    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
-    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE vpn_runtime_settings ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-
-    # indexes compatible with old databases
-    "CREATE INDEX IF NOT EXISTS idx_users_status ON users(status)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_users_subscription_token ON users(subscription_token) WHERE subscription_token IS NOT NULL",
-    "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status)",
-    "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
-    "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
-    "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
-    "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
-    "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
-]
-
-POST_MIGRATION_SQL = [
-    "UPDATE users SET language = 'ru' WHERE language IS NULL OR language = ''",
-    "UPDATE users SET status = 'active' WHERE status IS NULL OR status = ''",
-    "UPDATE users SET device_limit_override = NULL WHERE device_limit_override IS NOT NULL AND device_limit_override <= 0",
-    f"UPDATE plans SET device_limit = {int(settings.VPN_DEFAULT_DEVICE_LIMIT)} WHERE device_limit IS NULL OR device_limit <= 0",
-    "UPDATE plans SET is_active = TRUE WHERE is_active IS NULL",
-    "UPDATE plans SET source_env_key = code WHERE source_env_key IS NULL OR source_env_key = ''",
-    "UPDATE subscriptions SET status = 'active' WHERE status IS NULL OR status = ''",
-    "UPDATE locations SET status = 'online' WHERE status IS NULL OR status = ''",
-    "UPDATE locations SET sort_order = 100 WHERE sort_order IS NULL",
-    "UPDATE locations SET is_recommended = FALSE WHERE is_recommended IS NULL",
-    "UPDATE locations SET is_reserve = FALSE WHERE is_reserve IS NULL",
-    "UPDATE locations SET vpn_payload = '{}'::jsonb WHERE vpn_payload IS NULL",
-    "UPDATE locations SET is_deleted = FALSE WHERE is_deleted IS NULL",
-    "UPDATE locations SET location_source = 'catalog' WHERE location_source IS NULL OR location_source = ''",
-    "UPDATE payments SET currency = 'RUB' WHERE currency IS NULL OR currency = ''",
-    "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
-    "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
-    "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
-    "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
-    "UPDATE locations SET name_ru = '★ Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru = 'Авто | Самый быстрый')",
-    "UPDATE locations SET name_en = '★ Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en = 'Auto | Fastest')",
-    "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
-    "UPDATE locations SET name_en = 'Auto | Fastest Reserve' WHERE code = 'auto-reserve' AND (name_en IS NULL OR BTRIM(name_en) = '')",
-]
-
-SERIAL_SEQUENCE_TARGETS = (
-    ("users", "id"),
-    ("plans", "id"),
-    ("subscriptions", "id"),
-    ("devices", "id"),
-    ("locations", "id"),
-    ("admin_notes", "id"),
-    ("manual_extensions", "id"),
-    ("bot_notifications", "id"),
-    ("bot_error_log", "id"),
+from db_store import (
+    activate_payment_and_extend_subscription,
+    admin_create_or_update_user,
+    bootstrap,
+    create_location,
+    create_payment_record,
+    delete_device,
+    delete_location,
+    export_payments_csv,
+    _compose_vpn_payload_for_location,
+    _normalize_vpn_payload_keys,
+    _config_is_complete,
+    _pick_virtual_location,
+    get_active_plans,
+    get_payment_by_internal_or_external,
+    get_payment_for_user,
+    get_plan_by_code,
+    get_vpn_config_for_user,
+    get_user_by_id,
+    get_user_by_subscription_token,
+    get_user_by_active_auth_code,
+    get_user_by_telegram_id,
+    get_user_snapshot_by_telegram,
+    get_user_subscription_view,
+    get_subscription_device_gate_by_token,
+    ensure_user_subscription_token,
+    issue_auth_code,
+    consume_auth_code,
+    list_admin_users,
+    list_bot_errors,
+    list_broadcast_targets,
+    list_locations,
+    list_payments,
+    patch_location,
+    record_bot_error,
+    refresh_subscription_statuses,
+    register_device,
+    touch_subscription_device_by_token,
+    reset_user_devices_by_telegram,
+    set_user_device_limit_override_by_telegram,
+    set_user_language,
+    set_user_status_by_telegram,
+    settings_snapshot,
+    save_runtime_settings_payload,
+    sync_plans_from_env,
+    upsert_telegram_user,
+    update_payment,
+    extend_user_subscription_by_telegram,
+    enqueue_notification,
+    _get_user_subscription_view_with_conn,
 )
 
 
-
-def _run_schema_migrations(cur: psycopg.Cursor) -> None:
-    for statement in MIGRATION_SQL:
-        cur.execute(statement)
-    for statement in POST_MIGRATION_SQL:
-        cur.execute(statement)
+app = FastAPI(title=f"{settings.APP_NAME} VPN API")
+security = HTTPBearer(auto_error=False)
+basic_security = HTTPBasic()
 
 
-def _table_has_column(cur: psycopg.Cursor, table_name: str, column_name: str) -> bool:
-    cur.execute(
-        """
-        SELECT 1
-        FROM information_schema.columns
-        WHERE table_schema = CURRENT_SCHEMA()
-          AND table_name = %s
-          AND column_name = %s
-        LIMIT 1
-        """,
-        (table_name, column_name),
-    )
-    return bool(cur.fetchone())
+class TelegramAuthIn(BaseModel):
+    telegram_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
 
 
-def _resync_serial_sequence(cur: psycopg.Cursor, table_name: str, column_name: str = "id") -> None:
-    if not _table_has_column(cur, table_name, column_name):
-        return
-    cur.execute("SELECT pg_get_serial_sequence(%s, %s) AS sequence_name", (table_name, column_name))
-    row = cur.fetchone()
-    if not row:
-        return
-    sequence_name = row.get("sequence_name")
-    if not sequence_name:
-        return
-    cur.execute(
-        sql.SQL("SELECT COALESCE(MAX({column}), 0) AS max_id FROM {table}").format(
-            column=sql.Identifier(column_name),
-            table=sql.Identifier(table_name),
-        )
-    )
-    max_id_row = cur.fetchone()
-    max_id = int((max_id_row or {}).get("max_id") or 0)
-    next_value = max(1, max_id + 1)
-    cur.execute("SELECT setval(%s, %s, false)", (sequence_name, next_value))
+class CodeAuthIn(BaseModel):
+    code: str
+    telegram_id: Optional[int] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
 
 
-def _resync_serial_sequences(cur: psycopg.Cursor) -> None:
-    for table_name, column_name in SERIAL_SEQUENCE_TARGETS:
-        _resync_serial_sequence(cur, table_name, column_name)
+class IssueCodeIn(BaseModel):
+    telegram_id: int
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
 
 
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+class RefreshIn(BaseModel):
+    refresh_token: Optional[str] = None
 
 
-def db() -> psycopg.Connection:
-    return psycopg.connect(settings.DATABASE_URL, row_factory=dict_row)
+class LanguageIn(BaseModel):
+    language: str = "ru"
 
 
-def bootstrap() -> None:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(SCHEMA_TABLES_SQL)
-            _run_schema_migrations(cur)
-            _resync_serial_sequences(cur)
-        conn.commit()
-    apply_runtime_settings_overrides()
-    sync_plans_from_env()
-    sync_locations_catalog()
+class DeviceRegisterIn(BaseModel):
+    platform: str
+    device_name: str
+    device_fingerprint: str
 
 
-def sync_plans_from_env() -> None:
-    source_aliases = _canonical_plan_sources()
-    canonical_sources = tuple(source_aliases.keys())
-    obsolete_sources = tuple({alias for values in source_aliases.values() for alias in values if alias not in canonical_sources})
-    with db() as conn:
-        with conn.cursor() as cur:
-            for plan in settings.plan_definitions():
-                aliases = tuple(source_aliases.get(plan["source_env_key"], [plan["source_env_key"]]))
-                cur.execute(
-                    "SELECT id FROM plans WHERE source_env_key = ANY(%s) ORDER BY updated_at DESC NULLS LAST, id DESC LIMIT 1",
-                    (list(aliases),),
-                )
-                existing = cur.fetchone()
-                if existing:
-                    cur.execute(
-                        """
-                        UPDATE plans
-                        SET code = %(code)s,
-                            name_ru = %(name_ru)s,
-                            name_en = %(name_en)s,
-                            price_rub = %(price_rub)s,
-                            duration_days = %(duration_days)s,
-                            device_limit = %(device_limit)s,
-                            is_active = %(is_active)s,
-                            source_env_key = %(source_env_key)s,
-                            updated_at = NOW()
-                        WHERE id = %(id)s
-                        """,
-                        {**plan, "id": existing["id"]},
-                    )
-                    cur.execute(
-                        "UPDATE plans SET is_active = FALSE, updated_at = NOW() WHERE source_env_key = ANY(%s) AND id <> %s",
-                        (list(aliases), existing["id"]),
-                    )
+class PaymentCreateIn(BaseModel):
+    plan_code: str
+    method: str = "telegram"
+
+
+class AdminUserUpsertIn(BaseModel):
+    telegram_id: int
+    plan_code: str
+    expires_at: Optional[datetime] = None
+    username: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    language: str = "ru"
+    device_limit_override: Optional[int] = Field(default=None, ge=1)
+
+
+class AdminUserPatchIn(BaseModel):
+    device_limit_override: Optional[int] = None
+
+
+class ExtendIn(BaseModel):
+    days_added: Optional[int] = Field(default=None, gt=0)
+    days: Optional[int] = Field(default=None, gt=0)
+    reason: str = "manual extension"
+
+    def normalized_days(self) -> int:
+        return int(self.days_added or self.days or 30)
+
+
+class LocationIn(BaseModel):
+    code: str
+    name_ru: str
+    name_en: str
+    country_code: Optional[str] = None
+    is_active: bool = True
+    is_recommended: bool = False
+    is_reserve: bool = False
+    status: str = "online"
+    sort_order: int = 100
+    download_mbps: Optional[float] = None
+    upload_mbps: Optional[float] = None
+    ping_ms: Optional[int] = None
+    speed_checked_at: Optional[str] = None
+    vpn_payload: Dict[str, Any] = Field(default_factory=dict)
+
+
+class LocationPatchIn(BaseModel):
+    name_ru: Optional[str] = None
+    name_en: Optional[str] = None
+    country_code: Optional[str] = None
+    is_active: Optional[bool] = None
+    is_recommended: Optional[bool] = None
+    is_reserve: Optional[bool] = None
+    status: Optional[str] = None
+    sort_order: Optional[int] = None
+    download_mbps: Optional[float] = None
+    upload_mbps: Optional[float] = None
+    ping_ms: Optional[int] = None
+    speed_checked_at: Optional[str] = None
+    vpn_payload: Optional[Dict[str, Any]] = None
+
+
+class BroadcastIn(BaseModel):
+    text: str = ""
+    statuses: List[str] = Field(default_factory=lambda: ["active"])
+
+
+class TestSendIn(BaseModel):
+    telegram_id: int
+    text: str
+
+
+class VpnClientEventIn(BaseModel):
+    platform: str
+    stage: str = "runtime"
+    status: Optional[str] = None
+    location_code: Optional[str] = None
+    error_message: Optional[str] = None
+    details: Optional[str] = None
+
+
+class AdminPlanSettingsIn(BaseModel):
+    slot: str
+    code: str
+    name_ru: str
+    name_en: Optional[str] = None
+    price_rub: int = Field(default=0, ge=0)
+    duration_days: int = Field(default=1, ge=1)
+    device_limit: int = Field(default=1, ge=1)
+    is_active: bool = True
+
+
+class AdminVpnSettingsIn(BaseModel):
+    app_name: str
+    client_mode: str = "hiddify"
+    app_env: str = "production"
+    languages: List[str] = Field(default_factory=lambda: ["ru", "en"])
+    bot_name: str
+    bot_username: str
+    support_telegram_url: str
+    payments_enabled: bool = False
+    maintenance_mode: bool = False
+    new_activations_enabled: bool = True
+    max_devices_per_account: int = Field(default=1, ge=1)
+    device_limit: Optional[int] = Field(default=None, ge=1)
+    plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
+
+
+RU_LTE_RESERVE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
+BLACK_RESERVE_LOCATION_CODES: Tuple[str, ...] = ("intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3")
+RU_LTE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte",) + RU_LTE_RESERVE_LOCATION_CODES
+BLACK_LOCATION_CODES: Tuple[str, ...] = ("intl-fast",) + BLACK_RESERVE_LOCATION_CODES
+PUBLIC_STABLE_LOCATION_CODES: Tuple[str, ...] = RU_LTE_LOCATION_CODES + BLACK_LOCATION_CODES
+PUBLIC_VIRTUAL_LOCATION_CODES: Tuple[str, ...] = ("auto-fastest", "auto-reserve")
+_DEAD_CANDIDATE_CACHE: Dict[str, Dict[str, float]] = {"ru_lte": {}, "black": {}}
+_DEAD_CANDIDATE_LOCK = threading.Lock()
+_PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+_VPN_CONFIGS_RAW_BASE = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main"
+_REMOTE_SOURCE_ALIASES: Dict[str, str] = {
+    "Vless-Reality-White-Lists-Rus-Mobile.txt": f"{_VPN_CONFIGS_RAW_BASE}/Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": f"{_VPN_CONFIGS_RAW_BASE}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+    "WHITE-CIDR-RU-checked.txt": f"{_VPN_CONFIGS_RAW_BASE}/WHITE-CIDR-RU-checked.txt",
+    "WHITE-CIDR-RU-all.txt": f"{_VPN_CONFIGS_RAW_BASE}/WHITE-CIDR-RU-all.txt",
+    "BLACK_VLESS_RUS_mobile.txt": f"{_VPN_CONFIGS_RAW_BASE}/BLACK_VLESS_RUS_mobile.txt",
+    "BLACK_VLESS_RUS.txt": f"{_VPN_CONFIGS_RAW_BASE}/BLACK_VLESS_RUS.txt",
+}
+
+_LOCAL_SOURCE_FALLBACKS: Dict[str, Path] = {
+    "Vless-Reality-White-Lists-Rus-Mobile.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile.txt",
+    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+    "WHITE-CIDR-RU-checked.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-checked.txt",
+    "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
+    "BLACK_VLESS_RUS_mobile.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS_mobile.txt",
+    "BLACK_VLESS_RUS.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS.txt",
+}
+
+
+def _canonical_source_name(source: str) -> str:
+    raw = str(source or "").strip()
+    return Path(urlsplit(raw).path or raw).name
+
+
+def _canonical_remote_source_url(source: str) -> Optional[str]:
+    raw = str(source or "").strip()
+    if not raw:
+        return None
+    if raw.startswith(("http://", "https://")):
+        return raw
+    return _REMOTE_SOURCE_ALIASES.get(_canonical_source_name(raw))
+
+
+def _fresh_source_url(url: str) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return raw
+    parts = list(urlsplit(raw))
+    query_items = parse_qsl(parts[3], keep_blank_values=True)
+    query_items = [(key, value) for key, value in query_items if key != "_ts"]
+    query_items.append(("_ts", str(int(time.time()))))
+    parts[3] = urlencode(query_items)
+    return urlunsplit(parts)
+
+
+def _resolve_local_source_path(source: str) -> Path:
+    raw = str(source or "").strip()
+    path = Path(raw)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    return (_PROJECT_ROOT / path).resolve()
+
+
+def _read_text_from_source(source: str) -> str:
+    raw = str(source or "").strip()
+    if not raw:
+        return ""
+    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(_canonical_source_name(raw))
+    remote_url = _canonical_remote_source_url(raw)
+    request_headers = {
+        "Accept": "text/plain, text/html;q=0.9, */*;q=0.8",
+        "Cache-Control": "no-cache, no-store, max-age=0",
+        "Pragma": "no-cache",
+        "User-Agent": "inet-vpn-refresh/1.0",
+    }
+
+    if remote_url:
+        try:
+            response = requests.get(_fresh_source_url(remote_url), timeout=20, headers=request_headers)
+            response.raise_for_status()
+            return response.text
+        except Exception:
+            if raw.startswith(("http://", "https://")) and fallback_path and fallback_path.is_file():
+                return fallback_path.read_text(encoding="utf-8")
+            if not raw.startswith(("http://", "https://")):
+                path = _resolve_local_source_path(raw)
+                if path.is_file():
+                    return path.read_text(encoding="utf-8")
+                if fallback_path and fallback_path.is_file():
+                    return fallback_path.read_text(encoding="utf-8")
+            raise
+
+    path = _resolve_local_source_path(raw)
+    if path.is_file():
+        return path.read_text(encoding="utf-8")
+    if fallback_path and fallback_path.is_file():
+        return fallback_path.read_text(encoding="utf-8")
+    raise FileNotFoundError(f"Source file not found: {raw}")
+
+
+def _decode_vless_name(fragment: str) -> str:
+    return unquote(fragment or "").strip()
+
+
+def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
+    raw = str(line or "").strip()
+    if not raw.startswith("vless://"):
+        return None
+    base, _, fragment = raw.partition("#")
+    parsed = urlsplit(base)
+    if parsed.scheme.lower() != "vless":
+        return None
+    uuid = unquote(parsed.username or "").strip()
+    server = (parsed.hostname or "").strip()
+    try:
+        port = int(parsed.port or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if not uuid or not server or port <= 0:
+        return None
+    query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+    transport = (query.get("type") or query.get("transport") or query.get("network") or "tcp").strip() or "tcp"
+    payload: Dict[str, Any] = {
+        "engine": "xray",
+        "protocol": "vless",
+        "server": server,
+        "port": port,
+        "uuid": uuid,
+        "transport": transport,
+        "network": transport,
+        "security": (query.get("security") or "reality").strip() or "reality",
+        "flow": (query.get("flow") or "").strip(),
+        "sni": (query.get("sni") or query.get("serverName") or query.get("host") or "").strip(),
+        "server_name": (query.get("sni") or query.get("serverName") or query.get("host") or "").strip(),
+        "public_key": (query.get("pbk") or query.get("public_key") or query.get("publicKey") or "").strip(),
+        "short_id": (query.get("sid") or query.get("short_id") or query.get("shortId") or "").strip(),
+        "fingerprint": (query.get("fp") or query.get("fingerprint") or "chrome").strip() or "chrome",
+        "service_name": (query.get("serviceName") or query.get("service_name") or "").strip(),
+        "path": (query.get("path") or query.get("spx") or "").strip(),
+        "packet_encoding": (query.get("packetEncoding") or query.get("packet_encoding") or query.get("packet-encoding") or "xudp").strip() or "xudp",
+        "remark": _decode_vless_name(fragment),
+        "dns_servers": ["1.1.1.1", "8.8.8.8"],
+        "connect_mode": "tun",
+        "full_tunnel": True,
+    }
+    if query.get("mode"):
+        payload["mode"] = query.get("mode")
+    if query.get("host"):
+        payload["host"] = query.get("host")
+    if query.get("alpn"):
+        payload["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
+    return _normalize_vpn_payload_keys(payload)
+
+
+def _transport_allowed(payload: Dict[str, Any], allowed_values: List[str]) -> bool:
+    allowed = {item.strip().lower() for item in (allowed_values or []) if str(item or "").strip()}
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    return transport in allowed if allowed else True
+
+
+def _payload_transport(payload: Dict[str, Any]) -> str:
+    return str(payload.get("transport") or payload.get("network") or "tcp").strip().lower() or "tcp"
+
+
+def _payload_security(payload: Dict[str, Any]) -> str:
+    return str(payload.get("security") or "").strip().lower()
+
+
+def _candidate_identity_key(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        str(payload.get("server") or "").strip().lower(),
+        str(payload.get("port") or "").strip(),
+        str(payload.get("uuid") or "").strip().lower(),
+        str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+        str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+        str(payload.get("server_name") or payload.get("sni") or "").strip().lower(),
+        str(payload.get("path") or "").strip(),
+        str(payload.get("service_name") or "").strip(),
+    ])
+
+
+def _candidate_server_key(payload: Dict[str, Any]) -> str:
+    return "|".join([
+        str(payload.get("server") or "").strip().lower(),
+        str(payload.get("port") or "").strip(),
+    ])
+
+
+def _candidate_sni_key(payload: Dict[str, Any]) -> str:
+    return str(payload.get("server_name") or payload.get("sni") or "").strip().lower()
+
+
+def _dead_candidate_cooldown_seconds(pool: str) -> float:
+    if pool == "black":
+        return max(5, int(settings.BLACK_DEAD_COOLDOWN_MINUTES or 30)) * 60.0
+    return max(5, int(settings.RU_LTE_DEAD_COOLDOWN_MINUTES or 45)) * 60.0
+
+
+def _cleanup_dead_candidate_cache(pool: str) -> None:
+    now = time.time()
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        expired = [key for key, expires_at in bucket.items() if expires_at <= now]
+        for key in expired:
+            bucket.pop(key, None)
+
+
+def _is_candidate_recently_dead(pool: str, payload: Dict[str, Any]) -> bool:
+    _cleanup_dead_candidate_cache(pool)
+    identity = _candidate_identity_key(payload)
+    server_key = _candidate_server_key(payload)
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        return bool(bucket.get(identity) or bucket.get(f"server:{server_key}"))
+
+
+def _mark_candidate_dead(pool: str, payload: Dict[str, Any]) -> None:
+    identity = _candidate_identity_key(payload)
+    server_key = _candidate_server_key(payload)
+    expires_at = time.time() + _dead_candidate_cooldown_seconds(pool)
+    with _DEAD_CANDIDATE_LOCK:
+        bucket = _DEAD_CANDIDATE_CACHE.setdefault(pool, {})
+        if identity:
+            bucket[identity] = expires_at
+        if server_key:
+            bucket[f"server:{server_key}"] = expires_at
+
+
+def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[str]:
+    reasons: List[str] = []
+    protocol = str(payload.get("protocol") or "vless").strip().lower()
+    transport = _payload_transport(payload)
+    security = _payload_security(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
+    public_key = str(payload.get("public_key") or payload.get("publicKey") or "").strip()
+    short_id = str(payload.get("short_id") or payload.get("shortId") or "").strip()
+    flow = str(payload.get("flow") or "").strip().lower()
+    service_name = str(payload.get("service_name") or "").strip()
+    path = str(payload.get("path") or "").strip()
+
+    if protocol != "vless":
+        reasons.append("protocol")
+    if not str(payload.get("server") or "").strip():
+        reasons.append("server")
+    if int(payload.get("port") or 0) <= 0:
+        reasons.append("port")
+    if not str(payload.get("uuid") or "").strip():
+        reasons.append("uuid")
+
+    allowed = settings.BLACK_ALLOWED_TRANSPORTS if pool == "black" else settings.RU_LTE_ALLOWED_TRANSPORTS
+    if not _transport_allowed(payload, allowed or []):
+        reasons.append("transport_not_allowed")
+
+    if pool == "ru_lte" and security != "reality":
+        reasons.append("security_not_reality")
+    if pool == "black" and security not in {"reality", "tls"}:
+        reasons.append("security_unsupported")
+
+    if security in {"reality", "tls"} and not server_name:
+        reasons.append("missing_sni")
+    if security == "reality" and not public_key:
+        reasons.append("missing_public_key")
+    if security == "reality" and transport == "tcp" and flow != "xtls-rprx-vision":
+        reasons.append("tcp_missing_vision_flow")
+    if transport == "grpc" and not service_name:
+        reasons.append("grpc_missing_service_name")
+    if transport in {"ws", "websocket"} and not path:
+        reasons.append("ws_missing_path")
+    if pool == "ru_lte" and security == "reality" and not short_id:
+        reasons.append("missing_short_id")
+
+    return reasons
+
+
+def _is_candidate_strong(payload: Dict[str, Any], *, pool: str) -> bool:
+    return not _candidate_quality_reasons(payload, pool=pool)
+
+
+def _candidate_sort_key(item: Dict[str, Any]) -> Tuple[int, int, str]:
+    return (int(item.get("_score") or 0), int(item.get("_source_priority") or 0), str(item.get("remark") or ""))
+
+
+def _select_diverse_candidates(candidates: List[Dict[str, Any]], *, max_candidates: int) -> List[Dict[str, Any]]:
+    chosen: List[Dict[str, Any]] = []
+    used_servers: set[str] = set()
+    used_sni: set[str] = set()
+
+    for candidate in candidates:
+        server_key = _candidate_server_key(candidate)
+        sni_key = _candidate_sni_key(candidate)
+        if server_key and server_key in used_servers:
+            continue
+        if sni_key and sni_key in used_sni:
+            continue
+        chosen.append(candidate)
+        if server_key:
+            used_servers.add(server_key)
+        if sni_key:
+            used_sni.add(sni_key)
+        if len(chosen) >= max_candidates:
+            return chosen
+
+    for candidate in candidates:
+        identity = _candidate_identity_key(candidate)
+        if any(_candidate_identity_key(item) == identity for item in chosen):
+            continue
+        chosen.append(candidate)
+        if len(chosen) >= max_candidates:
+            return chosen
+    return chosen
+
+
+def _probe_candidate_with_timeout(payload: Dict[str, Any], timeout_seconds: float) -> Dict[str, Any]:
+    server = str(payload.get("server") or "").strip()
+    port = int(payload.get("port") or 0)
+    if not server or port <= 0:
+        return {"ok": False, "latency_ms": None, "error": "missing_server_or_port"}
+
+    started = time.perf_counter()
+    try:
+        addr_infos = socket.getaddrinfo(server, port, type=socket.SOCK_STREAM)
+    except OSError as exc:
+        return {"ok": False, "latency_ms": None, "error": f"dns:{exc}"}
+
+    timeout = max(1.0, float(timeout_seconds or 4))
+    last_error = None
+    for family, socktype, proto, _canonname, sockaddr in addr_infos[:4]:
+        sock = None
+        try:
+            sock = socket.socket(family, socktype, proto)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            latency_ms = int((time.perf_counter() - started) * 1000)
+            return {"ok": True, "latency_ms": latency_ms, "error": None}
+        except OSError as exc:
+            last_error = str(exc)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return {"ok": False, "latency_ms": None, "error": last_error or "connect_failed"}
+
+
+def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
+    runner = str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray").strip().lower() or "xray"
+    if runner not in {"xray", "sing-box", "singbox", "auto"}:
+        runner = "xray"
+
+    def _resolve_path(raw_value: str, default_name: str) -> Optional[str]:
+        raw = str(raw_value or default_name).strip() or default_name
+        if raw.startswith("/"):
+            probe_path = Path(raw)
+            return str(probe_path) if probe_path.is_file() else None
+        return shutil.which(raw)
+
+    xray_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray"), "xray")
+    singbox_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"), "sing-box")
+
+    if runner == "auto":
+        if xray_bin:
+            return ("xray", xray_bin)
+        if singbox_bin:
+            return ("singbox", singbox_bin)
+        return ("xray", None)
+    if runner in {"sing-box", "singbox"}:
+        return ("singbox", singbox_bin)
+    return ("xray", xray_bin)
+
+
+def _pick_free_local_port() -> int:
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        sock.bind(("127.0.0.1", 0))
+        sock.listen(1)
+        return int(sock.getsockname()[1])
+    finally:
+        sock.close()
+
+
+def _wait_for_local_socks_port(port: int, timeout_sec: float) -> bool:
+    deadline = time.time() + max(1.0, timeout_sec)
+    while time.time() < deadline:
+        sock = None
+        try:
+            sock = socket.create_connection(("127.0.0.1", port), timeout=0.5)
+            return True
+        except OSError:
+            time.sleep(0.1)
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except OSError:
+                    pass
+    return False
+
+
+def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
+    transport = _payload_transport(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or payload.get("host") or "").strip()
+    user: Dict[str, Any] = {
+        "id": str(payload.get("uuid") or "").strip(),
+        "encryption": "none",
+    }
+    flow = str(payload.get("flow") or "").strip()
+    if flow:
+        user["flow"] = flow
+
+    stream_settings: Dict[str, Any] = {
+        "network": transport if transport not in {"websocket"} else "ws",
+        "security": "reality",
+        "realitySettings": {
+            "show": False,
+            "serverName": server_name,
+            "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
+            "publicKey": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+            "shortId": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+            "spiderX": str(payload.get("path") or "/").strip() or "/",
+        },
+    }
+    if transport == "grpc":
+        stream_settings["grpcSettings"] = {
+            "serviceName": str(payload.get("service_name") or "").strip(),
+            "multiMode": False,
+        }
+    elif transport in {"ws", "websocket"}:
+        ws_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or "/").strip() or "/",
+        }
+        host = str(payload.get("host") or server_name or "").strip()
+        if host:
+            ws_settings["headers"] = {"Host": host}
+        stream_settings["wsSettings"] = ws_settings
+    elif transport == "xhttp":
+        xhttp_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or "/").strip() or "/",
+            "mode": str(payload.get("mode") or "auto").strip() or "auto",
+        }
+        host = str(payload.get("host") or server_name or "").strip()
+        if host:
+            xhttp_settings["host"] = host
+        extra = payload.get("xhttp_settings")
+        if isinstance(extra, dict):
+            for key, value in extra.items():
+                if key not in xhttp_settings and value not in (None, "", [], {}):
+                    xhttp_settings[key] = value
+        stream_settings["xhttpSettings"] = xhttp_settings
+
+    dns_servers = [str(item or "").strip() for item in (payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()]
+    if not dns_servers:
+        dns_servers = ["1.1.1.1", "8.8.8.8"]
+
+    return {
+        "log": {"loglevel": "warning"},
+        "dns": {
+            "servers": dns_servers,
+            "queryStrategy": "UseIPv4",
+        },
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": int(socks_port),
+                "protocol": "socks",
+                "settings": {
+                    "auth": "noauth",
+                    "udp": True,
+                },
+                "sniffing": {
+                    "enabled": False,
+                },
+            }
+        ],
+        "outbounds": [
+            {
+                "tag": "proxy",
+                "protocol": "vless",
+                "settings": {
+                    "vnext": [
+                        {
+                            "address": str(payload.get("server") or "").strip(),
+                            "port": int(payload.get("port") or 0),
+                            "users": [user],
+                        }
+                    ]
+                },
+                "streamSettings": stream_settings,
+            }
+        ],
+        "routing": {
+            "domainStrategy": "AsIs",
+        },
+    }
+
+
+def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
+    transport = _payload_transport(payload)
+    server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
+    outbound: Dict[str, Any] = {
+        "type": "vless",
+        "tag": "proxy",
+        "server": str(payload.get("server") or "").strip(),
+        "server_port": int(payload.get("port") or 0),
+        "uuid": str(payload.get("uuid") or "").strip(),
+        "packet_encoding": str(payload.get("packet_encoding") or "xudp").strip() or "xudp",
+        "tls": {
+            "enabled": True,
+            "server_name": server_name,
+            "utls": {
+                "enabled": True,
+                "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
+            },
+            "reality": {
+                "enabled": True,
+                "public_key": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+                "short_id": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+            },
+        },
+    }
+    flow = str(payload.get("flow") or "").strip()
+    if flow:
+        outbound["flow"] = flow
+    if transport == "grpc":
+        outbound["transport"] = {
+            "type": "grpc",
+            "service_name": str(payload.get("service_name") or "").strip(),
+        }
+    elif transport in {"ws", "websocket"}:
+        transport_payload: Dict[str, Any] = {
+            "type": "ws",
+            "path": str(payload.get("path") or "/").strip() or "/",
+        }
+        host = str(payload.get("host") or "").strip()
+        if host:
+            transport_payload["headers"] = {"Host": host}
+        outbound["transport"] = transport_payload
+
+    dns_remote_addr = str((payload.get("dns_servers") or ["1.1.1.1"])[0] or "1.1.1.1").strip() or "1.1.1.1"
+    dns_local_addr = str((payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"])[-1] or "8.8.8.8").strip() or "8.8.8.8"
+    return {
+        "log": {"level": "error"},
+        "dns": {
+            "servers": [
+                {"tag": "dns-remote", "address": dns_remote_addr, "detour": "proxy"},
+                {"tag": "dns-direct", "address": dns_local_addr},
+            ],
+            "rules": [
+                {"outbound": ["proxy"], "server": "dns-remote"},
+            ],
+            "final": "dns-remote",
+            "strategy": "ipv4_only",
+        },
+        "inbounds": [
+            {
+                "type": "socks",
+                "tag": "local-socks",
+                "listen": "127.0.0.1",
+                "listen_port": int(socks_port),
+            }
+        ],
+        "outbounds": [
+            outbound,
+            {"type": "direct", "tag": "direct"},
+            {"type": "block", "tag": "block"},
+        ],
+        "route": {
+            "auto_detect_interface": True,
+            "final": "proxy",
+        },
+    }
+
+
+def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
+    connect_timeout = max(2, int(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
+    max_time = max(connect_timeout + 1, int(getattr(settings, "RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12) or 12))
+    command = [
+        "curl",
+        "--silent",
+        "--show-error",
+        "--location",
+        "--output",
+        "/dev/null",
+        "--write-out",
+        "%{http_code} %{time_connect} %{time_starttransfer} %{time_total}",
+        "--socks5-hostname",
+        f"127.0.0.1:{int(socks_port)}",
+        "--connect-timeout",
+        str(connect_timeout),
+        "--max-time",
+        str(max_time),
+        url,
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True, timeout=max_time + 2)
+    if completed.returncode != 0:
+        return {"ok": False, "error": (completed.stderr or completed.stdout or f"curl_exit_{completed.returncode}").strip()}
+    parts = str(completed.stdout or "").strip().split()
+    if len(parts) != 4:
+        return {"ok": False, "error": "curl_bad_metrics"}
+    http_code, _time_connect, _time_ttfb, time_total = parts
+    try:
+        latency_ms = int(float(time_total) * 1000)
+    except (TypeError, ValueError):
+        latency_ms = None
+    if str(http_code) == "000":
+        return {"ok": False, "error": "http_000", "latency_ms": latency_ms}
+    return {"ok": True, "latency_ms": latency_ms, "http_code": http_code}
+
+
+def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
+    candidates: List[str] = []
+
+    def _append(value: Any) -> None:
+        text = str(value or "").strip()
+        if not text:
+            return
+        if text.startswith(("http://", "https://")):
+            url = text
+        else:
+            host = text.split("/")[0].strip()
+            if not host or ":" in host or " " in host:
+                return
+            url = f"https://{host}/"
+        if url not in candidates:
+            candidates.append(url)
+
+    _append(payload.get("host"))
+    _append(payload.get("server_name") or payload.get("sni"))
+    for item in (getattr(settings, "RU_LTE_REAL_PROBE_URLS", []) or []):
+        _append(item)
+    return candidates
+
+
+def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str, Any]:
+    runner_name, runner_bin = _resolve_probe_runner()
+    transport = _payload_transport(payload)
+    if transport == "xhttp" and runner_name == "singbox":
+        xray_bin = shutil.which(str(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray")
+        if xray_bin:
+            runner_name, runner_bin = "xray", xray_bin
+    if not runner_bin:
+        return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
+
+    urls = _ru_lte_candidate_probe_urls(payload)
+    if not urls:
+        return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
+
+    socks_port = _pick_free_local_port()
+    warmup_ms = max(0, int(getattr(settings, "RU_LTE_REAL_PROBE_WARMUP_MS", 1200) or 1200))
+    process: Optional[subprocess.Popen[str]] = None
+    stdout_tail = ""
+    with tempfile.TemporaryDirectory(prefix="inet_ru_lte_probe_") as temp_dir:
+        config_path = Path(temp_dir) / "config.json"
+        if runner_name == "singbox":
+            config_payload = _build_singbox_ru_lte_probe_config(payload, socks_port)
+            command = [runner_bin, "run", "-c", str(config_path)]
+        else:
+            config_payload = _build_xray_ru_lte_probe_config(payload, socks_port)
+            command = [runner_bin, "-config", str(config_path)]
+        config_path.write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+        try:
+            process = subprocess.Popen(
+                command,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+            )
+            if not _wait_for_local_socks_port(socks_port, max(2.0, float(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))):
+                if process.poll() is not None:
+                    stdout_tail = (process.stdout.read() if process.stdout else "").strip()[-700:]
+                    return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real"}
+                return {"ok": False, "latency_ms": None, "error": "socks_not_ready", "method": f"{runner_name}_real"}
+            if warmup_ms > 0:
+                time.sleep(warmup_ms / 1000.0)
+            last_error = "probe_failed"
+            for url in urls:
+                result = _run_curl_through_socks(url, socks_port)
+                if result.get("ok"):
+                    result["method"] = f"{runner_name}_real"
+                    result["probe_url"] = url
+                    return result
+                last_error = str(result.get("error") or last_error)
+            return {"ok": False, "latency_ms": None, "error": last_error, "method": f"{runner_name}_real"}
+        except subprocess.TimeoutExpired:
+            return {"ok": False, "latency_ms": None, "error": "real_probe_timeout", "method": f"{runner_name}_real"}
+        except Exception as exc:
+            return {"ok": False, "latency_ms": None, "error": f"real_probe_exception:{exc}", "method": f"{runner_name}_real"}
+        finally:
+            if process is not None:
+                try:
+                    process.terminate()
+                    process.wait(timeout=2)
+                except Exception:
+                    try:
+                        process.kill()
+                    except Exception:
+                        pass
+                    try:
+                        process.wait(timeout=1)
+                    except Exception:
+                        pass
+
+
+def _ru_lte_transport_bonus(payload: Dict[str, Any]) -> int:
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    if transport == "xhttp":
+        return 60
+    if transport == "grpc":
+        return 50
+    if transport in {"ws", "websocket"}:
+        return 40
+    if transport == "tcp":
+        return -25
+    return -50
+
+
+def _ru_lte_source_priority(source: str) -> int:
+    raw = str(source or "").strip().lower()
+    if raw.endswith("/vless-reality-white-lists-rus-mobile.txt") or raw.endswith("vless-reality-white-lists-rus-mobile.txt"):
+        return 40
+    if raw.endswith("/vless-reality-white-lists-rus-mobile-2.txt") or raw.endswith("vless-reality-white-lists-rus-mobile-2.txt"):
+        return 30
+    if raw.endswith("/white-cidr-ru-checked.txt") or raw.endswith("white-cidr-ru-checked.txt"):
+        return 20
+    if raw.endswith("/white-cidr-ru-all.txt") or raw.endswith("white-cidr-ru-all.txt"):
+        return 10
+    if raw.endswith("/white-sni-ru-all.txt") or raw.endswith("white-sni-ru-all.txt"):
+        return 0
+    return 0
+
+
+def _ru_lte_transport_allowed(payload: Dict[str, Any]) -> bool:
+    allowed = {item.strip().lower() for item in (settings.RU_LTE_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws", "xhttp"]) if str(item or "").strip()}
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    return transport in allowed
+
+
+def _black_source_priority(source: str) -> int:
+    raw = str(source or "").strip().lower()
+    if raw.endswith('/black_vless_rus_mobile.txt') or raw.endswith('black_vless_rus_mobile.txt'):
+        return 40
+    if raw.endswith('/black_vless_rus.txt') or raw.endswith('black_vless_rus.txt'):
+        return 30
+    if raw.endswith('/black_ss+all_rus.txt') or raw.endswith('black_ss+all_rus.txt'):
+        return 10
+    return 0
+
+
+def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
+    allowed = {item.strip().lower() for item in (settings.BLACK_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws", "xhttp"]) if str(item or "").strip()}
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    return transport in allowed if allowed else True
+
+
+def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _probe_candidate_with_timeout(payload, float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
+
+
+def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    if bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)):
+        real_probe = _probe_ru_lte_candidate_via_real_tunnel(payload)
+        if real_probe.get("ok"):
+            return real_probe
+        if bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)):
+            return real_probe
+
+    fallback_probe = _probe_candidate_with_timeout(payload, float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
+    fallback_probe["method"] = "tcp_fallback"
+    return fallback_probe
+
+
+def _ru_lte_payload_score(payload: Dict[str, Any]) -> int:
+    score = 0
+    transport = _payload_transport(payload)
+    security = _payload_security(payload)
+    score += _ru_lte_transport_bonus(payload)
+    if security == "reality":
+        score += 35
+    elif security == "tls":
+        score += 10
+    if str(payload.get("flow") or "").strip().lower() == "xtls-rprx-vision":
+        score += 20
+    elif transport == "tcp":
+        score -= 35
+    remark = str(payload.get("remark") or "").lower()
+    if "cidr" in remark:
+        score += 20
+    if "mobile" in remark or "lte" in remark:
+        score += 15
+    if payload.get("server_name") or payload.get("sni"):
+        score += 10
+    if payload.get("public_key"):
+        score += 10
+    if payload.get("short_id"):
+        score += 8
+    if transport == "grpc" and payload.get("service_name"):
+        score += 12
+    if transport in {"ws", "websocket"} and payload.get("path"):
+        score += 10
+    quality_penalty = len(_candidate_quality_reasons(payload, pool="black" if security == "tls" else "ru_lte")) * 20
+    score -= quality_penalty
+    latency = payload.get("_latency_ms")
+    if isinstance(latency, int):
+        if latency <= 120:
+            score += 40
+        elif latency <= 200:
+            score += 28
+        elif latency <= 350:
+            score += 15
+        elif latency <= 600:
+            score += 5
+        else:
+            score -= 25
+    if payload.get("_probe_ok"):
+        score += 50
+    return score
+
+
+def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    for row in list_locations(active_only=False):
+        if str(row.get("code") or "") == code:
+            return patch_location(int(row.get("id")), updates)
+
+    default_names = {
+        "ru-lte": ("Россия LTE", "Russia LTE", False),
+        "ru-lte-reserve-1": ("Россия LTE | Резерв 1", "Russia LTE | Reserve 1", True),
+        "ru-lte-reserve-2": ("Россия LTE | Резерв 2", "Russia LTE | Reserve 2", True),
+        "ru-lte-reserve-3": ("Россия LTE | Резерв 3", "Russia LTE | Reserve 3", True),
+        "intl-fast": ("Fast / International", "Fast / International", False),
+        "intl-fast-reserve-1": ("Fast / International | Reserve 1", "Fast / International | Reserve 1", True),
+        "intl-fast-reserve-2": ("Fast / International | Reserve 2", "Fast / International | Reserve 2", True),
+        "intl-fast-reserve-3": ("Fast / International | Reserve 3", "Fast / International | Reserve 3", True),
+    }
+    if code not in default_names:
+        return None
+
+    name_ru, name_en, is_reserve = default_names[code]
+    base_payload = dict(updates.get("vpn_payload") or {})
+    if base_payload:
+        base_payload.setdefault("location_code", code)
+        base_payload.setdefault("remark", name_en)
+
+    payload = {
+        "code": code,
+        "name_ru": str(updates.get("name_ru") or name_ru),
+        "name_en": str(updates.get("name_en") or name_en),
+        "country_code": updates.get("country_code", "RU" if code.startswith("ru-lte") else None),
+        "is_active": bool(updates.get("is_active", True)),
+        "is_recommended": bool(updates.get("is_recommended", code == "ru-lte")),
+        "is_reserve": bool(updates.get("is_reserve", is_reserve)),
+        "status": str(updates.get("status") or "offline"),
+        "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82, "intl-fast-reserve-3": 83}.get(code, 100)),
+        "vpn_payload": base_payload,
+        "location_source": "catalog",
+    }
+    return create_location(payload)
+
+
+def refresh_ru_lte_locations() -> Dict[str, Any]:
+    sources = [item for item in (settings.RU_LTE_SOURCE_URLS or []) if str(item or "").strip()]
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    source_stats: List[Dict[str, Any]] = []
+    raw_parsed_total = 0
+    complete_candidates_total = 0
+    duplicate_skipped_total = 0
+    quality_rejected_total = 0
+    cooldown_skipped_total = 0
+
+    for source in sources:
+        stat = {
+            "source": source,
+            "lines": 0,
+            "parsed": 0,
+            "complete": 0,
+            "accepted": 0,
+            "duplicates": 0,
+            "quality_rejected": 0,
+            "cooldown_skipped": 0,
+            "error": None,
+        }
+        try:
+            content = _read_text_from_source(source)
+            for line in content.splitlines():
+                stat["lines"] += 1
+                payload = _parse_vless_subscription_line(line)
+                if not payload:
+                    continue
+                stat["parsed"] += 1
+                raw_parsed_total += 1
+                normalized = _normalize_vpn_payload_keys(payload)
+                if not _config_is_complete(normalized):
+                    continue
+                stat["complete"] += 1
+                complete_candidates_total += 1
+                reasons = _candidate_quality_reasons(normalized, pool="ru_lte")
+                if reasons:
+                    stat["quality_rejected"] += 1
+                    quality_rejected_total += 1
+                    continue
+                key = _candidate_identity_key(normalized)
+                if key in seen:
+                    stat["duplicates"] += 1
+                    duplicate_skipped_total += 1
+                    continue
+                if _is_candidate_recently_dead("ru_lte", normalized):
+                    stat["cooldown_skipped"] += 1
+                    cooldown_skipped_total += 1
+                    continue
+                seen.add(key)
+                normalized["_source"] = source
+                normalized["_source_priority"] = _ru_lte_source_priority(source)
+                normalized["_score"] = _ru_lte_payload_score(normalized)
+                candidates.append(normalized)
+                stat["accepted"] += 1
+        except Exception as exc:
+            stat["error"] = str(exc)
+        source_stats.append(stat)
+
+    candidates.sort(key=_candidate_sort_key, reverse=True)
+    test_limit = max(1, int(settings.RU_LTE_TEST_LIMIT or 40))
+    tested: List[Dict[str, Any]] = []
+    probed_total = 0
+    probe_errors = 0
+    for candidate in candidates[:test_limit]:
+        probed_total += 1
+        probe = _ru_lte_probe_candidate(candidate)
+        if not probe.get("ok"):
+            probe_errors += 1
+            _mark_candidate_dead("ru_lte", candidate)
+            continue
+        normalized = dict(candidate)
+        normalized["_probe_ok"] = True
+        normalized["_latency_ms"] = int(probe.get("latency_ms") or 0)
+        normalized["_probe_method"] = str(probe.get("method") or "")
+        normalized["_probe_url"] = str(probe.get("probe_url") or "")
+        normalized["_score"] = _ru_lte_payload_score(normalized)
+        tested.append(normalized)
+
+    tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
+    max_candidates = min(len(RU_LTE_RESERVE_LOCATION_CODES), max(1, int(settings.RU_LTE_MAX_CANDIDATES or len(RU_LTE_RESERVE_LOCATION_CODES))))
+    top = _select_diverse_candidates(tested, max_candidates=max_candidates)[:max_candidates]
+
+    existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
+    selected_identities = {_candidate_identity_key(item) for item in top}
+    if len(top) < max_candidates:
+        for code in RU_LTE_RESERVE_LOCATION_CODES:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            if not existing_payload or not _config_is_complete(existing_payload):
+                continue
+            existing_payload = _normalize_vpn_payload_keys(existing_payload)
+            if _candidate_identity_key(existing_payload) in selected_identities:
+                continue
+            if not _is_candidate_strong(existing_payload, pool="ru_lte"):
+                continue
+            if _is_candidate_recently_dead("ru_lte", existing_payload):
+                continue
+            probe = _ru_lte_probe_candidate(existing_payload)
+            if not probe.get("ok"):
+                _mark_candidate_dead("ru_lte", existing_payload)
+                continue
+            existing_payload["_probe_ok"] = True
+            existing_payload["_latency_ms"] = int(probe.get("latency_ms") or existing.get("ping_ms") or 0)
+            existing_payload["_probe_method"] = str(probe.get("method") or "")
+            existing_payload["_probe_url"] = str(probe.get("probe_url") or "")
+            existing_payload["_source_priority"] = -1
+            existing_payload["_score"] = _ru_lte_payload_score(existing_payload)
+            top.append(existing_payload)
+            selected_identities.add(_candidate_identity_key(existing_payload))
+            if len(top) >= max_candidates:
+                break
+        top = _select_diverse_candidates(top, max_candidates=max_candidates)[:max_candidates]
+
+    assigned: List[Dict[str, Any]] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    remarks = {
+        "ru-lte-reserve-1": "Russia LTE | Reserve 1",
+        "ru-lte-reserve-2": "Russia LTE | Reserve 2",
+        "ru-lte-reserve-3": "Russia LTE | Reserve 3",
+    }
+
+    for idx, code in enumerate(RU_LTE_RESERVE_LOCATION_CODES):
+        payload = dict(top[idx]) if idx < len(top) else {}
+        if payload:
+            for key in ["_score", "_source", "_probe_ok"]:
+                payload.pop(key, None)
+            probe_method = str(payload.pop("_probe_method", "") or "")
+            probe_url = str(payload.pop("_probe_url", "") or "")
+            latency_ms = int(payload.pop("_latency_ms", 0) or 0)
+            payload["location_code"] = code
+            payload["remark"] = remarks.get(code, code)
+            updates = {
+                "vpn_payload": payload,
+                "status": "online",
+                "is_active": True,
+                "is_recommended": False,
+                "is_reserve": True,
+                "ping_ms": latency_ms if latency_ms > 0 else None,
+                "speed_checked_at": now_iso,
+            }
+            row = _patch_location_by_code(code, updates)
+            assigned.append({
+                "code": code,
+                "server": payload.get("server"),
+                "transport": payload.get("transport"),
+                "remark": payload.get("remark"),
+                "latency_ms": latency_ms,
+                "probe_method": probe_method,
+                "probe_url": probe_url,
+                "updated": bool(row),
+                "kept_old": idx >= len(tested),
+            })
+        else:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            keep_old = False
+            if existing_payload and _config_is_complete(existing_payload):
+                existing_payload = _normalize_vpn_payload_keys(existing_payload)
+                if _is_candidate_strong(existing_payload, pool="ru_lte") and not _is_candidate_recently_dead("ru_lte", existing_payload):
+                    probe = _ru_lte_probe_candidate(existing_payload)
+                    if probe.get("ok"):
+                        _patch_location_by_code(code, {
+                            "status": "online",
+                            "is_active": True,
+                            "is_recommended": False,
+                            "is_reserve": True,
+                            "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "speed_checked_at": now_iso,
+                        })
+                        assigned.append({
+                            "code": code,
+                            "server": existing_payload.get("server"),
+                            "transport": existing_payload.get("transport"),
+                            "remark": remarks.get(code, code),
+                            "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "probe_method": probe.get("method"),
+                            "probe_url": probe.get("probe_url"),
+                            "updated": True,
+                            "kept_old": True,
+                        })
+                        keep_old = True
+                    else:
+                        _mark_candidate_dead("ru_lte", existing_payload)
                 else:
-                    cur.execute(
-                        """
-                        INSERT INTO plans (code, name_ru, name_en, price_rub, duration_days, device_limit, is_active, source_env_key)
-                        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(price_rub)s, %(duration_days)s, %(device_limit)s, %(is_active)s, %(source_env_key)s)
-                        ON CONFLICT (code) DO UPDATE SET
-                            name_ru = EXCLUDED.name_ru,
-                            name_en = EXCLUDED.name_en,
-                            price_rub = EXCLUDED.price_rub,
-                            duration_days = EXCLUDED.duration_days,
-                            device_limit = EXCLUDED.device_limit,
-                            is_active = EXCLUDED.is_active,
-                            source_env_key = EXCLUDED.source_env_key,
-                            updated_at = NOW()
-                        """,
-                        plan,
-                    )
-            if obsolete_sources:
-                cur.execute(
-                    "UPDATE plans SET is_active = FALSE, updated_at = NOW() WHERE source_env_key = ANY(%s)",
-                    (list(obsolete_sources),),
-                )
-        conn.commit()
+                    _mark_candidate_dead("ru_lte", existing_payload)
+            if not keep_old:
+                row = _patch_location_by_code(code, {
+                    "status": "offline",
+                    "is_active": False,
+                    "is_recommended": False,
+                    "is_reserve": True,
+                    "ping_ms": None,
+                    "speed_checked_at": now_iso,
+                })
+                assigned.append({"code": code, "server": None, "transport": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
+
+    selected_live = [item for item in assigned if item.get("server")]
+    reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
+    effective_candidates_total = max(len(tested), len(selected_live))
+    source_errors = [item for item in source_stats if item.get("error")]
+    source_errors_total = len(source_errors)
+    sources_ok_total = len(source_stats) - source_errors_total
+    display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
+    summary_live_total = max(len(tested), len(selected_live))
+    refresh_summary = (
+        f"parsed {raw_parsed_total} | live {summary_live_total} | selected {len(selected_live)}"
+    )
+    if reused_existing_total:
+        refresh_summary += f" | reused {reused_existing_total}"
+    if source_errors_total:
+        refresh_summary += f" | source_errors {source_errors_total}"
+
+    return {
+        "ok": bool(top),
+        "sources": source_stats,
+        # Admin banner field: show parsed count when available, otherwise fall back
+        # to the effective/reused live pool so the UI never shows confusing 0|3.
+        "candidates_total": display_candidates_total,
+        "raw_parsed_total": raw_parsed_total,
+        "parsed_candidates_total": raw_parsed_total,
+        "complete_candidates_total": complete_candidates_total,
+        "unique_candidates_total": len(candidates),
+        "effective_candidates_total": effective_candidates_total,
+        "quality_rejected_total": quality_rejected_total,
+        "duplicate_skipped_total": duplicate_skipped_total,
+        "cooldown_skipped_total": cooldown_skipped_total,
+        "tested_total": probed_total,
+        "live_total": len(tested),
+        "reused_existing_total": reused_existing_total,
+        "probe_errors": probe_errors,
+        "source_errors_total": source_errors_total,
+        "sources_total": len(source_stats),
+        "sources_ok_total": sources_ok_total,
+        "source_errors": [{"source": item.get("source"), "error": item.get("error")} for item in source_errors],
+        "real_probe_enabled": bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)),
+        "real_probe_required": bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)),
+        "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
+        "selected": assigned,
+        "selected_live_total": len(selected_live),
+        "refresh_summary": refresh_summary,
+        "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
+        "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
+    }
 
 
-def _coerce_runtime_bool(value: Any, default: bool) -> bool:
+def refresh_black_locations() -> Dict[str, Any]:
+    sources = [item for item in (settings.BLACK_SOURCE_URLS or []) if str(item or "").strip()]
+    candidates: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    source_stats: List[Dict[str, Any]] = []
+    raw_parsed_total = 0
+    complete_candidates_total = 0
+    duplicate_skipped_total = 0
+    quality_rejected_total = 0
+    cooldown_skipped_total = 0
+
+    for source in sources:
+        stat = {
+            "source": source,
+            "lines": 0,
+            "parsed": 0,
+            "complete": 0,
+            "accepted": 0,
+            "duplicates": 0,
+            "quality_rejected": 0,
+            "cooldown_skipped": 0,
+            "error": None,
+        }
+        try:
+            content = _read_text_from_source(source)
+            for line in content.splitlines():
+                stat["lines"] += 1
+                payload = _parse_vless_subscription_line(line)
+                if not payload:
+                    continue
+                stat["parsed"] += 1
+                raw_parsed_total += 1
+                normalized = _normalize_vpn_payload_keys(payload)
+                if not _config_is_complete(normalized):
+                    continue
+                stat["complete"] += 1
+                complete_candidates_total += 1
+                reasons = _candidate_quality_reasons(normalized, pool="black")
+                if reasons:
+                    stat["quality_rejected"] += 1
+                    quality_rejected_total += 1
+                    continue
+                key = _candidate_identity_key(normalized)
+                if key in seen:
+                    stat["duplicates"] += 1
+                    duplicate_skipped_total += 1
+                    continue
+                if _is_candidate_recently_dead("black", normalized):
+                    stat["cooldown_skipped"] += 1
+                    cooldown_skipped_total += 1
+                    continue
+                seen.add(key)
+                normalized["_source"] = source
+                normalized["_source_priority"] = _black_source_priority(source)
+                normalized["_score"] = _ru_lte_payload_score(normalized)
+                candidates.append(normalized)
+                stat["accepted"] += 1
+        except Exception as exc:
+            stat["error"] = str(exc)
+        source_stats.append(stat)
+
+    candidates.sort(key=_candidate_sort_key, reverse=True)
+    test_limit = max(1, int(settings.BLACK_TEST_LIMIT or 40))
+    tested: List[Dict[str, Any]] = []
+    probed_total = 0
+    probe_errors = 0
+    max_candidates = min(len(BLACK_RESERVE_LOCATION_CODES), max(1, int(settings.BLACK_MAX_CANDIDATES or len(BLACK_RESERVE_LOCATION_CODES))))
+    probe_budget_seconds = max(8.0, min(float(settings.BLACK_AUTO_REFRESH_TIMEOUT_SEC or 600), 25.0))
+    probe_started = time.perf_counter()
+    for candidate in candidates[:test_limit]:
+        if tested and len(tested) >= max_candidates and (time.perf_counter() - probe_started) >= 2.0:
+            break
+        if (time.perf_counter() - probe_started) >= probe_budget_seconds:
+            break
+        probed_total += 1
+        probe = _black_probe_candidate(candidate)
+        if not probe.get("ok"):
+            probe_errors += 1
+            _mark_candidate_dead("black", candidate)
+            continue
+        normalized = dict(candidate)
+        normalized["_probe_ok"] = True
+        normalized["_latency_ms"] = int(probe.get("latency_ms") or 0)
+        normalized["_score"] = _ru_lte_payload_score(normalized)
+        tested.append(normalized)
+
+    tested.sort(key=lambda item: (int(item.get("_latency_ms") or 999999), -int(item.get("_source_priority") or 0), -int(item.get("_score") or 0), str(item.get("remark") or "")))
+    top = _select_diverse_candidates(tested, max_candidates=max_candidates)[:max_candidates]
+
+    existing_by_code = {str(row.get("code") or ""): row for row in list_locations(active_only=False)}
+    selected_identities = {_candidate_identity_key(item) for item in top}
+    if len(top) < max_candidates:
+        for code in BLACK_RESERVE_LOCATION_CODES:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            if not existing_payload or not _config_is_complete(existing_payload):
+                continue
+            existing_payload = _normalize_vpn_payload_keys(existing_payload)
+            if _candidate_identity_key(existing_payload) in selected_identities:
+                continue
+            if not _is_candidate_strong(existing_payload, pool="black"):
+                continue
+            if _is_candidate_recently_dead("black", existing_payload):
+                continue
+            probe = _black_probe_candidate(existing_payload)
+            if not probe.get("ok"):
+                _mark_candidate_dead("black", existing_payload)
+                continue
+            existing_payload["_probe_ok"] = True
+            existing_payload["_latency_ms"] = int(probe.get("latency_ms") or existing.get("ping_ms") or 0)
+            existing_payload["_source_priority"] = -1
+            existing_payload["_score"] = _ru_lte_payload_score(existing_payload)
+            top.append(existing_payload)
+            selected_identities.add(_candidate_identity_key(existing_payload))
+            if len(top) >= max_candidates:
+                break
+        top = _select_diverse_candidates(top, max_candidates=max_candidates)[:max_candidates]
+
+    assigned: List[Dict[str, Any]] = []
+    now_iso = datetime.now(timezone.utc).isoformat()
+    remarks = {
+        "intl-fast-reserve-1": "Fast / International | Reserve 1",
+        "intl-fast-reserve-2": "Fast / International | Reserve 2",
+        "intl-fast-reserve-3": "Fast / International | Reserve 3",
+    }
+
+    for idx, code in enumerate(BLACK_RESERVE_LOCATION_CODES):
+        payload = dict(top[idx]) if idx < len(top) else {}
+        if payload:
+            for key in ["_score", "_source", "_probe_ok"]:
+                payload.pop(key, None)
+            latency_ms = int(payload.pop("_latency_ms", 0) or 0)
+            payload["location_code"] = code
+            payload["remark"] = remarks.get(code, code)
+            updates = {
+                "name_ru": remarks.get(code, code),
+                "name_en": remarks.get(code, code),
+                "country_code": None,
+                "vpn_payload": payload,
+                "status": "online",
+                "is_active": True,
+                "is_recommended": False,
+                "is_reserve": True,
+                "ping_ms": latency_ms if latency_ms > 0 else None,
+                "speed_checked_at": now_iso,
+            }
+            row = _patch_location_by_code(code, updates)
+            assigned.append({
+                "code": code,
+                "server": payload.get("server"),
+                "transport": payload.get("transport"),
+                "security": payload.get("security"),
+                "remark": payload.get("remark"),
+                "latency_ms": latency_ms,
+                "updated": bool(row),
+                "kept_old": idx >= len(tested),
+            })
+        else:
+            existing = existing_by_code.get(code) or {}
+            existing_payload = _compose_vpn_payload_for_location(dict(existing)) if existing else None
+            keep_old = False
+            if existing_payload and _config_is_complete(existing_payload):
+                existing_payload = _normalize_vpn_payload_keys(existing_payload)
+                if _is_candidate_strong(existing_payload, pool="black") and not _is_candidate_recently_dead("black", existing_payload):
+                    probe = _black_probe_candidate(existing_payload)
+                    if probe.get("ok"):
+                        _patch_location_by_code(code, {
+                            "name_ru": remarks.get(code, code),
+                            "name_en": remarks.get(code, code),
+                            "country_code": None,
+                            "status": "online",
+                            "is_active": True,
+                            "is_recommended": False,
+                            "is_reserve": True,
+                            "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "speed_checked_at": now_iso,
+                        })
+                        assigned.append({
+                            "code": code,
+                            "server": existing_payload.get("server"),
+                            "transport": existing_payload.get("transport"),
+                            "security": existing_payload.get("security"),
+                            "remark": remarks.get(code, code),
+                            "latency_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
+                            "updated": True,
+                            "kept_old": True,
+                        })
+                        keep_old = True
+                    else:
+                        _mark_candidate_dead("black", existing_payload)
+                else:
+                    _mark_candidate_dead("black", existing_payload)
+            if not keep_old:
+                row = _patch_location_by_code(code, {
+                    "name_ru": remarks.get(code, code),
+                    "name_en": remarks.get(code, code),
+                    "country_code": None,
+                    "status": "offline",
+                    "is_active": False,
+                    "is_recommended": False,
+                    "is_reserve": True,
+                    "ping_ms": None,
+                    "speed_checked_at": now_iso,
+                })
+                assigned.append({"code": code, "server": None, "transport": None, "security": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
+
+    selected_live = [item for item in assigned if item.get("server")]
+    reused_existing_total = len([item for item in selected_live if item.get("kept_old")])
+    effective_candidates_total = max(len(tested), len(selected_live))
+    source_errors = [item for item in source_stats if item.get("error")]
+    source_errors_total = len(source_errors)
+    sources_ok_total = len(source_stats) - source_errors_total
+    display_candidates_total = raw_parsed_total if raw_parsed_total > 0 else effective_candidates_total
+    summary_live_total = max(len(tested), len(selected_live))
+    refresh_summary = (
+        f"parsed {raw_parsed_total} | live {summary_live_total} | selected {len(selected_live)}"
+    )
+    if reused_existing_total:
+        refresh_summary += f" | reused {reused_existing_total}"
+    if source_errors_total:
+        refresh_summary += f" | source_errors {source_errors_total}"
+
+    return {
+        "ok": bool(top),
+        "sources": source_stats,
+        # Admin banner field: show parsed count when available, otherwise fall back
+        # to the effective/reused live pool so the UI never shows confusing 0|3.
+        "candidates_total": display_candidates_total,
+        "raw_parsed_total": raw_parsed_total,
+        "parsed_candidates_total": raw_parsed_total,
+        "complete_candidates_total": complete_candidates_total,
+        "unique_candidates_total": len(candidates),
+        "effective_candidates_total": effective_candidates_total,
+        "quality_rejected_total": quality_rejected_total,
+        "duplicate_skipped_total": duplicate_skipped_total,
+        "cooldown_skipped_total": cooldown_skipped_total,
+        "tested_total": probed_total,
+        "live_total": len(tested),
+        "reused_existing_total": reused_existing_total,
+        "probe_errors": probe_errors,
+        "source_errors_total": source_errors_total,
+        "sources_total": len(source_stats),
+        "sources_ok_total": sources_ok_total,
+        "source_errors": [{"source": item.get("source"), "error": item.get("error")} for item in source_errors],
+        "selected": assigned,
+        "selected_live_total": len(selected_live),
+        "refresh_summary": refresh_summary,
+        "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
+        "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
+    }
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    bootstrap()
+    if settings.RU_LTE_REFRESH_ON_STARTUP:
+        try:
+            _run_ru_lte_refresh_safe(source="startup")
+        except Exception as exc:
+            _set_ru_lte_refresh_error(exc)
+    if settings.BLACK_REFRESH_ON_STARTUP:
+        try:
+            _run_black_refresh_safe(source="startup")
+        except Exception as exc:
+            _set_black_refresh_error(exc)
+    _start_ru_lte_auto_refresh_loop()
+    _start_black_auto_refresh_loop()
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"] if settings.CORS_ORIGINS == ["*"] else settings.CORS_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.add_middleware(GZipMiddleware, minimum_size=500)
+
+_LOCATIONS_CACHE_TTL_SEC = 5
+_locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
+_ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+_black_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+
+
+def _json_no_cache_headers(*, etag_seed: Optional[str] = None) -> Dict[str, str]:
+    headers = {
+        "Cache-Control": "no-store, no-cache, must-revalidate, max-age=0",
+        "Pragma": "no-cache",
+        "Expires": "0",
+    }
+    if etag_seed is not None:
+        headers["ETag"] = f'W/"{hashlib.sha256(etag_seed.encode("utf-8")).hexdigest()}"'
+    return headers
+
+
+def _runtime_config_version() -> str:
+    parts: List[str] = []
+    for row in list_locations(active_only=False):
+        code = str(row.get("code") or "").strip()
+        updated_at = str(row.get("updated_at") or "").strip()
+        status = str(row.get("status") or "").strip().lower()
+        is_active = "1" if bool(row.get("is_active")) else "0"
+        is_deleted = "1" if bool(row.get("is_deleted")) else "0"
+        payload = _compose_vpn_payload_for_location(dict(row)) or {}
+        payload_json = json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        parts.append("|".join([code, updated_at, status, is_active, is_deleted, payload_json]))
+    digest = hashlib.sha256("\n".join(sorted(parts)).encode("utf-8")).hexdigest()
+    return digest
+
+
+def _config_version_payload() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "version": _runtime_config_version(),
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "locations_cache_ttl_sec": int(_LOCATIONS_CACHE_TTL_SEC),
+        "supports": {
+            "sync": True,
+            "vpn_config": True,
+            "subscription": True,
+        },
+    }
+
+
+def _invalidate_locations_cache() -> None:
+    _locations_cache["items"] = None
+    _locations_cache["expires_at"] = 0.0
+
+
+def _set_ru_lte_refresh_success() -> None:
+    _ru_lte_refresh_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
+    _ru_lte_refresh_state["last_error"] = None
+    _ru_lte_refresh_state["last_error_at"] = None
+
+
+def _set_ru_lte_refresh_error(exc: Exception) -> None:
+    _ru_lte_refresh_state["last_error"] = str(exc)
+    _ru_lte_refresh_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_ru_lte_refresh_safe(*, source: str = "manual") -> Dict[str, Any]:
+    result = refresh_ru_lte_locations()
+    result["refresh_source"] = source
+    _invalidate_locations_cache()
+    _set_ru_lte_refresh_success()
+    return result
+
+
+def _start_ru_lte_auto_refresh_loop() -> None:
+    if not settings.RU_LTE_AUTO_REFRESH_ENABLED:
+        return
+    interval_seconds = max(60, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30) * 60)
+    retry_seconds = min(90, max(20, int(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4) * 10))
+    initial_delay = interval_seconds if settings.RU_LTE_REFRESH_ON_STARTUP else 0
+
+    def worker() -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+        while True:
+            started = time.monotonic()
+            degraded = False
+            try:
+                result = _run_ru_lte_refresh_safe(source="auto")
+                degraded = bool(result.get("selected_live_total", 0) < max(1, int(settings.RU_LTE_MAX_CANDIDATES or 4)))
+            except Exception as exc:
+                _set_ru_lte_refresh_error(exc)
+                degraded = True
+            elapsed = time.monotonic() - started
+            sleep_for = retry_seconds if degraded else interval_seconds
+            time.sleep(max(5.0, sleep_for - elapsed))
+
+    thread = threading.Thread(target=worker, name="ru-lte-auto-refresh", daemon=True)
+    thread.start()
+
+
+def _set_black_refresh_success() -> None:
+    _black_refresh_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
+    _black_refresh_state["last_error"] = None
+    _black_refresh_state["last_error_at"] = None
+
+
+def _set_black_refresh_error(exc: Exception) -> None:
+    _black_refresh_state["last_error"] = str(exc)
+    _black_refresh_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_black_refresh_safe(*, source: str = "manual") -> Dict[str, Any]:
+    result = refresh_black_locations()
+    result["refresh_source"] = source
+    _invalidate_locations_cache()
+    _set_black_refresh_success()
+    return result
+
+
+def _start_black_auto_refresh_loop() -> None:
+    if not settings.BLACK_AUTO_REFRESH_ENABLED:
+        return
+    interval_seconds = max(60, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30) * 60)
+    retry_seconds = min(120, max(30, int(settings.BLACK_CONNECT_TIMEOUT_SEC or 4) * 12))
+    initial_delay = interval_seconds if settings.BLACK_REFRESH_ON_STARTUP else 0
+
+    def worker() -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+        while True:
+            started = time.monotonic()
+            degraded = False
+            try:
+                result = _run_black_refresh_safe(source="auto")
+                degraded = bool(result.get("selected_live_total", 0) < max(1, int(settings.BLACK_MAX_CANDIDATES or 4)))
+            except Exception as exc:
+                _set_black_refresh_error(exc)
+                degraded = True
+            elapsed = time.monotonic() - started
+            sleep_for = retry_seconds if degraded else interval_seconds
+            time.sleep(max(5.0, sleep_for - elapsed))
+
+    thread = threading.Thread(target=worker, name="black-auto-refresh", daemon=True)
+    thread.start()
+
+
+def _location_status_is_online(row: Dict[str, Any]) -> bool:
+    return str(row.get("status") or "").strip().lower() == "online"
+
+
+def _public_location_code_allowed(code: str) -> bool:
+    clean = str(code or "").strip()
+    return bool(clean)
+
+
+def _row_has_ready_payload(row: Dict[str, Any]) -> bool:
+    payload = _compose_vpn_payload_for_location(dict(row))
+    return bool(payload) and _config_is_complete(payload)
+
+
+def _public_concrete_location_allowed(row: Dict[str, Any]) -> bool:
+    code = str(row.get("code") or "").strip()
+    if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        return False
+    if not _location_status_is_online(row):
+        return False
+    if not _row_has_ready_payload(row):
+        return False
+    return True
+
+
+def _public_location_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
+    code = str(row.get("code") or "").strip()
+    is_virtual = code in PUBLIC_VIRTUAL_LOCATION_CODES
+    is_recommended = bool(row.get("is_recommended"))
+    sort_order = int(row.get("sort_order") or 9999)
+    stable_priority = PUBLIC_STABLE_LOCATION_CODES.index(code) if code in PUBLIC_STABLE_LOCATION_CODES else 1000
+    reserve_rank = 1 if bool(row.get("is_reserve")) else 0
+    display_name = str(row.get("name_en") or row.get("name_ru") or code or "").strip().lower()
+    return (
+        0 if is_virtual else 1,
+        0 if is_recommended else 1,
+        sort_order,
+        stable_priority,
+        reserve_rank,
+        display_name,
+    )
+
+
+def _public_location_rows() -> List[Dict[str, Any]]:
+    rows = list_locations(active_only=True)
+    items: List[Dict[str, Any]] = []
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        if not _public_location_code_allowed(code):
+            continue
+        if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            resolved = _pick_virtual_location(code)
+            if resolved is not None:
+                items.append(dict(row))
+            continue
+        if not _public_concrete_location_allowed(row):
+            continue
+        items.append(dict(row))
+    items.sort(key=_public_location_sort_key)
+    return items
+
+
+def _public_locations_health_snapshot() -> Dict[str, Any]:
+    rows = _public_location_rows()
+    online_codes = [str(row.get("code") or "").strip() for row in rows if str(row.get("code") or "").strip() in PUBLIC_STABLE_LOCATION_CODES]
+    online_set = set(online_codes)
+    ru_online = [code for code in RU_LTE_LOCATION_CODES if code in online_set]
+    intl_online = [code for code in BLACK_LOCATION_CODES if code in online_set]
+    return {
+        "public_total": len(rows),
+        "ru_lte_online": ru_online,
+        "intl_online": intl_online,
+        "healthy": bool(ru_online or intl_online),
+        "degraded": not (RU_LTE_LOCATION_CODES[0] in online_set and BLACK_LOCATION_CODES[0] in online_set),
+    }
+
+
+def _cached_locations_payload() -> List[Dict[str, Any]]:
+    now = time.monotonic()
+    cached_items = _locations_cache.get("items")
+    expires_at = float(_locations_cache.get("expires_at") or 0.0)
+    if cached_items is not None and expires_at > now:
+        return cached_items
+    items = [serialize_location(row) for row in _public_location_rows()]
+    _locations_cache["items"] = items
+    _locations_cache["expires_at"] = now + _LOCATIONS_CACHE_TTL_SEC
+    return items
+
+
+
+def _safe_compare_secret(left: Optional[str], right: Optional[str]) -> bool:
+    left_bytes = (left or "").encode("utf-8")
+    right_bytes = (right or "").encode("utf-8")
+    return secrets.compare_digest(left_bytes, right_bytes)
+
+
+def issue_token(user_id: int, *, expires_delta: timedelta, token_type: str = "access") -> str:
+    now = datetime.now(timezone.utc)
+    payload = {
+        "sub": str(user_id),
+        "typ": token_type,
+        "iat": now,
+        "exp": now + expires_delta,
+        "jti": uuid4().hex,
+    }
+    return jwt.encode(payload, settings.JWT_SECRET, algorithm="HS256")
+
+
+
+def issue_access_token(user_id: int) -> str:
+    return issue_token(
+        user_id,
+        expires_delta=timedelta(minutes=max(1, int(settings.AUTH_ACCESS_TOKEN_MINUTES or 60))),
+        token_type="access",
+    )
+
+
+
+def issue_refresh_token(user_id: int) -> str:
+    return issue_token(
+        user_id,
+        expires_delta=timedelta(days=max(1, int(settings.AUTH_REFRESH_TOKEN_DAYS or 90))),
+        token_type="refresh",
+    )
+
+
+
+def _decode_token(raw_token: str, *, expected_type: Optional[str] = None) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(raw_token, settings.JWT_SECRET, algorithms=["HS256"])
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+    token_type = str(payload.get("typ") or "")
+    if expected_type and token_type != expected_type:
+        raise HTTPException(status_code=401, detail=f"Invalid token type: expected {expected_type}")
+    return payload
+
+
+
+def _issue_auth_payload(user: Dict[str, Any], *, is_new: bool = False) -> Dict[str, Any]:
+    user_id = int(user["id"])
+    refresh_subscription_statuses(user_id)
+    fresh_user = get_user_by_id(user_id) or user
+    access_token = issue_access_token(user_id)
+    refresh_token = issue_refresh_token(user_id)
+    view = get_user_subscription_view(user_id)
+    return {
+        "ok": True,
+        "token": access_token,
+        "access_token": access_token,
+        "refresh_token": refresh_token,
+        "user": fresh_user,
+        "subscription": view.get("subscription"),
+        "language": fresh_user.get("language") or "ru",
+        "is_new": is_new,
+    }
+
+
+
+def _fallback_code_user_payload(payload: CodeAuthIn) -> Dict[str, Any]:
+    suffix = str(payload.code or settings.AUTH_DEV_LOGIN_CODE)[-6:]
+    telegram_id = payload.telegram_id or int(f"900{suffix}")
+    language = "en" if payload.language == "en" else "ru"
+    return {
+        "telegram_id": telegram_id,
+        "username": payload.username or f"inet_dev_{suffix}",
+        "first_name": payload.first_name or "INET",
+        "last_name": payload.last_name or "Dev",
+        "language": language,
+    }
+
+
+
+def get_current_user(credentials: HTTPAuthorizationCredentials = Depends(security)) -> Dict[str, Any]:
+    if not credentials or not credentials.credentials:
+        raise HTTPException(status_code=401, detail="Missing bearer token")
+    payload = _decode_token(credentials.credentials, expected_type="access")
+    user_id = int(payload["sub"])
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return user
+
+
+
+def require_code_issuer(x_auth_code_secret: Optional[str] = Header(default=None)) -> bool:
+    configured_secret = (settings.AUTH_CODE_ISSUER_SECRET or "").strip()
+    if not configured_secret:
+        return True
+    if _safe_compare_secret(x_auth_code_secret, configured_secret):
+        return True
+    raise HTTPException(status_code=401, detail="Invalid code issuer secret")
+
+
+
+def require_admin(credentials: HTTPBasicCredentials = Depends(basic_security)) -> str:
+    valid_user = _safe_compare_secret(credentials.username, settings.ADMIN_BASIC_USER)
+    valid_pass = _safe_compare_secret(credentials.password, settings.ADMIN_BASIC_PASS)
+    if not (valid_user and valid_pass):
+        raise HTTPException(status_code=401, detail="Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+
+
+def _flag_emoji(country_code: Optional[str]) -> str:
+    if not country_code or len(country_code) != 2:
+        return ""
+    code = country_code.upper()
+    if not code.isalpha():
+        return ""
+    return "".join(chr(127397 + ord(char)) for char in code)
+
+
+
+def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(row.get("code") or "")
+    country_code = row.get("country_code")
+    if code.startswith("auto-"):
+        return {
+            "type": "virtual",
+            "section_key": "system",
+            "section_name_ru": "Системные",
+            "section_name_en": "System",
+            "icon": "💎",
+        }
+    if "lte" in code.lower():
+        return {
+            "type": "mobile",
+            "section_key": "mobile",
+            "section_name_ru": "Мобильные",
+            "section_name_en": "Mobile",
+            "icon": "📶",
+        }
+    return {
+        "type": "node",
+        "section_key": "countries",
+        "section_name_ru": "Основные страны",
+        "section_name_en": "Main countries",
+        "icon": _flag_emoji(country_code),
+    }
+
+
+
+def _diagnostic_text(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
+
+
+
+def _diagnostic_bool(value: Any) -> Optional[bool]:
     if isinstance(value, bool):
         return value
-    if isinstance(value, (int, float)):
-        return bool(value)
     if isinstance(value, str):
         normalized = value.strip().lower()
         if normalized in {"1", "true", "yes", "on"}:
             return True
         if normalized in {"0", "false", "no", "off"}:
             return False
-    return default
-
-
-def _coerce_runtime_int(value: Any, default: int, minimum: int = 1) -> int:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return max(minimum, int(default))
-    return max(minimum, parsed)
-
-
-def _coerce_runtime_str(value: Any, default: str) -> str:
-    text_value = str(value or "").strip()
-    return text_value or default
-
-
-def _coerce_runtime_languages(value: Any, default: List[str]) -> List[str]:
-    if isinstance(value, str):
-        items = [item.strip() for item in value.split(",")]
-    elif isinstance(value, list):
-        items = [str(item).strip() for item in value]
-    else:
-        items = list(default or [])
-    normalized = [item for item in items if item]
-    return normalized or list(default or ["ru", "en"])
-
-
-def _canonical_plan_sources() -> Dict[str, List[str]]:
-    return {
-        "PLAN_DAILY": ["PLAN_DAILY"],
-        "PLAN_MONTHLY_1": ["PLAN_MONTHLY_1", "PLAN_MONTHLY", "PLAN_DEVICE_1"],
-        "PLAN_MONTHLY_2": ["PLAN_MONTHLY_2", "PLAN_DEVICE_2"],
-        "PLAN_MONTHLY_3": ["PLAN_MONTHLY_3", "PLAN_DEVICE_3"],
-    }
-
-
-def _runtime_plan_slot(plan: Dict[str, Any]) -> Optional[str]:
-    source_key = str(plan.get("source_env_key") or "").strip().upper()
-    legacy_map = {
-        "PLAN_DAILY": "daily",
-        "PLAN_MONTHLY": "monthly_1",
-        "PLAN_DEVICE_1": "monthly_1",
-        "PLAN_DEVICE_2": "monthly_2",
-        "PLAN_DEVICE_3": "monthly_3",
-        "PLAN_MONTHLY_1": "monthly_1",
-        "PLAN_MONTHLY_2": "monthly_2",
-        "PLAN_MONTHLY_3": "monthly_3",
-    }
-    if source_key in legacy_map:
-        return legacy_map[source_key]
-    slot = str(plan.get("slot") or "").strip().lower()
-    return slot or None
-
-
-def _current_runtime_plan_payloads() -> List[Dict[str, Any]]:
-    order = {"daily": 0, "monthly_1": 1, "monthly_2": 2, "monthly_3": 3}
-    picked: Dict[str, Dict[str, Any]] = {}
-    canonical_sources = set(_canonical_plan_sources().keys())
-    for item in get_all_plans():
-        slot = _runtime_plan_slot(item)
-        if slot not in {"daily", "monthly_1", "monthly_2", "monthly_3"}:
-            continue
-        row = {
-            "slot": slot,
-            "code": str(item.get("code") or "").strip() or slot,
-            "name_ru": str(item.get("name_ru") or "").strip() or slot,
-            "name_en": str(item.get("name_en") or item.get("name_ru") or "").strip() or slot,
-            "price_rub": _coerce_runtime_int(item.get("price_rub"), 0, minimum=0),
-            "duration_days": _coerce_runtime_int(item.get("duration_days"), 1, minimum=1),
-            "device_limit": _coerce_runtime_int(item.get("device_limit"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1),
-            "is_active": bool(item.get("is_active", True)),
-            "_source_env_key": str(item.get("source_env_key") or "").strip().upper(),
-        }
-        current = picked.get(slot)
-        if current is None:
-            picked[slot] = row
-            continue
-        row_rank = (1 if row["is_active"] else 0, 1 if row["_source_env_key"] in canonical_sources else 0)
-        current_rank = (1 if current["is_active"] else 0, 1 if current["_source_env_key"] in canonical_sources else 0)
-        if row_rank > current_rank:
-            picked[slot] = row
-    plans = []
-    for slot in ("daily", "monthly_1", "monthly_2", "monthly_3"):
-        row = picked.get(slot)
-        if not row:
-            continue
-        row.pop("_source_env_key", None)
-        plans.append(row)
-    plans.sort(key=lambda item: order.get(item["slot"], 999))
-    return plans
-
-
-def _normalize_client_mode(value: Any) -> str:
-    mode = str(value or "").strip().lower()
-    return "v2raytun" if mode == "v2raytun" else "hiddify"
-
-
-def _client_store_urls(mode: Optional[str] = None) -> Dict[str, str]:
-    selected = _normalize_client_mode(mode if mode is not None else getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
-    if selected == "v2raytun":
-        mobile = {
-            "android_app_url": str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip(),
-            "ios_app_url": str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip(),
-            "android_app_package": str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip(),
-        }
-    else:
-        mobile = {
-            "android_app_url": str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip(),
-            "ios_app_url": str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip(),
-            "android_app_package": str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip(),
-        }
-    return {
-        **mobile,
-        "windows_app_url": str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip(),
-        "macos_app_url": str(getattr(settings, "HAPP_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip(),
-    }
-
-
-def _active_client_name(mode: Optional[str] = None) -> str:
-    return "v2RayTun" if _normalize_client_mode(mode) == "v2raytun" else "Hiddify"
-
-
-def _desktop_client_name() -> str:
-    return "Happ"
-
-
-def get_runtime_settings_payload() -> Dict[str, Any]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT payload FROM vpn_runtime_settings WHERE id = 1")
-            row = cur.fetchone()
-    payload = row.get("payload") if row else {}
-    return dict(payload or {})
-
-
-def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    data = dict(payload or get_runtime_settings_payload() or {})
-    settings.APP_NAME = _coerce_runtime_str(data.get("app_name"), settings.APP_NAME)
-    settings.VPN_CLIENT_MODE = _normalize_client_mode(data.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
-    settings.APP_ENV = _coerce_runtime_str(data.get("app_env"), settings.APP_ENV)
-    settings.APP_LANGS = _coerce_runtime_languages(data.get("languages"), list(settings.APP_LANGS or ["ru", "en"]))
-    settings.BOT_NAME = _coerce_runtime_str(data.get("bot_name"), settings.BOT_NAME)
-    settings.BOT_USERNAME = _coerce_runtime_str(data.get("bot_username"), settings.BOT_USERNAME)
-    settings.SUPPORT_TELEGRAM_URL = _coerce_runtime_str(data.get("support_telegram_url"), settings.SUPPORT_TELEGRAM_URL)
-    settings.PAYMENTS_ENABLED = _coerce_runtime_bool(data.get("payments_enabled"), settings.PAYMENTS_ENABLED)
-    settings.VPN_MAINTENANCE_MODE = _coerce_runtime_bool(data.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE)
-    settings.VPN_NEW_ACTIVATIONS_ENABLED = _coerce_runtime_bool(data.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED)
-    max_devices = _coerce_runtime_int(data.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
-    default_device_limit = _coerce_runtime_int(data.get("device_limit"), max_devices, minimum=1)
-    settings.VPN_MAX_DEVICES_PER_ACCOUNT = max_devices
-    settings.VPN_DEFAULT_DEVICE_LIMIT = min(default_device_limit, max_devices)
-    settings.VPN_SETTINGS_EDITABLE = True
-
-    plans = data.get("plans") if isinstance(data.get("plans"), list) else _current_runtime_plan_payloads()
-    plan_by_slot = {
-        slot: item
-        for item in plans
-        if isinstance(item, dict) and (slot := _runtime_plan_slot(item)) in {"daily", "monthly_1", "monthly_2", "monthly_3"}
-    }
-
-    slot_meta = {
-        "daily": ("PLAN_DAILY", "PLAN_DAILY_CODE", "PLAN_DAILY_NAME_RU", "PLAN_DAILY_NAME_EN", "PLAN_DAILY_PRICE_RUB", "PLAN_DAILY_DURATION_DAYS", "PLAN_DAILY_DEVICE_LIMIT", "PLAN_DAILY_ENABLED"),
-        "monthly_1": ("PLAN_MONTHLY_1", "PLAN_MONTHLY_1_CODE", "PLAN_MONTHLY_1_NAME_RU", "PLAN_MONTHLY_1_NAME_EN", "PLAN_MONTHLY_1_PRICE_RUB", "PLAN_MONTHLY_1_DURATION_DAYS", "PLAN_MONTHLY_1_DEVICE_LIMIT", "PLAN_MONTHLY_1_ENABLED"),
-        "monthly_2": ("PLAN_MONTHLY_2", "PLAN_MONTHLY_2_CODE", "PLAN_MONTHLY_2_NAME_RU", "PLAN_MONTHLY_2_NAME_EN", "PLAN_MONTHLY_2_PRICE_RUB", "PLAN_MONTHLY_2_DURATION_DAYS", "PLAN_MONTHLY_2_DEVICE_LIMIT", "PLAN_MONTHLY_2_ENABLED"),
-        "monthly_3": ("PLAN_MONTHLY_3", "PLAN_MONTHLY_3_CODE", "PLAN_MONTHLY_3_NAME_RU", "PLAN_MONTHLY_3_NAME_EN", "PLAN_MONTHLY_3_PRICE_RUB", "PLAN_MONTHLY_3_DURATION_DAYS", "PLAN_MONTHLY_3_DEVICE_LIMIT", "PLAN_MONTHLY_3_ENABLED"),
-    }
-    for slot, (_source_key, code_attr, name_ru_attr, name_en_attr, price_attr, duration_attr, limit_attr, active_attr) in slot_meta.items():
-        plan = plan_by_slot.get(slot)
-        if not plan:
-            continue
-        setattr(settings, code_attr, _coerce_runtime_str(plan.get("code"), getattr(settings, code_attr)))
-        setattr(settings, name_ru_attr, _coerce_runtime_str(plan.get("name_ru"), getattr(settings, name_ru_attr)))
-        setattr(settings, name_en_attr, _coerce_runtime_str(plan.get("name_en"), getattr(settings, name_en_attr)))
-        setattr(settings, price_attr, _coerce_runtime_int(plan.get("price_rub"), getattr(settings, price_attr), minimum=0))
-        fixed_duration = 1 if slot == "daily" else 30
-        fixed_limit = 1 if slot in {"daily", "monthly_1"} else (2 if slot == "monthly_2" else 3)
-        setattr(settings, duration_attr, fixed_duration)
-        setattr(settings, limit_attr, min(fixed_limit, settings.VPN_MAX_DEVICES_PER_ACCOUNT))
-        setattr(settings, active_attr, _coerce_runtime_bool(plan.get("is_active"), getattr(settings, active_attr)))
-
-    return data
-
-
-def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = {
-        "app_name": _coerce_runtime_str(payload.get("app_name"), settings.APP_NAME),
-        "client_mode": _normalize_client_mode(payload.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify")),
-        "app_env": _coerce_runtime_str(payload.get("app_env"), settings.APP_ENV),
-        "languages": _coerce_runtime_languages(payload.get("languages"), list(settings.APP_LANGS or ["ru", "en"])),
-        "bot_name": _coerce_runtime_str(payload.get("bot_name"), settings.BOT_NAME),
-        "bot_username": _coerce_runtime_str(payload.get("bot_username"), settings.BOT_USERNAME),
-        "support_telegram_url": _coerce_runtime_str(payload.get("support_telegram_url"), settings.SUPPORT_TELEGRAM_URL),
-        "payments_enabled": _coerce_runtime_bool(payload.get("payments_enabled"), settings.PAYMENTS_ENABLED),
-        "maintenance_mode": _coerce_runtime_bool(payload.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE),
-        "new_activations_enabled": _coerce_runtime_bool(payload.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED),
-    }
-    max_devices = _coerce_runtime_int(payload.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
-    normalized["max_devices_per_account"] = max_devices
-    normalized["device_limit"] = min(
-        _coerce_runtime_int(payload.get("device_limit"), max_devices, minimum=1),
-        max_devices,
-    )
-
-    plans_input = payload.get("plans") if isinstance(payload.get("plans"), list) else _current_runtime_plan_payloads()
-    normalized_plans: List[Dict[str, Any]] = []
-    plan_bases = {
-        "daily": (settings.PLAN_DAILY_CODE, settings.PLAN_DAILY_NAME_RU, settings.PLAN_DAILY_NAME_EN, settings.PLAN_DAILY_PRICE_RUB, settings.PLAN_DAILY_DURATION_DAYS, settings.PLAN_DAILY_DEVICE_LIMIT, settings.PLAN_DAILY_ENABLED),
-        "monthly_1": (settings.PLAN_MONTHLY_1_CODE, settings.PLAN_MONTHLY_1_NAME_RU, settings.PLAN_MONTHLY_1_NAME_EN, settings.PLAN_MONTHLY_1_PRICE_RUB, settings.PLAN_MONTHLY_1_DURATION_DAYS, settings.PLAN_MONTHLY_1_DEVICE_LIMIT, settings.PLAN_MONTHLY_1_ENABLED),
-        "monthly_2": (settings.PLAN_MONTHLY_2_CODE, settings.PLAN_MONTHLY_2_NAME_RU, settings.PLAN_MONTHLY_2_NAME_EN, settings.PLAN_MONTHLY_2_PRICE_RUB, settings.PLAN_MONTHLY_2_DURATION_DAYS, settings.PLAN_MONTHLY_2_DEVICE_LIMIT, settings.PLAN_MONTHLY_2_ENABLED),
-        "monthly_3": (settings.PLAN_MONTHLY_3_CODE, settings.PLAN_MONTHLY_3_NAME_RU, settings.PLAN_MONTHLY_3_NAME_EN, settings.PLAN_MONTHLY_3_PRICE_RUB, settings.PLAN_MONTHLY_3_DURATION_DAYS, settings.PLAN_MONTHLY_3_DEVICE_LIMIT, settings.PLAN_MONTHLY_3_ENABLED),
-    }
-    for slot in ("daily", "monthly_1", "monthly_2", "monthly_3"):
-        raw_plan = next((item for item in plans_input if isinstance(item, dict) and _runtime_plan_slot(item) == slot), None) or {}
-        base_code, base_name_ru, base_name_en, base_price, base_duration, base_limit, base_active = plan_bases[slot]
-        name_ru = _coerce_runtime_str(raw_plan.get("name_ru"), base_name_ru)
-        name_en = _coerce_runtime_str(raw_plan.get("name_en"), raw_plan.get("name_ru") or base_name_en)
-        fixed_duration = 1 if slot == "daily" else 30
-        fixed_limit = 1 if slot in {"daily", "monthly_1"} else (2 if slot == "monthly_2" else 3)
-        normalized_plans.append({
-            "slot": slot,
-            "code": _coerce_runtime_str(raw_plan.get("code"), base_code),
-            "name_ru": name_ru,
-            "name_en": name_en,
-            "price_rub": _coerce_runtime_int(raw_plan.get("price_rub"), base_price, minimum=0),
-            "duration_days": fixed_duration,
-            "device_limit": min(fixed_limit, max_devices),
-            "is_active": _coerce_runtime_bool(raw_plan.get("is_active"), base_active),
-        })
-    normalized["plans"] = normalized_plans
-
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO vpn_runtime_settings (id, payload, updated_at)
-                VALUES (1, %s, NOW())
-                ON CONFLICT (id) DO UPDATE SET
-                    payload = EXCLUDED.payload,
-                    updated_at = NOW()
-                """,
-                (Jsonb(normalized),),
-            )
-        conn.commit()
-    apply_runtime_settings_overrides(normalized)
-    sync_plans_from_env()
-    return normalized
-
-
-def _parse_locations_json(raw_json: str) -> List[Dict[str, Any]]:
-    try:
-        raw_locations = json.loads(raw_json or "[]")
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(raw_locations, list):
-        return []
-
-    normalized: List[Dict[str, Any]] = []
-    for idx, item in enumerate(raw_locations, start=1):
-        if not isinstance(item, dict):
-            continue
-        code = str(item.get("code") or "").strip()
-        name_ru = str(item.get("name_ru") or "").strip()
-        name_en = str(item.get("name_en") or name_ru).strip()
-        if not code or not name_ru or not name_en:
-            continue
-        country_code = item.get("country_code")
-        if country_code is not None:
-            country_code = str(country_code).strip().upper() or None
-        normalized.append(
-            {
-                "code": code,
-                "name_ru": name_ru,
-                "name_en": name_en,
-                "country_code": country_code,
-                "is_active": bool(item.get("is_active", True)),
-                "is_recommended": bool(item.get("is_recommended", False)),
-                "is_reserve": bool(item.get("is_reserve", False)),
-                "status": str(item.get("status") or "online").strip() or "online",
-                "sort_order": int(item.get("sort_order") or idx * 10),
-                "vpn_payload": item.get("vpn_payload") if isinstance(item.get("vpn_payload"), dict) else {},
-                "is_deleted": bool(item.get("is_deleted", False)),
-                "location_source": str(item.get("location_source") or "catalog").strip() or "catalog",
-            }
-        )
-    return normalized
-
-
-
-def _load_default_locations() -> List[Dict[str, Any]]:
-    builtin_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_JSON)
-    if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED:
-        env_locations = _parse_locations_json(settings.DEFAULT_LOCATIONS_ENV_JSON)
-        if env_locations:
-            return env_locations
-    return builtin_locations
-
-
-def _parse_json_object_if_possible(raw: Any) -> Optional[Dict[str, Any]]:
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str):
-        candidate = raw.strip()
-        if not candidate:
-            return None
-        try:
-            value = json.loads(candidate)
-        except Exception:
-            return None
-        if isinstance(value, dict):
-            return value
     return None
 
 
-def _extract_dns_servers_from_xray(payload: Dict[str, Any]) -> List[str]:
-    dns = payload.get("dns")
-    if not isinstance(dns, dict):
-        return []
-    servers = dns.get("servers")
-    if not isinstance(servers, list):
-        return []
-    result: List[str] = []
-    for item in servers:
-        if isinstance(item, str) and item.strip():
-            result.append(item.strip())
-        elif isinstance(item, dict):
-            address = str(item.get("address") or "").strip()
-            if address:
-                result.append(address)
-    return result
+
+def _diagnostic_int(value: Any) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return 0
 
 
-def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    outbounds = payload.get("outbounds")
-    if not isinstance(outbounds, list):
-        return {}
 
-    proxy = None
-    for outbound in outbounds:
-        if not isinstance(outbound, dict):
-            continue
-        protocol = str(outbound.get("protocol") or "").strip().lower()
-        if protocol == "vless":
-            proxy = outbound
-            if str(outbound.get("tag") or "").strip().lower() == "proxy":
-                break
-    if not isinstance(proxy, dict):
-        return {}
-
-    settings_payload = proxy.get("settings")
-    stream_settings = proxy.get("streamSettings") if isinstance(proxy.get("streamSettings"), dict) else {}
-    vnext = settings_payload.get("vnext") if isinstance(settings_payload, dict) else None
-    if not isinstance(vnext, list) or not vnext:
-        return {}
-    upstream = vnext[0] if isinstance(vnext[0], dict) else {}
-    users = upstream.get("users") if isinstance(upstream, dict) else None
-    if not isinstance(users, list) or not users:
-        return {}
-    user = users[0] if isinstance(users[0], dict) else {}
-
-    grpc_settings = stream_settings.get("grpcSettings") if isinstance(stream_settings.get("grpcSettings"), dict) else {}
-    ws_settings = stream_settings.get("wsSettings") if isinstance(stream_settings.get("wsSettings"), dict) else {}
-    xhttp_settings = stream_settings.get("xhttpSettings") if isinstance(stream_settings.get("xhttpSettings"), dict) else {}
-    reality_settings = stream_settings.get("realitySettings") if isinstance(stream_settings.get("realitySettings"), dict) else {}
-    tls_settings = stream_settings.get("tlsSettings") if isinstance(stream_settings.get("tlsSettings"), dict) else {}
-
-    security = str(stream_settings.get("security") or proxy.get("security") or "reality").strip() or "reality"
-    server_name = str(
-        reality_settings.get("serverName")
-        or tls_settings.get("serverName")
-        or proxy.get("sni")
-        or ""
-    ).strip()
-
-    converted: Dict[str, Any] = {
-        "protocol": "vless",
-        "engine": "xray",
-        "server": str(upstream.get("address") or "").strip(),
-        "port": upstream.get("port"),
-        "uuid": str(user.get("id") or "").strip(),
-        "transport": str(stream_settings.get("network") or proxy.get("network") or "tcp").strip() or "tcp",
-        "network": str(stream_settings.get("network") or proxy.get("network") or "tcp").strip() or "tcp",
-        "security": security,
-        "flow": str(user.get("flow") or "").strip() or None,
-        "sni": server_name or None,
-        "server_name": server_name or None,
-        "service_name": str(grpc_settings.get("serviceName") or "").strip() or None,
-        "mode": str(xhttp_settings.get("mode") or "").strip() or None,
-        "public_key": str(reality_settings.get("publicKey") or "").strip() or None,
-        "short_id": str(reality_settings.get("shortId") or "").strip() or None,
-        "fingerprint": str(reality_settings.get("fingerprint") or tls_settings.get("fingerprint") or "").strip() or None,
-        "allow_insecure": bool(tls_settings.get("allowInsecure") or proxy.get("allowInsecure") or False),
-        "host": None,
-        "path": None,
-        "packet_encoding": "xudp",
-        "domain_resolver": "dns-remote",
-        "connect_mode": "tun",
-        "full_tunnel": True,
-        "raw_xray_config": json.dumps(payload, ensure_ascii=False),
-        "rawXrayConfig": json.dumps(payload, ensure_ascii=False),
-    }
-
-    if converted["transport"] in {"ws", "websocket"}:
-        converted["host"] = str(ws_settings.get("headers", {}).get("Host") or "").strip() or None
-        converted["path"] = str(ws_settings.get("path") or "/").strip() or "/"
-    elif converted["transport"] == "xhttp":
-        converted["host"] = str(xhttp_settings.get("host") or "").strip() or None
-        converted["path"] = str(xhttp_settings.get("path") or "/").strip() or "/"
-
-    dns_servers = _extract_dns_servers_from_xray(payload)
-    if dns_servers:
-        converted["dns_servers"] = dns_servers
-        converted["dnsServers"] = dns_servers
-
-    alpn = tls_settings.get("alpn")
-    if isinstance(alpn, list):
-        normalized_alpn = [str(item).strip() for item in alpn if str(item).strip()]
-        if normalized_alpn:
-            converted["alpn"] = normalized_alpn
-
-    return {key: value for key, value in converted.items() if value is not None and value != ""}
-
-
-def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(payload or {})
-    if not normalized:
-        return {}
-
-    raw_xray = normalized.get("raw_xray_config") or normalized.get("rawXrayConfig")
-    raw_xray_payload = _parse_json_object_if_possible(raw_xray)
-    if raw_xray_payload:
-        converted = _convert_raw_xray_payload(raw_xray_payload)
-        for key, value in converted.items():
-            if normalized.get(key) in (None, "", [], {}):
-                normalized[key] = value
-
-    engine = str(normalized.get("engine") or "").strip().lower()
-    if not engine:
-        normalized["engine"] = "xray" if normalized.get("raw_xray_config") or normalized.get("rawXrayConfig") else "nekobox"
-    elif engine == "xray-core":
-        normalized["engine"] = "xray"
-
-    normalized.setdefault("protocol", "vless")
-    normalized.setdefault("transport", normalized.get("network") or "tcp")
-    normalized.setdefault("network", normalized.get("transport") or "tcp")
-    normalized.setdefault("security", "reality")
-    normalized.setdefault("mtu", 1400)
-    normalized.setdefault("domain_resolver", "dns-remote")
-    normalized.setdefault("packet_encoding", "xudp")
-    normalized.setdefault("connect_mode", "tun")
-    normalized.setdefault("full_tunnel", True)
-
-    dns_servers = normalized.get("dns_servers") or normalized.get("dnsServers")
-    if not dns_servers:
-        normalized["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
-        normalized["dnsServers"] = ["1.1.1.1", "8.8.8.8"]
-    return normalized
-
-
-def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
-    normalized = dict(payload or {})
-    if not normalized:
-        return {}
-    if "server_port" in normalized and "port" not in normalized:
-        normalized["port"] = normalized.get("server_port")
-    if "id" in normalized and "uuid" not in normalized:
-        normalized["uuid"] = normalized.get("id")
-    if "network" in normalized and "transport" not in normalized:
-        normalized["transport"] = normalized.get("network")
-    if "transport" in normalized and "network" not in normalized:
-        normalized["network"] = normalized.get("transport")
-    if "server_name" in normalized and "sni" not in normalized:
-        normalized["sni"] = normalized.get("server_name")
-    if "sni" in normalized and "server_name" not in normalized:
-        normalized["server_name"] = normalized.get("sni")
-    if "serviceName" in normalized and "service_name" not in normalized:
-        normalized["service_name"] = normalized.get("serviceName")
-    if "service_name" in normalized and "serviceName" not in normalized:
-        normalized["serviceName"] = normalized.get("service_name")
-    if "publicKey" in normalized and "public_key" not in normalized:
-        normalized["public_key"] = normalized.get("publicKey")
-    if "public_key" in normalized and "publicKey" not in normalized:
-        normalized["publicKey"] = normalized.get("public_key")
-    if "shortId" in normalized and "short_id" not in normalized:
-        normalized["short_id"] = normalized.get("shortId")
-    if "short_id" in normalized and "shortId" not in normalized:
-        normalized["shortId"] = normalized.get("short_id")
-    if "dnsServers" in normalized and "dns_servers" not in normalized:
-        normalized["dns_servers"] = normalized.get("dnsServers")
-    if "dns_servers" in normalized and "dnsServers" not in normalized:
-        normalized["dnsServers"] = normalized.get("dns_servers")
-    if "allowInsecure" in normalized and "allow_insecure" not in normalized:
-        normalized["allow_insecure"] = normalized.get("allowInsecure")
-    if "allow_insecure" in normalized and "allowInsecure" not in normalized:
-        normalized["allowInsecure"] = normalized.get("allow_insecure")
-    if "domainResolver" in normalized and "domain_resolver" not in normalized:
-        normalized["domain_resolver"] = normalized.get("domainResolver")
-    if "domain_resolver" in normalized and "domainResolver" not in normalized:
-        normalized["domainResolver"] = normalized.get("domain_resolver")
-    if "packetEncoding" in normalized and "packet_encoding" not in normalized:
-        normalized["packet_encoding"] = normalized.get("packetEncoding")
-    if "packet_encoding" in normalized and "packetEncoding" not in normalized:
-        normalized["packetEncoding"] = normalized.get("packet_encoding")
-    if "rawSingBoxConfig" in normalized and "raw_sing_box_config" not in normalized:
-        normalized["raw_sing_box_config"] = normalized.get("rawSingBoxConfig")
-    if "raw_sing_box_config" in normalized and "rawSingBoxConfig" not in normalized:
-        normalized["rawSingBoxConfig"] = normalized.get("raw_sing_box_config")
-    if "rawXrayConfig" in normalized and "raw_xray_config" not in normalized:
-        normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
-    if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
-        normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
-    return _apply_admin_mobile_defaults(normalized)
-
-
-def _placeholder_like_value(value: Any) -> bool:
+def _diagnostic_placeholder(value: Any) -> bool:
     text = str(value or "").strip()
     if not text:
         return True
     lowered = text.lower()
-    placeholder_prefixes = ("paste_", "your_", "replace_", "todo", "changeme")
-    if lowered.startswith(placeholder_prefixes):
+    if lowered.startswith(("paste_", "your_", "replace_", "todo", "changeme")):
         return True
     if "example.com" in lowered or "example.net" in lowered or "example.org" in lowered:
         return True
@@ -1011,775 +2050,599 @@ def _placeholder_like_value(value: Any) -> bool:
     return False
 
 
-def _config_is_complete(payload: Dict[str, Any]) -> bool:
-    normalized = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
-    server = str(normalized.get("server") or "").strip()
-    uuid = str(normalized.get("uuid") or "").strip()
-    security = str(normalized.get("security") or "reality").strip().lower() or "reality"
-    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
-    sni = str(normalized.get("server_name") or normalized.get("sni") or "").strip()
-    public_key = str(normalized.get("public_key") or normalized.get("publicKey") or "").strip()
-    short_id = str(normalized.get("short_id") or normalized.get("shortId") or "").strip()
-    service_name = str(normalized.get("service_name") or normalized.get("serviceName") or "").strip()
-    path = str(normalized.get("path") or "").strip()
-    dns_servers = normalized.get("dns_servers") or normalized.get("dnsServers") or []
-    try:
-        port = int(normalized.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-
-    if _placeholder_like_value(server) or _placeholder_like_value(uuid) or port <= 0:
-        return False
-    if not isinstance(dns_servers, list) or not [str(item).strip() for item in dns_servers if str(item).strip() and not _placeholder_like_value(item)]:
-        return False
-    if security == "reality":
-        if _placeholder_like_value(public_key) or _placeholder_like_value(short_id) or _placeholder_like_value(sni):
-            return False
-    if transport == "grpc" and _placeholder_like_value(service_name):
-        return False
-    if transport in {"ws", "websocket"} and _placeholder_like_value(path):
-        return False
-    return True
-
-
-def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location_code: Optional[str] = None) -> Dict[str, Any]:
-    payload: Dict[str, Any] = {}
-    default_payload = settings.default_vpn_payload()
-    if default_payload:
-        payload.update(default_payload)
-    overrides = settings.location_vpn_payloads().get(str(row.get("code") or "").strip())
-    if overrides:
-        payload.update(overrides)
-    stored = row.get("vpn_payload")
-    if isinstance(stored, dict) and stored:
-        payload.update(stored)
-
-    payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
-    if not payload:
-        return {}
-
-    payload.setdefault("location_code", requested_location_code or row.get("code"))
-    payload.setdefault("resolved_location_code", row.get("code"))
-    payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
-    payload.setdefault("display_name", row.get("name_en") or row.get("name_ru") or row.get("code"))
-    return payload
-
-
-def _location_speed_rank(row: Dict[str, Any]) -> tuple:
-    download = _normalize_optional_float(row.get("download_mbps")) or 0.0
-    upload = _normalize_optional_float(row.get("upload_mbps")) or 0.0
-    ping = _normalize_optional_int(row.get("ping_ms"))
-    has_speed = 1 if (download > 0 or upload > 0 or (ping is not None and ping > 0)) else 0
-    ping_score = 0 if ping is None else max(0, 10000 - ping)
-    recommended = 1 if bool(row.get("is_recommended")) else 0
-    reserve = 1 if bool(row.get("is_reserve")) else 0
-    return (has_speed, download, upload, ping_score, recommended, -reserve, -(int(row.get("sort_order") or 9999)))
-
-
-def _is_lte_location(row: Dict[str, Any]) -> bool:
-    code = str(row.get("code") or "").strip().lower()
-    if code.startswith("ru-lte") or code.startswith("russia-lte"):
-        return True
-    name_parts = [row.get("name_ru"), row.get("name_en")]
-    joined = " ".join(str(part or "").strip().lower() for part in name_parts if str(part or "").strip())
-    return "lte" in joined
-
-
-def _speed_metrics_present(row: Dict[str, Any]) -> bool:
-    return bool(
-        (_normalize_optional_float(row.get("download_mbps")) or 0) > 0
-        or (_normalize_optional_float(row.get("upload_mbps")) or 0) > 0
-        or (_normalize_optional_int(row.get("ping_ms")) or 0) > 0
-    )
-
-
-def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    unique: List[Dict[str, Any]] = []
-    seen: set[str] = set()
-    for row in rows:
-        code = str(row.get("code") or "").strip()
-        if not code or code in seen:
-            continue
-        seen.add(code)
-        unique.append(row)
-    return unique
-
-
-def get_user_virtual_location_assignment(user_id: int, virtual_code: str) -> Optional[str]:
-    code = str(virtual_code or "").strip()
-    if not code:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT concrete_code FROM virtual_location_assignments WHERE user_id = %s AND virtual_code = %s LIMIT 1",
-                (user_id, code),
-            )
-            row = cur.fetchone()
-    if not row:
-        return None
-    return str(row.get("concrete_code") or "").strip() or None
-
-
-def upsert_user_virtual_location_assignment(user_id: int, virtual_code: str, concrete_code: str) -> None:
-    virtual_clean = str(virtual_code or "").strip()
-    concrete_clean = str(concrete_code or "").strip()
-    if not virtual_clean or not concrete_clean:
-        return
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO virtual_location_assignments (user_id, virtual_code, concrete_code)
-                VALUES (%s, %s, %s)
-                ON CONFLICT (user_id, virtual_code) DO UPDATE SET
-                    concrete_code = EXCLUDED.concrete_code,
-                    updated_at = NOW()
-                """,
-                (user_id, virtual_clean, concrete_clean),
-            )
-        conn.commit()
-
-
-def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[str, int]:
-    clean_codes = [str(code or "").strip() for code in concrete_codes if str(code or "").strip()]
-    if not clean_codes:
-        return {}
-    placeholders = ", ".join(["%s"] * len(clean_codes))
-    query = f"""
-        SELECT vla.concrete_code, COUNT(DISTINCT vla.user_id) AS assigned_users
-        FROM virtual_location_assignments vla
-        JOIN users u ON u.id = vla.user_id
-        JOIN subscriptions s ON s.user_id = vla.user_id
-        WHERE vla.concrete_code IN ({placeholders})
-          AND COALESCE(u.status, 'active') <> 'blocked'
-          AND s.starts_at <= NOW()
-          AND s.expires_at >= NOW()
-        GROUP BY vla.concrete_code
-    """
-    counts: Dict[str, int] = {}
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, tuple(clean_codes))
-            for row in cur.fetchall():
-                counts[str(row.get("concrete_code") or "").strip()] = int(row.get("assigned_users") or 0)
-    return counts
-
-
-def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    excluded = {"auto-fastest", "auto-reserve"}
-    preferred_main_codes = ["intl-fast", "ru-lte"]
-    preferred_reserve_codes = ["intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
-
-    def is_online(row: Dict[str, Any]) -> bool:
-        return str(row.get("status") or "").strip().lower() == "online"
-
-    def with_payload(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        valid = []
-        for row in items:
-            row_code = str(row.get("code") or "").strip()
-            if row_code in excluded:
-                continue
-            payload = _compose_vpn_payload_for_location(dict(row))
-            if payload and _config_is_complete(payload):
-                valid.append(row)
-        return valid
-
-    def by_codes(codes: List[str]) -> List[Dict[str, Any]]:
-        order = {code_item: idx for idx, code_item in enumerate(codes)}
-        found = [row for row in rows if is_online(row) and str(row.get("code") or "") in order]
-        return sorted(with_payload(found), key=lambda row: order.get(str(row.get("code") or ""), 999))
-
-    def generic(predicate) -> List[Dict[str, Any]]:
-        return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
-
-    def measured(predicate) -> List[Dict[str, Any]]:
-        return generic(lambda row: predicate(row) and _speed_metrics_present(row))
-
-    def non_lte_main(row: Dict[str, Any]) -> bool:
-        return is_online(row) and not bool(row.get("is_reserve")) and not _is_lte_location(row)
-
-    def non_lte_reserve(row: Dict[str, Any]) -> bool:
-        return is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row)
-
-    def lte_main_row(row: Dict[str, Any]) -> bool:
-        return is_online(row) and not bool(row.get("is_reserve")) and _is_lte_location(row)
-
-    def lte_reserve_row(row: Dict[str, Any]) -> bool:
-        return is_online(row) and bool(row.get("is_reserve")) and _is_lte_location(row)
-
-    lte_main = by_codes([code_item for code_item in preferred_main_codes if code_item == "ru-lte"])
-    lte_reserve = by_codes([code_item for code_item in preferred_reserve_codes if code_item.startswith("ru-lte-")])
-    fast_main = by_codes([code_item for code_item in preferred_main_codes if code_item != "ru-lte"])
-    fast_reserve = by_codes([code_item for code_item in preferred_reserve_codes if not code_item.startswith("ru-lte-")])
-
-    if code == "auto-fastest":
-        return _dedupe_location_rows(
-            measured(non_lte_main)
-            + fast_main
-            + measured(non_lte_reserve)
-            + fast_reserve
-            + generic(lambda row: is_online(row) and bool(row.get("is_recommended")) and not _is_lte_location(row))
-            + generic(lambda row: is_online(row) and not _is_lte_location(row))
-            + lte_main
-            + lte_reserve
-            + generic(is_online)
-        )
-
-    if code == "auto-reserve":
-        # Reserve must prefer real reserve rows first. Only when there is no live reserve candidate
-        # do we fall back to ordinary main rows.
-        return _dedupe_location_rows(
-            measured(non_lte_reserve)
-            + fast_reserve
-            + generic(lambda row: is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row))
-            + measured(lte_reserve_row)
-            + lte_reserve
-            + generic(lte_reserve_row)
-            + measured(non_lte_main)
-            + fast_main
-            + generic(lambda row: is_online(row) and not bool(row.get("is_reserve")) and not _is_lte_location(row))
-            + measured(lte_main_row)
-            + lte_main
-            + generic(lte_main_row)
-            + generic(is_online)
-        )
+def _diagnostic_string_list(value: Any) -> List[str]:
+    if isinstance(value, list):
+        return [str(item).strip() for item in value if str(item).strip()]
+    if isinstance(value, str):
+        return [part.strip() for part in value.split(",") if part.strip()]
     return []
 
 
-def _virtual_sibling_code(code: str) -> Optional[str]:
-    if code == "auto-fastest":
-        return "auto-reserve"
-    if code == "auto-reserve":
-        return "auto-fastest"
+
+def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str) -> Dict[str, Any]:
+    issues: List[str] = []
+    fixes: List[str] = []
+
+    server = _diagnostic_text(payload.get("server"))
+    port = _diagnostic_int(payload.get("port"))
+    uuid = _diagnostic_text(payload.get("uuid"))
+    security = _diagnostic_text(payload.get("security") or "reality").lower() or "reality"
+    transport = _diagnostic_text(payload.get("transport") or payload.get("network") or "tcp").lower() or "tcp"
+    sni = _diagnostic_text(payload.get("server_name") or payload.get("sni"))
+    public_key = _diagnostic_text(payload.get("public_key") or payload.get("publicKey"))
+    short_id = _diagnostic_text(payload.get("short_id") or payload.get("shortId"))
+    service_name = _diagnostic_text(payload.get("service_name") or payload.get("serviceName"))
+    path = _diagnostic_text(payload.get("path"))
+    connect_mode = _diagnostic_text(payload.get("connect_mode") or "tun").lower() or "tun"
+    full_tunnel = _diagnostic_bool(payload.get("full_tunnel"))
+    dns_servers = _diagnostic_string_list(payload.get("dns_servers") or payload.get("dnsServers"))
+
+    if not payload:
+        issues.append("vpn_payload is empty")
+        fixes.append("Open Edit payload and fill server, port, uuid, and Reality fields.")
+
+    if not server or _diagnostic_placeholder(server):
+        issues.append("server is missing or still contains a placeholder")
+    if port <= 0:
+        issues.append("port is missing")
+    if not uuid or _diagnostic_placeholder(uuid):
+        issues.append("uuid is missing or still contains a placeholder")
+
+    if any(issue in {"server is missing or still contains a placeholder", "port is missing", "uuid is missing or still contains a placeholder"} for issue in issues):
+        fixes.append("Set real server/port/uuid values in effective payload.")
+
+    if security == "reality":
+        if not public_key or _diagnostic_placeholder(public_key):
+            issues.append("Reality public_key is missing or still contains a placeholder")
+        if not sni or _diagnostic_placeholder(sni):
+            issues.append("Reality server_name / sni is missing or still contains a placeholder")
+        if not short_id or _diagnostic_placeholder(short_id):
+            issues.append("Reality short_id is missing or still contains a placeholder")
+        if any(issue.startswith("Reality ") for issue in issues):
+            fixes.append("For Reality fill real public_key, short_id, and server_name/sni values.")
+
+    if transport in {"grpc"} and (not service_name or _diagnostic_placeholder(service_name)):
+        issues.append("gRPC service_name is missing or still contains a placeholder")
+        fixes.append("Set service_name for gRPC transport.")
+
+    if transport in {"ws", "websocket"} and (not path or _diagnostic_placeholder(path)):
+        issues.append("WebSocket path is missing or still contains a placeholder")
+        fixes.append("Set path for WebSocket transport.")
+
+    if connect_mode != "tun":
+        issues.append(f"connect_mode must be tun, got {connect_mode or 'empty'}")
+        fixes.append("Set connect_mode=tun.")
+
+    if full_tunnel is False:
+        issues.append("full_tunnel is disabled")
+        fixes.append("Set full_tunnel=true for full-device routing.")
+
+    if not dns_servers or any(_diagnostic_placeholder(item) for item in dns_servers):
+        issues.append("dns_servers is empty or still contains placeholders")
+        fixes.append("Add dns_servers, for example 1.1.1.1 and 8.8.8.8.")
+
+    platform_key = str(platform_label or "").strip().lower()
+    if platform_key == "windows":
+        fixes.append("Run the VPN client as Administrator before enabling TUN on Windows.")
+    elif platform_key == "macos":
+        fixes.append("Allow VPN / Network Extension permissions in macOS System Settings if TUN does not start.")
+
+    fatal_prefixes = (
+        "vpn_payload is empty",
+        "server is missing or still contains a placeholder",
+        "port is missing",
+        "uuid is missing or still contains a placeholder",
+        "Reality public_key is missing or still contains a placeholder",
+        "Reality server_name / sni is missing or still contains a placeholder",
+        "Reality short_id is missing or still contains a placeholder",
+        "connect_mode must be tun",
+    )
+    fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
+
+    if fatal_issues:
+        status = "error"
+        label = f"{platform_label}: payload incomplete"
+    elif issues:
+        status = "warning"
+        label = f"{platform_label}: check payload"
+    else:
+        status = "ready"
+        label = f"{platform_label}: ready"
+
+    if not issues and not _config_is_complete(payload):
+        status = "error"
+        label = f"{platform_label}: payload incomplete"
+        issues.append("effective payload is incomplete")
+        fixes.append("Fill required fields in effective payload.")
+
+    unique_fixes = list(dict.fromkeys([item for item in fixes if item]))
+    return {
+        "status": status,
+        "label": label,
+        "issues": issues,
+        "fixes": unique_fixes,
+    }
+
+
+
+def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    code = _diagnostic_text(row.get("code"))
+    preview_row = dict(row)
+    preview_payload = dict(resolved_payload) if isinstance(resolved_payload, dict) else {}
+    preview_target_code = code
+    preview_target_name = _diagnostic_text(row.get("name_en") or row.get("name_ru") or code)
+    is_virtual = code in PUBLIC_VIRTUAL_LOCATION_CODES
+
+    if is_virtual and not preview_payload:
+        picked = _pick_virtual_location(code)
+        if picked is not None:
+            preview_row = dict(picked)
+            preview_target_code = _diagnostic_text(preview_row.get("code")) or code
+            preview_target_name = _diagnostic_text(preview_row.get("name_en") or preview_row.get("name_ru") or preview_target_code)
+            preview_payload = _compose_vpn_payload_for_location(preview_row, requested_location_code=code or None)
+            if preview_payload:
+                virtual_name = _diagnostic_text(row.get("name_en") or row.get("name_ru") or code) or code or "VLESS"
+                resolved_name = preview_target_name or preview_target_code or "VLESS"
+                preview_payload = dict(preview_payload)
+                preview_payload["remark"] = f"{virtual_name} → {resolved_name}"
+                preview_payload["display_name"] = preview_payload["remark"]
+        else:
+            issue = "no live auto candidate available"
+            fix = "Bring at least one online concrete location with a complete payload so virtual auto routing can resolve."
+            platform_items = {}
+            for platform_label in ("Android", "iOS", "Windows", "macOS"):
+                platform_items[platform_label.lower()] = {
+                    "status": "error",
+                    "label": f"{platform_label}: no live candidate",
+                    "issues": [issue],
+                    "fixes": [fix],
+                }
+            return {
+                "summary_status": "error",
+                "summary_text": issue,
+                "issues": [issue],
+                "fixes": [fix],
+                "android": platform_items["android"],
+                "ios": platform_items["ios"],
+                "windows": platform_items["windows"],
+                "macos": platform_items["macos"],
+                "preview_payload": {},
+                "preview_target_code": None,
+                "preview_target_name": None,
+                "preview_is_virtual": True,
+            }
+
+    payload = preview_payload if preview_payload else _compose_vpn_payload_for_location(dict(row))
+    android = _build_tun_platform_diagnostics(payload, "Android")
+    ios = _build_tun_platform_diagnostics(payload, "iOS")
+    windows = _build_tun_platform_diagnostics(payload, "Windows")
+    macos = _build_tun_platform_diagnostics(payload, "macOS")
+
+    platform_items = (android, ios, windows, macos)
+
+    summary_status = "ready"
+    if any(item["status"] == "error" for item in platform_items):
+        summary_status = "error"
+    elif any(item["status"] == "warning" for item in platform_items):
+        summary_status = "warning"
+
+    issues = list(dict.fromkeys(
+        android.get("issues", [])
+        + ios.get("issues", [])
+        + windows.get("issues", [])
+        + macos.get("issues", [])
+    ))
+    fixes = list(dict.fromkeys(
+        android.get("fixes", [])
+        + ios.get("fixes", [])
+        + windows.get("fixes", [])
+        + macos.get("fixes", [])
+    ))
+    if summary_status == "ready":
+        if is_virtual and preview_target_name and preview_target_code and preview_target_code != code:
+            summary_text = f"Virtual auto route is ready. Admin preview resolves to {preview_target_name}."
+        else:
+            summary_text = "TUN payload is ready for Android, iOS, Windows, and macOS."
+    else:
+        summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
+
+    return {
+        "summary_status": summary_status,
+        "summary_text": summary_text,
+        "issues": issues,
+        "fixes": fixes,
+        "android": android,
+        "ios": ios,
+        "windows": windows,
+        "macos": macos,
+        "preview_payload": payload if isinstance(payload, dict) else {},
+        "preview_target_code": preview_target_code,
+        "preview_target_name": preview_target_name,
+        "preview_is_virtual": is_virtual,
+    }
+
+
+def _location_error_created_at(row: Dict[str, Any]) -> str:
+    for key in ("updated_at", "created_at"):
+        value = row.get(key)
+        if isinstance(value, datetime):
+            return value.astimezone(timezone.utc).isoformat()
+        text = _diagnostic_text(value)
+        if text:
+            return text
+    return datetime.now(timezone.utc).isoformat()
+
+
+
+def build_location_tun_error_items() -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for row in list_locations(active_only=False):
+        diagnostics = build_location_tun_diagnostics(row)
+        if diagnostics.get("summary_status") == "ready":
+            continue
+        code = _diagnostic_text(row.get("code")) or "unknown"
+        issues = diagnostics.get("issues", [])
+        fixes = diagnostics.get("fixes", [])
+        message_parts = []
+        if issues:
+            message_parts.append("Issues: " + " | ".join(issues[:4]))
+        if fixes:
+            message_parts.append("Fix: " + " | ".join(fixes[:3]))
+        items.append({
+            "created_at": _location_error_created_at(row),
+            "source": f"vpn-location:{code}",
+            "context": diagnostics.get("summary_status") or "error",
+            "error_message": " || ".join(message_parts) or (diagnostics.get("summary_text") or "TUN payload needs attention."),
+        })
+    return items
+
+
+
+def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) -> Dict[str, Any]:
+    item = dict(row)
+    raw_vpn_payload = item.pop("vpn_payload", None)
+    normalized_payload = dict(raw_vpn_payload) if isinstance(raw_vpn_payload, dict) else {}
+    meta = _location_meta(item)
+    item.update(meta)
+    item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
+    item["display_name_en"] = f'{meta["icon"]} {item.get("name_en")}'.strip() if meta.get("icon") else item.get("name_en")
+    item["name"] = item.get("display_name_ru") or item.get("name_ru") or item.get("name_en")
+    item["recommended"] = bool(item.get("is_recommended"))
+    item["reserve"] = bool(item.get("is_reserve"))
+    item["location_source"] = str(item.get("location_source") or "catalog")
+    diagnostics = build_location_tun_diagnostics(row)
+    resolved_payload = diagnostics.get("preview_payload") if isinstance(diagnostics.get("preview_payload"), dict) else {}
+    item["has_vpn_payload"] = bool(normalized_payload) or bool(resolved_payload)
+    item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
+    item["resolved_target_code"] = diagnostics.get("preview_target_code")
+    item["resolved_target_name"] = diagnostics.get("preview_target_name")
+    if include_payload:
+        item["vpn_payload"] = normalized_payload
+        item["resolved_vpn_payload"] = resolved_payload
+        item["tun_diagnostics"] = diagnostics
+    return item
+
+
+
+def _bot_public_url() -> str:
+    bot_username = (settings.BOT_USERNAME or "").strip().lstrip("@")
+    if bot_username:
+        return f"https://t.me/{bot_username}"
+    return settings.SUPPORT_TELEGRAM_URL
+
+
+def _selected_client_mode() -> str:
+    mode = str(getattr(settings, "VPN_CLIENT_MODE", "hiddify") or "").strip().lower()
+    return "v2raytun" if mode == "v2raytun" else "hiddify"
+
+
+def _selected_client_name() -> str:
+    return "v2RayTun" if _selected_client_mode() == "v2raytun" else "Hiddify"
+
+
+def _normalize_target_platform(platform: Optional[str]) -> str:
+    raw = str(platform or "").strip().lower()
+    if raw in {"android"}:
+        return "android"
+    if raw in {"ios", "iphone", "ipad"}:
+        return "ios"
+    if raw in {"windows", "win"}:
+        return "windows"
+    if raw in {"macos", "mac", "osx", "darwin"}:
+        return "macos"
+    if raw == "linux":
+        return "linux"
+    return "client"
+
+
+def _client_mode_for_platform(platform: Optional[str]) -> str:
+    normalized = _normalize_target_platform(platform)
+    if normalized in {"windows", "macos"}:
+        return "happ"
+    return _selected_client_mode()
+
+
+def _client_name_for_platform(platform: Optional[str]) -> str:
+    mode = _client_mode_for_platform(platform)
+    if mode == "happ":
+        return "Happ"
+    return "v2RayTun" if mode == "v2raytun" else "Hiddify"
+
+
+def _selected_android_app_package(platform: Optional[str] = None) -> str:
+    mode = _client_mode_for_platform(platform or "android")
+    if mode == "v2raytun":
+        return str(getattr(settings, "V2RAYTUN_ANDROID_APP_PACKAGE", "") or "").strip()
+    return str(getattr(settings, "HIDDIFY_ANDROID_APP_PACKAGE", getattr(settings, "ANDROID_APP_PACKAGE", "")) or "").strip()
+
+
+def _selected_platform_store_url(platform: str) -> str:
+    key = _normalize_target_platform(platform)
+    mode = _client_mode_for_platform(key)
+    if key == "windows":
+        return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
+    if key == "macos":
+        return str(getattr(settings, "HAPP_MACOS_APP_URL", getattr(settings, "MACOS_APP_URL", "")) or "").strip()
+    if mode == "v2raytun":
+        if key == "android":
+            return str(getattr(settings, "V2RAYTUN_ANDROID_APP_URL", "") or "").strip()
+        if key in {"ios"}:
+            return str(getattr(settings, "V2RAYTUN_IOS_APP_URL", "") or "").strip()
+    if key == "android":
+        return str(getattr(settings, "HIDDIFY_ANDROID_APP_URL", getattr(settings, "ANDROID_APP_URL", "")) or "").strip()
+    if key in {"ios"}:
+        return str(getattr(settings, "HIDDIFY_IOS_APP_URL", getattr(settings, "IOS_APP_URL", "")) or "").strip()
+    return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
+
+
+def _build_native_import_url(subscription_url: Optional[str], platform: Optional[str] = None) -> str:
+    clean_url = str(subscription_url or "").strip()
+    if not clean_url:
+        return ""
+    mode = _client_mode_for_platform(platform)
+    if mode == "happ":
+        return ""
+    if mode == "v2raytun":
+        return f"v2raytun://import/{quote(clean_url, safe=':/?&=%#')}"
+    import_name = str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip()
+    return f"hiddify://import/{quote(clean_url, safe=':/?&=%')}#{quote(import_name, safe='')}"
+
+
+def _subscription_public_url_from_base(base_url: str, token: Optional[str]) -> Optional[str]:
+    base = str(base_url or "").strip().rstrip("/")
+    clean_token = str(token or "").strip()
+    if not base or not clean_token:
+        return None
+    return f"{base}/sub/{quote(clean_token, safe='')}"
+
+
+def _resolve_subscription_token(*, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
+    clean_token = str(token or "").strip()
+    if clean_token:
+        return clean_token
+    clean_code = str(code or "").strip()
+    if not clean_code:
+        return None
+    user = get_user_by_active_auth_code(clean_code)
+    if not user:
+        return None
+    return ensure_user_subscription_token(int(user["id"]))
+
+
+def _request_forwarded_proto(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    raw_cf_visitor = str(request.headers.get("cf-visitor") or "").strip()
+    if raw_cf_visitor:
+        try:
+            parsed_cf_visitor = json.loads(raw_cf_visitor)
+            cf_scheme = str(parsed_cf_visitor.get("scheme") or "").strip().lower()
+            if cf_scheme in {"http", "https"}:
+                return cf_scheme
+        except Exception:
+            pass
+    for header_name in ("x-forwarded-proto", "x-forwarded-protocol", "x-scheme"):
+        raw_value = str(request.headers.get(header_name) or "").strip()
+        if not raw_value:
+            continue
+        first_part = raw_value.split(",", 1)[0].strip().lower()
+        if first_part in {"http", "https"}:
+            return first_part
+    scheme = str(getattr(getattr(request, "url", None), "scheme", "") or "").strip().lower()
+    return scheme if scheme in {"http", "https"} else ""
+
+
+
+def _request_forwarded_host(request: Optional[Request]) -> str:
+    if request is None:
+        return ""
+    raw_forwarded_host = str(request.headers.get("x-forwarded-host") or "").strip()
+    if raw_forwarded_host:
+        return raw_forwarded_host.split(",", 1)[0].strip()
+    host_header = str(request.headers.get("host") or "").strip()
+    if host_header:
+        return host_header
+    try:
+        return str(getattr(request.url, "netloc", "") or "").strip()
+    except Exception:
+        return ""
+
+
+
+def _request_external_base_url(request: Optional[Request]) -> str:
+    configured_base = str(getattr(settings, "BACKEND_BASE_URL", "") or "").strip().rstrip("/")
+    if configured_base:
+        return configured_base
+    if request is None:
+        return ""
+    scheme = _request_forwarded_proto(request) or "https"
+    host = _request_forwarded_host(request)
+    if not host:
+        return ""
+    return f"{scheme}://{host}"
+
+
+
+def _request_is_https(request: Optional[Request]) -> bool:
+    return _request_forwarded_proto(request) == "https"
+
+
+
+def _subscription_public_url(request: Optional[Request] = None, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
+    clean_token = _resolve_subscription_token(token=token, code=code)
+    if not clean_token:
+        return None
+    external_base = _request_external_base_url(request)
+    if external_base:
+        return _subscription_public_url_from_base(external_base, clean_token)
+    return _subscription_public_url_from_base(settings.BACKEND_BASE_URL, clean_token)
+
+
+def _build_native_open_app_url(request: Optional[Request] = None, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None, platform: Optional[str] = None) -> str:
+    del lang
+    subscription_url = _subscription_public_url(request, token=token, code=code)
+    return _build_native_import_url(subscription_url, platform=platform)
+
+
+def _build_open_app_bridge_url(request: Request, *, code: Optional[str] = None, token: Optional[str] = None, lang: Optional[str] = None, platform: Optional[str] = None) -> str:
+    bridge = (settings.OPEN_APP_BRIDGE_URL or "").strip()
+    if bridge:
+        parts = urlsplit(bridge)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        if code:
+            query["code"] = code
+        elif token:
+            query["token"] = token
+        if lang:
+            query["lang"] = lang
+        if platform:
+            query["platform"] = _normalize_target_platform(platform)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+    base = _request_external_base_url(request)
+    query = {}
+    if code:
+        query["code"] = code
+    elif token:
+        query["token"] = token
+    if lang:
+        query["lang"] = lang
+    if platform:
+        query["platform"] = _normalize_target_platform(platform)
+    return f"{base}/open-app?{urlencode(query)}" if query else f"{base}/open-app"
+
+
+def _detect_android_app_package(platform: Optional[str] = None) -> str:
+    explicit = _selected_android_app_package(platform=platform)
+    if explicit:
+        return explicit
+    parsed = urlsplit(_selected_platform_store_url("android"))
+    if parsed.scheme and parsed.netloc:
+        query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        package_name = str(query.get("id") or "").strip()
+        if package_name:
+            return package_name
+    return ""
+
+
+def _build_android_intent_url(native_url: str) -> str:
+    parsed_native = urlsplit(native_url)
+    if not parsed_native.scheme or parsed_native.scheme in {"http", "https"}:
+        return ""
+    android_package = _detect_android_app_package()
+    if not android_package:
+        return ""
+    intent_path = parsed_native.path or ""
+    if parsed_native.netloc:
+        intent_path = f"//{parsed_native.netloc}{intent_path}"
+    intent_query = f"?{parsed_native.query}" if parsed_native.query else ""
+    intent_fragment = f"#{parsed_native.fragment}" if parsed_native.fragment else ""
+    return (
+        f"intent:{intent_path}{intent_query}{intent_fragment}"
+        f"#Intent;scheme={parsed_native.scheme};package={android_package};end"
+    )
+
+
+def _subscription_access_context(token: str) -> Optional[Dict[str, Any]]:
+    provided = str(token or "").strip()
+    if not provided:
+        return None
+    expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
+    if settings.LEGACY_GLOBAL_SUBSCRIPTION_TOKEN_ENABLED and expected and secrets.compare_digest(provided, expected):
+        return {"kind": "global", "user": None}
+    user = get_user_by_subscription_token(provided)
+    if user:
+        return {"kind": "user", "user": user}
     return None
 
 
-def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
-    if len(pool) <= 3:
-        return list(pool)
 
-    primary = list(pool[:3])
-    overflow = list(pool[3:])
-    if not overflow:
-        return primary
-
-    def row_load(row: Dict[str, Any]) -> int:
-        return int(loads.get(str(row.get("code") or "").strip(), 0))
-
-    best_primary_load = min(row_load(row) for row in primary)
-    best_overflow_load = min(row_load(row) for row in overflow)
-    if best_overflow_load + 1 < best_primary_load:
-        return overflow
-    return primary
-
-
-def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
-    rows = list_locations(active_only=True)
-    if not rows:
-        return None
-
-    ranked_candidates = _virtual_location_candidates(code, rows)
-    if not ranked_candidates:
-        return None
-
-    # Reserve virtual route should resolve to a real reserve candidate whenever at least one
-    # live reserve exists. Only then do we fall back to non-reserve rows.
-    if code == "auto-reserve":
-        reserve_ranked_candidates = [row for row in ranked_candidates if bool(row.get("is_reserve"))]
-        if reserve_ranked_candidates:
-            ranked_candidates = reserve_ranked_candidates
-
-    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
-    if not user_id:
-        return pool[0]
-
-    sibling_code = _virtual_sibling_code(code)
-    sibling_assigned_code = get_user_virtual_location_assignment(user_id, sibling_code) if sibling_code else None
-
-    if sibling_assigned_code:
-        sibling_filtered_pool = [
-            row for row in pool
-            if str(row.get("code") or "").strip() != sibling_assigned_code
-        ]
-        if sibling_filtered_pool:
-            pool = sibling_filtered_pool
-
-    assigned_code = get_user_virtual_location_assignment(user_id, code)
-    if assigned_code:
-        sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
-        if not sibling_collision:
-            for row in pool:
-                if str(row.get("code") or "").strip() == assigned_code:
-                    return row
-
-    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
-    effective_pool = _prefer_primary_virtual_pool(pool, loads)
-    selected = min(
-        enumerate(effective_pool),
-        key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
-    )[1]
-    selected_code = str(selected.get("code") or "").strip()
-    if selected_code:
-        upsert_user_virtual_location_assignment(user_id, code, selected_code)
-    return selected
-
-def sync_locations_catalog() -> None:
-    locations = _load_default_locations()
-    if not locations:
-        return
-
-    default_codes = [item["code"] for item in locations]
-    with db() as conn:
-        with conn.cursor() as cur:
-            for item in locations:
-                data = dict(item)
-                data["location_source"] = "catalog"
-                data["is_deleted"] = bool(data.get("is_deleted", False))
-                if not data.get("vpn_payload"):
-                    data["vpn_payload"] = _compose_vpn_payload_for_location(data)
-                data["download_mbps"] = _normalize_optional_float(data.get("download_mbps"))
-                data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
-                data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
-                data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
-                data["vpn_payload"] = Jsonb(data.get("vpn_payload") or {})
-                cur.execute(
-                    """
-                    INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, download_mbps, upload_mbps, ping_ms, speed_checked_at, vpn_payload, is_deleted, location_source)
-                    VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(download_mbps)s, %(upload_mbps)s, %(ping_ms)s, %(speed_checked_at)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
-                    ON CONFLICT (code) DO UPDATE SET
-                        -- Preserve admin-edited catalog rows across restarts.
-                        -- Bootstrap should only backfill missing defaults, not overwrite
-                        -- mutable values changed from the admin panel.
-                        name_ru = CASE
-                            WHEN COALESCE(NULLIF(BTRIM(locations.name_ru), ''), NULL) IS NULL THEN EXCLUDED.name_ru
-                            ELSE locations.name_ru
-                        END,
-                        name_en = CASE
-                            WHEN COALESCE(NULLIF(BTRIM(locations.name_en), ''), NULL) IS NULL THEN EXCLUDED.name_en
-                            ELSE locations.name_en
-                        END,
-                        country_code = CASE
-                            WHEN COALESCE(NULLIF(BTRIM(locations.country_code), ''), NULL) IS NULL THEN EXCLUDED.country_code
-                            ELSE locations.country_code
-                        END,
-                        is_active = locations.is_active,
-                        is_recommended = locations.is_recommended,
-                        is_reserve = locations.is_reserve,
-                        status = CASE
-                            WHEN COALESCE(NULLIF(BTRIM(locations.status), ''), NULL) IS NULL THEN EXCLUDED.status
-                            ELSE locations.status
-                        END,
-                        sort_order = CASE
-                            WHEN locations.sort_order IS NULL THEN EXCLUDED.sort_order
-                            ELSE locations.sort_order
-                        END,
-                        download_mbps = CASE
-                            WHEN locations.download_mbps IS NULL THEN EXCLUDED.download_mbps
-                            ELSE locations.download_mbps
-                        END,
-                        upload_mbps = CASE
-                            WHEN locations.upload_mbps IS NULL THEN EXCLUDED.upload_mbps
-                            ELSE locations.upload_mbps
-                        END,
-                        ping_ms = CASE
-                            WHEN locations.ping_ms IS NULL THEN EXCLUDED.ping_ms
-                            ELSE locations.ping_ms
-                        END,
-                        speed_checked_at = CASE
-                            WHEN locations.speed_checked_at IS NULL THEN EXCLUDED.speed_checked_at
-                            ELSE locations.speed_checked_at
-                        END,
-                        vpn_payload = CASE
-                            WHEN locations.vpn_payload = '{}'::jsonb THEN EXCLUDED.vpn_payload
-                            ELSE locations.vpn_payload
-                        END,
-                        is_deleted = locations.is_deleted,
-                        location_source = CASE
-                            WHEN COALESCE(NULLIF(BTRIM(locations.location_source), ''), 'catalog') = 'admin' THEN 'admin'
-                            ELSE 'catalog'
-                        END,
-                        updated_at = NOW()
-                    """,
-                    data,
-                )
-
-            placeholders = ", ".join(["%s"] * len(default_codes))
-            cur.execute(
-                f"""
-                UPDATE locations
-                SET is_active = FALSE,
-                    is_recommended = FALSE,
-                    is_reserve = FALSE,
-                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
-                    updated_at = NOW()
-                WHERE is_deleted = FALSE
-                  AND location_source = 'catalog'
-                  AND code NOT IN ({placeholders})
-                """,
-                tuple(default_codes),
-            )
-        conn.commit()
-
-
-def _normalize_location_source(value: Any) -> str:
-    normalized = str(value or "catalog").strip().lower()
-    return "admin" if normalized == "admin" else "catalog"
-
-
-def _as_positive_int(value: Any) -> Optional[int]:
-    try:
-        parsed = int(value)
-    except (TypeError, ValueError):
-        return None
-    if parsed <= 0:
-        return None
-    return parsed
-
-
-def _normalize_device_limit_override(value: Any) -> Optional[int]:
-    parsed = _as_positive_int(value)
-    if parsed is None:
-        return None
-    # V2: per-user override must bypass the global default ceiling.
-    # Global max remains a default/plan cap for regular users,
-    # but selected users may explicitly receive a higher manual limit.
-    return parsed
-
-
-def _resolve_effective_device_limit(plan_limit: Any = None, user_override: Any = None) -> int:
-    override_limit = _normalize_device_limit_override(user_override)
-    if override_limit is not None:
-        return override_limit
-    plan_value = _as_positive_int(plan_limit)
-    if plan_value is not None:
-        return min(plan_value, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
-    default_limit = _as_positive_int(settings.VPN_DEFAULT_DEVICE_LIMIT) or 1
-    return min(default_limit, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
-
-
-def _normalize_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not row:
-        return None
-    return {
-        "id": row["id"],
-        "telegram_id": row["telegram_id"],
-        "username": row.get("username"),
-        "first_name": row.get("first_name"),
-        "last_name": row.get("last_name"),
-        "language": row.get("language") or "ru",
-        "status": row.get("status") or "active",
-        "device_limit_override": _normalize_device_limit_override(row.get("device_limit_override")),
-        "subscription_token": row.get("subscription_token"),
-        "created_at": row.get("created_at"),
-        "updated_at": row.get("updated_at"),
-    }
-
-
-def _generate_subscription_token() -> str:
-    return secrets.token_urlsafe(32)
-
-
-def ensure_user_subscription_token(user_id: int) -> str:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT subscription_token FROM users WHERE id = %s FOR UPDATE", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("User not found")
-            existing = str((row or {}).get("subscription_token") or "").strip()
-            if existing:
-                conn.commit()
-                return existing
-
-            for _ in range(5):
-                token = _generate_subscription_token()
-                cur.execute(
-                    "UPDATE users SET subscription_token = %s, updated_at = NOW() WHERE id = %s RETURNING subscription_token",
-                    (token, user_id),
-                )
-                updated = cur.fetchone()
-                if updated and updated.get("subscription_token"):
-                    conn.commit()
-                    return str(updated["subscription_token"])
-            raise RuntimeError("Failed to generate unique subscription token")
-
-
-def get_user_by_active_auth_code(code: str) -> Optional[Dict[str, Any]]:
-    normalized = (code or "").strip()
-    if not normalized:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT u.*
-                FROM auth_codes ac
-                JOIN users u ON u.id = ac.user_id
-                WHERE ac.code = %s
-                  AND ac.used_at IS NULL
-                  AND ac.expires_at > NOW()
-                LIMIT 1
-                """,
-                (normalized,),
-            )
-            row = cur.fetchone()
-    return _normalize_user(row) if row else None
-
-
-def get_user_by_subscription_token(subscription_token: str) -> Optional[Dict[str, Any]]:
-    token = str(subscription_token or "").strip()
-    if not token:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE subscription_token = %s", (token,))
-            return _normalize_user(cur.fetchone())
-
-
-def get_user_by_id(user_id: int) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-            return _normalize_user(cur.fetchone())
-
-
-def get_user_by_telegram_id(telegram_id: int) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM users WHERE telegram_id = %s", (telegram_id,))
-            return _normalize_user(cur.fetchone())
-
-
-def upsert_telegram_user(payload: Dict[str, Any]) -> Dict[str, Any]:
-    telegram_id = int(payload["telegram_id"])
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO users (telegram_id, username, first_name, last_name, language, status)
-                VALUES (%s, %s, %s, %s, %s, COALESCE(%s, 'active'))
-                ON CONFLICT (telegram_id) DO UPDATE SET
-                    username = COALESCE(EXCLUDED.username, users.username),
-                    first_name = COALESCE(EXCLUDED.first_name, users.first_name),
-                    last_name = COALESCE(EXCLUDED.last_name, users.last_name),
-                    language = CASE
-                        WHEN users.language IS NULL OR users.language = '' THEN COALESCE(EXCLUDED.language, 'ru')
-                        ELSE users.language
-                    END,
-                    updated_at = NOW()
-                RETURNING *
-                """,
-                (
-                    telegram_id,
-                    payload.get("username"),
-                    payload.get("first_name"),
-                    payload.get("last_name"),
-                    payload.get("language") or "ru",
-                    payload.get("status"),
-                ),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return _normalize_user(row)
-
-
-def set_user_language(user_id: int, language: str) -> Dict[str, Any]:
-    language = "en" if language == "en" else "ru"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET language = %s, updated_at = NOW() WHERE id = %s RETURNING *", (language, user_id))
-            row = cur.fetchone()
-        conn.commit()
-    return _normalize_user(row)
-
-
-def set_user_status_by_telegram(telegram_id: int, status: str, admin_name: str, note: str) -> Dict[str, Any]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE users SET status = %s, updated_at = NOW() WHERE telegram_id = %s RETURNING *", (status, telegram_id))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("User not found")
-            cur.execute(
-                "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
-                (row["id"], admin_name, note),
-            )
-        conn.commit()
-    return _normalize_user(row)
-
-
-def get_active_plans() -> List[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM plans WHERE is_active = TRUE ORDER BY duration_days ASC, price_rub ASC")
-            return [dict(row) for row in cur.fetchall()]
-
-
-def get_all_plans() -> List[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM plans ORDER BY duration_days ASC, price_rub ASC")
-            return [dict(row) for row in cur.fetchall()]
-
-
-def get_plan_by_code(code: str) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM plans WHERE code = %s", (code,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def refresh_subscription_statuses(user_id: Optional[int] = None) -> None:
-    query = """
-        UPDATE subscriptions
-        SET status = CASE
-            WHEN starts_at <= NOW() AND expires_at >= NOW() THEN 'active'
-            WHEN starts_at > NOW() THEN 'pending'
-            ELSE 'expired'
-        END,
-        updated_at = NOW()
-    """
-    args: Tuple[Any, ...] = tuple()
-    if user_id is not None:
-        query += " WHERE user_id = %s"
-        args = (user_id,)
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, args)
-        conn.commit()
-
-
-def _subscription_select(where_sql: str) -> str:
-    return f"""
-        SELECT s.*, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en,
-               p.name_ru, p.name_en, p.price_rub, p.duration_days, p.device_limit
-        FROM subscriptions s
-        JOIN plans p ON p.id = s.plan_id
-        {where_sql}
-        ORDER BY s.expires_at DESC
-        LIMIT 1
-    """
-
-
-
-def get_current_subscription(user_id: int) -> Optional[Dict[str, Any]]:
-    refresh_subscription_statuses(user_id)
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(_subscription_select("WHERE s.user_id = %s AND s.status = 'active'"), (user_id,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def get_subscription_device_gate_by_token(subscription_token: str, device_fingerprint: str) -> Optional[Dict[str, Any]]:
-    token = str(subscription_token or "").strip()
-    fingerprint = str(device_fingerprint or "").strip()
-    if not token:
-        return None
-    user = get_user_by_subscription_token(token)
-    if not user:
-        return None
-    if user.get("status") == "blocked":
-        return {
-            "allowed": False,
-            "reason": "user_blocked",
-            "detail": "Access blocked",
-            "user_id": int(user["id"]),
-            "devices_used": 0,
-            "device_limit": 0,
-            "known_device": False,
-        }
-    subscription = get_current_subscription(int(user["id"]))
-    if not subscription:
-        return {
-            "allowed": False,
-            "reason": "subscription_inactive",
-            "detail": "Active subscription required",
-            "user_id": int(user["id"]),
-            "devices_used": 0,
-            "device_limit": 0,
-            "known_device": False,
-        }
-    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
-    devices = get_user_devices(int(user["id"]))
-    known_device = bool(fingerprint) and any(str(item.get("device_fingerprint") or "") == fingerprint for item in devices)
-    return {
-        "allowed": known_device or len(devices) < allowed_limit,
-        "reason": "ok" if (known_device or len(devices) < allowed_limit) else "device_limit_reached",
-        "detail": "OK" if (known_device or len(devices) < allowed_limit) else f"Device limit reached ({len(devices)}/{allowed_limit})",
-        "user_id": int(user["id"]),
-        "devices_used": len(devices),
-        "device_limit": allowed_limit,
-        "known_device": known_device,
-    }
-
-
-def get_latest_subscription(user_id: int) -> Optional[Dict[str, Any]]:
-    refresh_subscription_statuses(user_id)
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(_subscription_select("WHERE s.user_id = %s"), (user_id,))
-            row = cur.fetchone()
-            return dict(row) if row else None
-
-
-def get_user_devices(user_id: int) -> List[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
-                (user_id,),
-            )
-            return [dict(row) for row in cur.fetchall()]
-
-
-def _get_user_subscription_view_with_conn(conn: psycopg.Connection, user_id: int) -> Dict[str, Any]:
-    refresh_subscription_statuses(user_id)
-    with conn.cursor() as cur:
-        cur.execute("SELECT * FROM users WHERE id = %s", (user_id,))
-        user_row = cur.fetchone()
-        user = _normalize_user(user_row)
-
-        cur.execute(_subscription_select("WHERE s.user_id = %s AND s.status = 'active'"), (user_id,))
-        subscription_row = cur.fetchone()
-        subscription = dict(subscription_row) if subscription_row else None
-
-        latest = subscription
-        if latest is None:
-            cur.execute(_subscription_select("WHERE s.user_id = %s"), (user_id,))
-            latest_row = cur.fetchone()
-            latest = dict(latest_row) if latest_row else None
-
-        cur.execute(
-            "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
-            (user_id,),
-        )
-        devices = [dict(row) for row in cur.fetchall()]
-
-    allowed_limit = _resolve_effective_device_limit(
-        (latest or {}).get("device_limit"),
-        (user or {}).get("device_limit_override"),
-    )
-    subscription_token = ensure_user_subscription_token(user_id) if user else None
-    return {
-        "subscription": latest,
-        "is_active": bool(subscription),
-        "devices": devices,
-        "devices_used": len(devices),
-        "device_limit": allowed_limit,
-        "device_limit_override": (user or {}).get("device_limit_override"),
-        "subscription_token": subscription_token,
-    }
-
-
-def get_user_subscription_view(user_id: int) -> Dict[str, Any]:
-    with db() as conn:
-        return _get_user_subscription_view_with_conn(conn, user_id)
-
-
-def _device_platform_family(platform: Any) -> str:
+def _subscription_token_is_active(token: Optional[str]) -> bool:
+    access = _subscription_access_context(str(token or "").strip())
+    if not access:
+        return False
+    if access["kind"] != "user":
+        return True
+    user = access.get("user")
+    if not user or user.get("status") == "blocked":
+        return False
+    view = get_user_subscription_view(int(user["id"]))
+    return bool(view.get("is_active") and view.get("subscription"))
+
+
+
+def _sanitize_tracking_value(value: Optional[str], *, max_len: int = 160) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in {'-', '_', '.', ':', '@'})
+    return cleaned[:max_len]
+
+
+
+def _detect_device_platform_and_name(request: Request) -> Tuple[str, str]:
+    user_agent = str(request.headers.get("user-agent") or "").strip()
+    ua = user_agent.lower()
+    sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip().strip('"').lower()
+    platform = "client"
+    if "android" in ua or sec_platform == "android":
+        platform = "android"
+    elif any(token in ua for token in ("iphone", "ipad", "ios")) or sec_platform in {"ios", "iphone", "ipad"}:
+        platform = "ios"
+    elif "windows" in ua:
+        platform = "windows"
+    elif any(token in ua for token in ("mac os", "macos", "darwin")):
+        platform = "macos"
+    elif "linux" in ua:
+        platform = "linux"
+
+    client_name = "VPN client"
+    if "hiddify" in ua:
+        client_name = "Hiddify"
+    elif "v2raytun" in ua:
+        client_name = "v2RayTun"
+    elif "happ" in ua:
+        client_name = "Happ"
+    elif "nekobox" in ua:
+        client_name = "NekoBox"
+    elif "nekoray" in ua:
+        client_name = "NekoRay"
+    elif "sing-box" in ua or "singbox" in ua:
+        client_name = "sing-box"
+
+    platform_title = {
+        "android": "Android",
+        "ios": "iOS",
+        "windows": "Windows",
+        "macos": "macOS",
+        "linux": "Linux",
+    }.get(platform)
+    device_name = f"{client_name} {platform_title}" if platform_title else client_name
+    return platform, device_name
+
+
+
+def _device_platform_family(platform: Optional[str]) -> str:
     normalized = str(platform or "").strip().lower()
     if normalized in {"android", "ios"}:
         return "mobile"
@@ -1791,7 +2654,7 @@ def _device_platform_family(platform: Any) -> str:
 
 
 
-def _device_client_family(device_name: Any) -> str:
+def _device_client_family(device_name: Optional[str]) -> str:
     normalized = str(device_name or "").strip().lower()
     if "v2raytun" in normalized:
         return "v2raytun"
@@ -1811,42 +2674,172 @@ def _device_client_family(device_name: Any) -> str:
 
 
 
-def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
+def _is_public_ip_address(value: Optional[str]) -> bool:
+    raw = str(value or "").strip()
+    if not raw:
+        return False
+    try:
+        parsed = ipaddress.ip_address(raw)
+    except ValueError:
+        return False
+    if parsed.is_private or parsed.is_loopback or parsed.is_link_local or parsed.is_reserved or parsed.is_multicast or parsed.is_unspecified:
+        return False
+    return True
+
+
+
+def _client_ip_from_request(request: Request) -> str:
+    for header_name in ("cf-connecting-ip", "x-real-ip", "x-forwarded-for"):
+        raw = str(request.headers.get(header_name) or "").strip()
+        if not raw:
+            continue
+        candidate = raw.split(",", 1)[0].strip()
+        if _is_public_ip_address(candidate):
+            return candidate
+    client = getattr(request, "client", None)
+    host = str(getattr(client, "host", None) or "").strip()
+    if _is_public_ip_address(host):
+        return host
+    return ""
+
+
+
+def _subscription_client_id_from_request(request: Request) -> str:
+    raw_value = (
+        request.query_params.get("client_id")
+        or request.query_params.get("subcid")
+        or request.headers.get("x-client-id")
+        or request.cookies.get("inet_sub_cid")
+    )
+    if not raw_value:
+        legacy_cid = str(request.query_params.get("cid") or "").strip()
+        if legacy_cid.startswith("cid-"):
+            raw_value = legacy_cid
+    return _sanitize_tracking_value(raw_value, max_len=120)
+
+
+
+def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    if normalized_client_id:
+        return (f"cid:{normalized_client_id}", "client_id")
+    user_agent = str(request.headers.get("user-agent") or "").strip()
+    accept_language = str(request.headers.get("accept-language") or "").strip()
+    sec_ch_ua = str(request.headers.get("sec-ch-ua") or "").strip()
+    sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
+    sec_mobile = str(request.headers.get("sec-ch-ua-mobile") or "").strip()
+    client_ip = _client_ip_from_request(request)
+    parts = [user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile]
+    normalized_parts = [part.strip() for part in parts if part and part.strip()]
+    if client_ip:
+        normalized_parts.append(client_ip)
+    if not normalized_parts:
+        return None
+    return ("fallback:" + "|".join(normalized_parts), "fallback")
+
+
+
+def _build_subscription_device_fingerprint(request: Request, token: str, client_id: Optional[str] = None) -> Optional[str]:
+    fingerprint_source = _subscription_fingerprint_source(request, token, client_id)
+    if not fingerprint_source:
+        return None
+    source, _ = fingerprint_source
+    return hashlib.sha256(f"sub-device:v3:{token}:{source}".encode("utf-8")).hexdigest()
+
+
+
+def _subscription_cookie_value(request: Request, token: str) -> str:
+    current = _subscription_client_id_from_request(request)
+    if current:
+        return current
+    ua = str(request.headers.get("user-agent") or "").strip()
+    platform, _ = _detect_device_platform_and_name(request)
+    seed = f"{token}|{platform}|{ua}|{uuid4().hex}"
+    return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+
+def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, Any]], gate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not gate or gate.get("allowed"):
+        return gate
+    if not access or access.get("kind") != "user":
+        return gate
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+    has_explicit_client_id = bool(_subscription_client_id_from_request(request))
+    allow_soft_match_with_client_id = (
+        client_hint in {"v2raytun", "hiddify"}
+        or "v2raytun" in user_agent_hint
+        or "hiddify" in user_agent_hint
+    )
+    if has_explicit_client_id and not allow_soft_match_with_client_id:
+        return gate
+    used = int(gate.get("devices_used") or 0)
+    limit = int(gate.get("device_limit") or 0)
+    if limit <= 0 or used < limit:
+        return gate
+    platform, device_name = _detect_device_platform_and_name(request)
+    user = access.get("user") or {}
+    user_id = int(user.get("id") or 0)
+    if user_id <= 0:
+        return gate
+    try:
+        view = get_user_subscription_view(user_id)
+    except Exception:
+        return gate
+    devices = list(view.get("devices") or [])
     normalized_platform = str(platform or "").strip().lower()
     normalized_name = str(device_name or "").strip()
     platform_family = _device_platform_family(normalized_platform)
     client_family = _device_client_family(normalized_name)
 
     exact_matches = [
-        item for item in existing
+        item
+        for item in devices
         if str(item.get("platform") or "").strip().lower() == normalized_platform
         and str(item.get("device_name") or "").strip() == normalized_name
     ]
     if len(exact_matches) == 1:
-        return exact_matches[0]
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_device_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {normalized_name or normalized_platform or 'device'} slot"
+        return relaxed
 
-    same_platform = [
-        item for item in existing
+    same_platform_matches = [
+        item
+        for item in devices
         if str(item.get("platform") or "").strip().lower() == normalized_platform
     ]
-    if len(same_platform) == 1:
-        return same_platform[0]
+    if len(same_platform_matches) == 1:
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {normalized_platform or 'device'} slot"
+        return relaxed
 
-    same_family = []
-    for item in existing:
+    same_family_matches = []
+    for item in devices:
         item_platform = str(item.get("platform") or "").strip().lower()
         item_name = str(item.get("device_name") or "").strip()
         item_family = _device_platform_family(item_platform)
         item_client_family = _device_client_family(item_name)
-        compatible_family = item_family == platform_family
+        same_family = item_family == platform_family
         compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
-        if compatible_family and compatible_client:
-            same_family.append(item)
-    if len(same_family) == 1:
-        return same_family[0]
+        if same_family and compatible_client:
+            same_family_matches.append(item)
+    if len(same_family_matches) == 1:
+        relaxed = dict(gate)
+        relaxed["allowed"] = True
+        relaxed["known_device"] = True
+        relaxed["reason"] = "platform_family_soft_match"
+        relaxed["detail"] = f"Subscription refresh allowed for existing {platform_family or normalized_platform or 'device'} slot"
+        return relaxed
 
-    if len(existing) == 1:
-        only_item = existing[0]
+    if len(devices) == 1:
+        only_item = devices[0]
         only_platform = str(only_item.get("platform") or "").strip().lower()
         only_name = str(only_item.get("device_name") or "").strip()
         only_family = _device_platform_family(only_platform)
@@ -1854,1108 +2847,1502 @@ def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, dev
         compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
         compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
         if compatible_family and compatible_client:
-            return only_item
+            relaxed = dict(gate)
+            relaxed["allowed"] = True
+            relaxed["known_device"] = True
+            relaxed["reason"] = "single_slot_soft_match"
+            relaxed["detail"] = "Subscription refresh allowed for existing single device slot"
+            return relaxed
 
-    return None
+    return gate
 
 
-def _upsert_device_record(
-    user_id: int,
-    platform: str,
-    device_name: str,
-    device_fingerprint: str,
-    *,
-    enforce_limit: bool = True,
-) -> Optional[Dict[str, Any]]:
-    user = get_user_by_id(user_id)
-    if not user:
-        raise ValueError("User not found")
-    if user["status"] == "blocked":
-        raise PermissionError("User is blocked")
-    subscription = get_current_subscription(user_id)
-    if not subscription:
-        raise PermissionError("Active subscription required")
-    if enforce_limit and not settings.VPN_NEW_ACTIVATIONS_ENABLED:
-        raise PermissionError("New activations are disabled")
-    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
-    existing = get_user_devices(user_id)
-    for item in existing:
-        if item["device_fingerprint"] == device_fingerprint:
-            with db() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(
-                        """
-                        UPDATE devices
-                        SET platform = %s, device_name = %s, is_active = TRUE, last_seen_at = NOW()
-                        WHERE id = %s
-                        RETURNING *
-                        """,
-                        (platform, device_name, item["id"]),
-                    )
-                    row = cur.fetchone()
-                conn.commit()
-            return dict(row) if row else None
-    if len(existing) >= allowed_limit:
-        if not enforce_limit:
-            matched_item = _select_soft_match_device(existing, platform, device_name)
-            if matched_item:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE devices
-                            SET device_fingerprint = %s,
-                                platform = %s,
-                                device_name = %s,
-                                is_active = TRUE,
-                                last_seen_at = NOW()
-                            WHERE id = %s
-                            RETURNING *
-                            """,
-                            (device_fingerprint, platform, device_name, matched_item["id"]),
-                        )
-                        row = cur.fetchone()
-                    conn.commit()
-                return dict(row) if row else None
-        if enforce_limit:
-            raise PermissionError(f"Device limit reached ({allowed_limit})")
+
+def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> None:
+    if not access or access.get("kind") != "user":
+        return
+    user = access.get("user") or {}
+    if not user or user.get("status") == "blocked":
+        return
+    client_id = _subscription_client_id_from_request(request)
+    fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
+    if not fingerprint:
+        return
+    platform, device_name = _detect_device_platform_and_name(request)
+    try:
+        touch_subscription_device_by_token(token, platform=platform, device_name=device_name, device_fingerprint=fingerprint)
+    except Exception:
+        pass
+
+
+
+def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if not access or access.get("kind") != "user":
         return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO devices (user_id, platform, device_name, device_fingerprint)
-                VALUES (%s, %s, %s, %s)
-                RETURNING *
-                """,
-                (user_id, platform, device_name, device_fingerprint),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return dict(row) if row else None
-
-
-
-def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
-    item = _upsert_device_record(user_id, platform, device_name, device_fingerprint, enforce_limit=True)
-    if not item:
-        raise PermissionError("Device registration failed")
-    return item
-
-
-
-def touch_subscription_device_by_token(subscription_token: str, platform: str, device_name: str, device_fingerprint: str) -> Optional[Dict[str, Any]]:
-    token = str(subscription_token or "").strip()
-    if not token or not device_fingerprint:
+    user = access.get("user") or {}
+    if not user or user.get("status") == "blocked":
         return None
-    user = get_user_by_subscription_token(token)
-    if not user:
+    client_id = _subscription_client_id_from_request(request)
+    fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
+    if not fingerprint:
         return None
     try:
-        return _upsert_device_record(
-            int(user["id"]),
-            str(platform or "client").strip() or "client",
-            str(device_name or "VPN client").strip() or "VPN client",
-            str(device_fingerprint or "").strip(),
-            enforce_limit=False,
-        )
+        gate = get_subscription_device_gate_by_token(token, fingerprint)
     except Exception:
         return None
-
-
-def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("DELETE FROM devices WHERE user_id = %s AND id = %s RETURNING *", (user_id, device_id))
-            row = cur.fetchone()
-        conn.commit()
-    if row:
-        enqueue_notification(
-            user_id=user_id,
-            event_type="device_removed",
-            unique_key=f"device_removed:{row['id']}:{int(datetime.now(timezone.utc).timestamp())}",
-            payload={
-                "platform": row.get("platform"),
-                "device_name": row.get("device_name"),
-            },
-        )
-        return dict(row)
-    return None
-
-
-def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
-    query = "SELECT * FROM locations WHERE is_deleted = FALSE"
-    if active_only:
-        query += " AND is_active = TRUE"
-    query += " ORDER BY sort_order ASC, id ASC"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query)
-            return [dict(row) for row in cur.fetchall()]
-
-
-def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_status: str = "offline") -> Dict[str, Any]:
-    data = dict(payload or {})
-    data["code"] = str(data.get("code") or "").strip()
-    data["name_ru"] = str(data.get("name_ru") or "").strip()
-    data["name_en"] = str(data.get("name_en") or data.get("name_ru") or "").strip()
-    country_code = data.get("country_code")
-    data["country_code"] = str(country_code).strip().upper() or None if country_code is not None else None
-    data["status"] = str(data.get("status") or default_status).strip().lower() or default_status
-    if data["status"] not in {"online", "offline", "reserve"}:
-        data["status"] = default_status
-    try:
-        data["sort_order"] = int(data.get("sort_order") or 100)
-    except (TypeError, ValueError):
-        data["sort_order"] = 100
-    data["is_active"] = bool(data.get("is_active", True))
-    data["is_recommended"] = bool(data.get("is_recommended", False))
-    data["is_reserve"] = bool(data.get("is_reserve", False))
-    data["download_mbps"] = _normalize_optional_float(data.get("download_mbps"))
-    data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
-    data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
-    data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
-    vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
-    if data["code"] and not vpn_payload.get("location_code"):
-        vpn_payload["location_code"] = data["code"]
-    if data["name_en"] and not vpn_payload.get("remark"):
-        vpn_payload["remark"] = data["name_en"]
-    data["vpn_payload"] = vpn_payload
-    return data
+    return _subscription_soft_gate_allow(request, access, gate)
 
 
 
-def _insert_or_upsert_location(cur: psycopg.Cursor, data: Dict[str, Any]) -> Dict[str, Any]:
-    db_data = dict(data)
-    db_data["vpn_payload"] = Jsonb(db_data.get("vpn_payload") or {})
-    cur.execute(
-        """
-        INSERT INTO locations (code, name_ru, name_en, country_code, is_active, is_recommended, is_reserve, status, sort_order, download_mbps, upload_mbps, ping_ms, speed_checked_at, vpn_payload, is_deleted, location_source)
-        VALUES (%(code)s, %(name_ru)s, %(name_en)s, %(country_code)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order)s, %(download_mbps)s, %(upload_mbps)s, %(ping_ms)s, %(speed_checked_at)s, %(vpn_payload)s, %(is_deleted)s, %(location_source)s)
-        ON CONFLICT (code) DO UPDATE SET
-            name_ru = EXCLUDED.name_ru,
-            name_en = EXCLUDED.name_en,
-            country_code = EXCLUDED.country_code,
-            is_active = EXCLUDED.is_active,
-            is_recommended = EXCLUDED.is_recommended,
-            is_reserve = EXCLUDED.is_reserve,
-            status = EXCLUDED.status,
-            sort_order = EXCLUDED.sort_order,
-            download_mbps = EXCLUDED.download_mbps,
-            upload_mbps = EXCLUDED.upload_mbps,
-            ping_ms = EXCLUDED.ping_ms,
-            speed_checked_at = EXCLUDED.speed_checked_at,
-            vpn_payload = EXCLUDED.vpn_payload,
-            is_deleted = FALSE,
-            location_source = EXCLUDED.location_source,
-            updated_at = NOW()
-        RETURNING *
-        """,
-        db_data,
-    )
-    row = cur.fetchone()
-    if not row:
-        raise ValueError("Location was not saved")
-    return dict(row)
+def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    base_name = str(
+        normalized.get("remark")
+        or normalized.get("display_name")
+        or row.get("name_en")
+        or row.get("name_ru")
+        or row.get("code")
+        or "VLESS"
+    ).strip() or "VLESS"
+    if bool(row.get("is_recommended")) and not base_name.startswith(("★ ", "⭐ ")):
+        return f"★ {base_name}"
+    return base_name
+
+
+def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
+    normalized = _normalize_vpn_payload_keys(payload)
+    if not normalized or not _config_is_complete(normalized):
+        raise ValueError("VLESS payload is incomplete")
+
+    uuid = str(normalized.get("uuid") or "").strip()
+    server = str(normalized.get("server") or "").strip()
+    port = int(normalized.get("port") or 443)
+    remark = str(normalized.get("remark") or normalized.get("display_name") or fallback_name).strip() or fallback_name
+
+    query: Dict[str, Any] = {
+        "type": str(normalized.get("transport") or normalized.get("network") or "tcp").strip() or "tcp",
+        "security": str(normalized.get("security") or "reality").strip() or "reality",
+        "encryption": str(normalized.get("encryption") or "none").strip() or "none",
+    }
+    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
+    optional_keys = {
+        "flow": normalized.get("flow"),
+        "sni": normalized.get("sni") or normalized.get("server_name"),
+        "host": normalized.get("host"),
+        "path": normalized.get("path"),
+        "serviceName": normalized.get("service_name") or normalized.get("serviceName"),
+        "mode": normalized.get("mode") or ("auto" if transport == "xhttp" else None),
+        "pbk": normalized.get("public_key") or normalized.get("publicKey"),
+        "sid": normalized.get("short_id") or normalized.get("shortId"),
+        "fp": normalized.get("fingerprint"),
+        "alpn": ",".join(str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()),
+        "packetEncoding": normalized.get("packet_encoding") or normalized.get("packetEncoding"),
+    }
+    for key, value in optional_keys.items():
+        text = str(value or "").strip()
+        if text:
+            query[key] = text
+
+    return f"vless://{quote(uuid, safe='')}@{server}:{port}?{urlencode(query)}#{quote(remark, safe='')}"
 
 
 
-def _is_locations_sequence_conflict(exc: Exception) -> bool:
-    text = str(exc).lower()
-    constraint_name = str(getattr(getattr(exc, "diag", None), "constraint_name", "") or "").lower()
-    return (
-        "duplicate key value violates unique constraint" in text
-        and ("locations_pkey" in text or constraint_name == "locations_pkey")
-    )
+def _hiddify_subscription_transport_allowed(payload: Dict[str, Any]) -> bool:
+    allowed = {item.strip().lower() for item in (settings.HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws"]) if str(item or "").strip()}
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    return transport in allowed if allowed else True
 
 
+def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+    code = str(row.get("code") or "").strip()
+    resolved_row = dict(row)
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        picked = _pick_virtual_location(code, user_id=user_id)
+        if not picked:
+            return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
+        resolved_row = dict(picked)
 
-def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
-    data = _normalize_location_mutation_payload(payload)
-    if not data["code"]:
-        raise ValueError("code is required")
-    if not data["name_ru"]:
-        raise ValueError("name_ru is required")
-    if not data["name_en"]:
-        raise ValueError("name_en is required")
-    data["is_deleted"] = False
-    data["location_source"] = _normalize_location_source(data.get("location_source") or "admin")
-    with db() as conn:
-        with conn.cursor() as cur:
-            try:
-                _resync_serial_sequence(cur, "locations")
-                row = _insert_or_upsert_location(cur, data)
-            except psycopg.Error as exc:
-                conn.rollback()
-                if not _is_locations_sequence_conflict(exc):
-                    raise
-                with conn.cursor() as retry_cur:
-                    _resync_serial_sequence(retry_cur, "locations")
-                    row = _insert_or_upsert_location(retry_cur, data)
-        conn.commit()
-    return row
-
-
-def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-    updates = []
-    values: List[Any] = []
-    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
-    for key, value in payload.items():
-        if key not in allowed:
-            continue
-        if key in {"name_ru", "name_en"}:
-            value = str(value or "").strip()
-        elif key == "country_code":
-            value = str(value).strip().upper() or None if value is not None else None
-        elif key == "status":
-            value = str(value or "offline").strip() or "offline"
-        elif key == "sort_order":
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                value = 100
-        elif key in {"download_mbps", "upload_mbps"}:
-            value = _normalize_optional_float(value)
-        elif key == "ping_ms":
-            value = _normalize_optional_int(value)
-        elif key == "speed_checked_at":
-            value = _normalize_optional_timestamp(value)
-        elif key == "vpn_payload":
-            value = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(value or {})))
-            if "name_en" in payload and payload.get("name_en") and not value.get("remark"):
-                value["remark"] = str(payload.get("name_en") or "").strip()
-            value = Jsonb(value)
-        updates.append(f"{key} = %s")
-        values.append(value)
-    if not updates:
-        raise ValueError("No valid fields to update")
-    values.append(location_id)
-    query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s AND is_deleted = FALSE RETURNING *"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, tuple(values))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Location not found")
-        conn.commit()
-    return dict(row)
-
-
-def delete_location(location_id: int) -> Dict[str, Any]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE locations
-                SET is_deleted = TRUE,
-                    is_active = FALSE,
-                    is_recommended = FALSE,
-                    is_reserve = FALSE,
-                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
-                    updated_at = NOW()
-                WHERE id = %s AND is_deleted = FALSE
-                RETURNING *
-                """,
-                (location_id,),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Location not found")
-        conn.commit()
-    return dict(row)
-
-
-def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
-    subscription = get_current_subscription(user_id)
-    if not subscription:
-        raise PermissionError("Active subscription required")
-
-    if location_code in {"auto-fastest", "auto-reserve"}:
-        row = _pick_virtual_location(location_code, user_id=user_id)
-        if not row:
-            raise ValueError("No active VLESS node is available for auto selection")
-    else:
-        with db() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE AND status = 'online' LIMIT 1",
-                    (location_code,),
-                )
-                row = cur.fetchone()
-    if not row:
-        raise ValueError("Location not found")
-
-    payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
+    payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
     if not payload:
-        raise ValueError("VLESS config is not configured for this location")
-    if not _config_is_complete(payload):
-        raise ValueError("VLESS config is incomplete for this location")
-    return payload
+        return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
 
-def create_payment_record(
-    user_id: int,
-    plan_id: int,
-    provider: str,
-    method: str,
-    amount: float,
-    currency: str,
-    status: str,
-    external_payment_id: Optional[str] = None,
-    checkout_url: Optional[str] = None,
-) -> Dict[str, Any]:
-    payment_id = str(uuid4())
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO payments (id, user_id, plan_id, provider, method, amount, currency, status, external_payment_id, checkout_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                RETURNING *
-                """,
-                (payment_id, user_id, plan_id, provider, method, amount, currency, status, external_payment_id, checkout_url),
+    payload_for_subscription = dict(payload)
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        virtual_name = str(row.get("name_en") or row.get("name_ru") or code or "VLESS").strip() or "VLESS"
+        resolved_name = str(
+            resolved_row.get("name_en")
+            or resolved_row.get("name_ru")
+            or resolved_row.get("code")
+            or payload_for_subscription.get("resolved_location_code")
+            or "VLESS"
+        ).strip() or "VLESS"
+        payload_for_subscription["remark"] = f"{virtual_name} → {resolved_name}"
+        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+    else:
+        payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
+        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+
+    fallback_name = _subscription_remark_for_row(row, payload_for_subscription)
+    return payload_for_subscription, fallback_name
+
+
+def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    concrete: List[Dict[str, Any]] = []
+    for row in _public_location_rows():
+        payload, _ = _subscription_payload_and_fallback_name(dict(row), user_id=user_id)
+        if payload and _hiddify_subscription_transport_allowed(payload):
+            concrete.append(dict(row))
+    return concrete
+
+
+def _hiddify_profile_update_interval_header_value() -> str:
+    raw_value = getattr(settings, "HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)
+    try:
+        numeric = float(raw_value)
+    except (TypeError, ValueError):
+        numeric = 1.0
+    if numeric <= 0:
+        numeric = 1.0
+    normalized_hours = int(numeric + 0.5)
+    if normalized_hours < 1:
+        normalized_hours = 1
+    return str(normalized_hours)
+
+
+def _subscription_cache_buster_url(request: Optional[Request], token: str, content_version: str) -> Optional[str]:
+    base_url = _subscription_public_url(request, token=token)
+    if not base_url:
+        return None
+    version = str(content_version or "").strip()
+    if not version:
+        return base_url
+    parts = urlsplit(base_url)
+    query = dict(parse_qsl(parts.query, keep_blank_values=True))
+    query["v"] = version[:16]
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+
+
+def _subscription_inline_comment_headers(
+    *,
+    profile_title: str,
+    update_interval_hours: str,
+    subscription_userinfo: str,
+    support_url: str,
+    profile_web_page_url: str,
+    moved_permanently_to_url: Optional[str],
+    content_version: str,
+) -> List[str]:
+    title_b64 = base64.b64encode(profile_title.encode("utf-8")).decode("ascii")
+    lines: List[str] = [
+        f"#profile-title: base64:{title_b64}",
+        f"#profile-update-interval: {update_interval_hours}",
+        f"#subscription-userinfo: {subscription_userinfo}",
+    ]
+    if support_url:
+        lines.append(f"#support-url: {support_url}")
+    if profile_web_page_url:
+        lines.append(f"#profile-web-page-url: {profile_web_page_url}")
+    if moved_permanently_to_url:
+        lines.append(f"#moved-permanently-to: {moved_permanently_to_url}")
+    version = str(content_version or "").strip()
+    if version:
+        lines.append(f"#x-subscription-version: {version[:16]}")
+    return lines[:10]
+
+
+def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
+    if value is None:
+        return None
+    aware = value if value.tzinfo is not None else value.replace(tzinfo=timezone.utc)
+    return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
+
+
+def _subscription_response(request: Request, token: str, *, head_only: bool = False) -> Response:
+    access = _subscription_access_context(token)
+    if not access:
+        raise HTTPException(status_code=404, detail="Subscription not found")
+
+    expires_ts = int(time.time()) + 86400 * 3650
+    profile_title = f"{settings.APP_NAME} Subscription"
+    subscription_user_id: Optional[int] = None
+    if access["kind"] == "user":
+        user = access["user"]
+        if not user or user.get("status") == "blocked":
+            raise HTTPException(status_code=404, detail="Subscription not found")
+        view = get_user_subscription_view(int(user["id"]))
+        if not view.get("is_active") or not view.get("subscription"):
+            raise HTTPException(status_code=403, detail="Active subscription required")
+        subscription = view["subscription"] or {}
+        expires_at = subscription.get("expires_at")
+        if isinstance(expires_at, datetime):
+            expires_ts = int(expires_at.timestamp())
+        elif isinstance(expires_at, str):
+            try:
+                expires_ts = int(datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp())
+            except Exception:
+                pass
+        profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
+        subscription_user_id = int(user["id"])
+
+        gate = _subscription_device_gate(request, token, access)
+        if gate and not gate.get("allowed"):
+            used = int(gate.get("devices_used") or 0)
+            limit = int(gate.get("device_limit") or 0)
+            content = (
+                f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
+                f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
             )
-            row = cur.fetchone()
-        conn.commit()
-    return dict(row)
+            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+
+    if not head_only:
+        _track_subscription_device_access(request, token, access)
+
+    rows = _subscription_location_rows(subscription_user_id)
+    lines: List[str] = []
+    for row in rows:
+        payload_for_subscription, fallback_name = _subscription_payload_and_fallback_name(dict(row), user_id=subscription_user_id)
+        if not payload_for_subscription:
+            continue
+        try:
+            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=fallback_name))
+        except Exception:
+            continue
+
+    if not lines:
+        raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
+
+    content = "\n".join(lines) + "\n"
+    content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    last_modified_dt: Optional[datetime] = None
+    for row in rows:
+        raw_updated = row.get("updated_at")
+        parsed: Optional[datetime] = None
+        if isinstance(raw_updated, datetime):
+            parsed = raw_updated
+        elif isinstance(raw_updated, str):
+            try:
+                parsed = datetime.fromisoformat(raw_updated.replace("Z", "+00:00"))
+            except Exception:
+                parsed = None
+        if parsed is not None:
+            if last_modified_dt is None or parsed > last_modified_dt:
+                last_modified_dt = parsed
+    if last_modified_dt is None:
+        last_modified_dt = datetime.now(timezone.utc)
+    profile_web_page_url = str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
+    support_url = str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+    update_interval_hours = _hiddify_profile_update_interval_header_value()
+    subscription_userinfo = f"upload=0; download=0; total=0; expire={expires_ts}"
+    moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
+    inline_headers = _subscription_inline_comment_headers(
+        profile_title=profile_title,
+        update_interval_hours=update_interval_hours,
+        subscription_userinfo=subscription_userinfo,
+        support_url=support_url,
+        profile_web_page_url=profile_web_page_url,
+        moved_permanently_to_url=moved_permanently_to_url,
+        content_version=content_version,
+    )
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
+    content = "\n".join(lines) + "\n" if suppress_inline_headers else "\n".join(inline_headers + lines) + "\n"
+    response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    headers = {
+        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
+        "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
+        "Subscription-Userinfo": subscription_userinfo,
+        "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
+        "CDN-Cache-Control": "no-store, no-cache, max-age=0",
+        "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
+        "Surrogate-Control": "no-store",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "ETag": f'W/"{response_etag}"',
+        "Last-Modified": _http_date_from_datetime(last_modified_dt) or "",
+        "Vary": "*",
+        "X-Accel-Expires": "0",
+        "profile-update-interval": update_interval_hours,
+        "support-url": support_url,
+        "profile-web-page-url": profile_web_page_url,
+        "moved-permanently-to": moved_permanently_to_url or "",
+        "x-hiddify-source": "subscription",
+        "x-subscription-version": content_version,
+        "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
+    }
+    response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+    try:
+        response.set_cookie(
+            key="inet_sub_cid",
+            value=_subscription_cookie_value(request, token),
+            max_age=31536000,
+            httponly=False,
+            samesite="lax",
+            secure=_request_is_https(request),
+        )
+    except Exception:
+        pass
+    return response
 
 
-def update_payment(payment_id: str, **fields: Any) -> Dict[str, Any]:
-    if not fields:
-        raise ValueError("No fields to update")
-    updates = []
-    values = []
-    for key, value in fields.items():
-        updates.append(f"{key} = %s")
-        values.append(value)
-    if fields.get("status") == "paid":
-        updates.append("paid_at = COALESCE(paid_at, NOW())")
-    values.append(payment_id)
-    query = f"UPDATE payments SET {', '.join(updates)} WHERE id = %s RETURNING *"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, tuple(values))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Payment not found")
-        conn.commit()
-    return dict(row)
+@app.get("/sub/{token}")
+def public_subscription(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
+    del cid
+    return _subscription_response(request, token, head_only=False)
 
 
-def get_payment_for_user(payment_id: str, user_id: int) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT pay.*, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en,
-                       p.duration_days, p.device_limit
-                FROM payments pay
-                JOIN plans p ON p.id = pay.plan_id
-                WHERE pay.id = %s AND pay.user_id = %s
-                """,
-                (payment_id, user_id),
+@app.head("/sub/{token}")
+def public_subscription_head(request: Request, token: str, cid: Optional[str] = Query(default=None)) -> Response:
+    del cid
+    return _subscription_response(request, token, head_only=True)
+
+
+@app.get("/sub")
+def public_subscription_hint() -> Dict[str, Any]:
+    return {
+        "ok": True,
+        "message": "Use /sub/<personal_subscription_token>",
+    }
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon() -> Response:
+    return Response(status_code=204)
+
+
+@app.get("/open-app", response_class=HTMLResponse, name="open_app_bridge")
+def open_app_bridge(
+    request: Request,
+    code: Optional[str] = Query(default=None),
+    token: Optional[str] = Query(default=None),
+    lang: str = Query(default="ru"),
+    platform: Optional[str] = Query(default=None),
+) -> HTMLResponse:
+    norm_lang = "en" if lang == "en" else "ru"
+    detected_platform, _ = _detect_device_platform_and_name(request)
+    target_platform = _normalize_target_platform(platform or detected_platform)
+    client_mode = _client_mode_for_platform(target_platform)
+    client_name = _client_name_for_platform(target_platform)
+    resolved_token = _resolve_subscription_token(token=token, code=code)
+    active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
+    subscription_client_id = _subscription_cookie_value(request, active_token) if active_token else ""
+    subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
+    tracked_subscription_url = None
+    if subscription_url and subscription_client_id:
+        try:
+            parts = urlsplit(subscription_url)
+            query = dict(parse_qsl(parts.query, keep_blank_values=True))
+            query["client_id"] = subscription_client_id
+            if client_mode:
+                query["client"] = client_mode
+            tracked_subscription_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+        except Exception:
+            tracked_subscription_url = subscription_url
+    elif subscription_url:
+        tracked_subscription_url = subscription_url
+    native_url = _build_native_import_url(tracked_subscription_url, platform=target_platform) if tracked_subscription_url else ""
+    supports_native_launch = bool(native_url)
+    bot_url = _bot_public_url()
+    page_text = {
+        "ru": {
+            "title": f"Подключение через {client_name}",
+            "headline": f"Подключение через {client_name}",
+            "body_auto": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
+            "body_manual": f"Для {client_name} на этой платформе используйте ручной импорт: скопируйте персональную ссылку ниже и добавьте её в приложение как Subscription / URL. Токен уже зашит в ссылку.",
+            "invalid_link": "Ссылка недействительна или срок доступа истёк. Вернитесь в бота и купите подписку.",
+            "open_button": f"Открыть в {client_name}",
+            "copy_button": f"Скопировать ссылку для {client_name}",
+            "android_button": f"Скачать {_client_name_for_platform('android')} для Android",
+            "ios_button": f"Скачать {_client_name_for_platform('ios')} для iPhone / iPad",
+            "windows_button": "Скачать Happ для Windows",
+            "macos_button": "Скачать Happ для macOS",
+            "copy_label": "Персональная ссылка подписки",
+            "copy_done": "Ссылка подписки скопирована.",
+            "copy_failed": "Не удалось скопировать автоматически. Скопируйте ссылку ниже вручную.",
+            "bot_button": "Вернуться в бота",
+        },
+        "en": {
+            "title": f"Connect with {client_name}",
+            "headline": f"Connect with {client_name}",
+            "body_auto": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
+            "body_manual": f"On this platform, use manual import for {client_name}: copy the personal subscription link below and add it inside the app as Subscription / URL. The token is already embedded in the link.",
+            "invalid_link": "This link is invalid or access has expired. Return to the bot and buy a subscription.",
+            "open_button": f"Open in {client_name}",
+            "copy_button": f"Copy link for {client_name}",
+            "android_button": f"Download {_client_name_for_platform('android')} for Android",
+            "ios_button": f"Download {_client_name_for_platform('ios')} for iPhone / iPad",
+            "windows_button": "Download Happ for Windows",
+            "macos_button": "Download Happ for macOS",
+            "copy_label": "Personal subscription link",
+            "copy_done": "Subscription link copied.",
+            "copy_failed": "Could not copy automatically. Copy the link below manually.",
+            "bot_button": "Back to bot",
+        },
+    }[norm_lang]
+    display_subscription_url = tracked_subscription_url or subscription_url
+    copy_block = ""
+    if display_subscription_url:
+        copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(display_subscription_url)}</code></div>'
+    native_url_attr = html.escape(native_url or display_subscription_url or "", quote=True)
+    native_url_js = json.dumps(native_url)
+    subscription_url_js = json.dumps(display_subscription_url or "")
+    client_mode_js = json.dumps(client_mode)
+    supports_native_launch_js = json.dumps(supports_native_launch)
+    copy_done_js = json.dumps(page_text["copy_done"])
+    copy_failed_js = json.dumps(page_text["copy_failed"])
+    import_name_js = json.dumps(str(getattr(settings, "HIDDIFY_IMPORT_NAME", "") or f"{settings.APP_NAME} Subscription").strip())
+    android_intent_url = _build_android_intent_url(native_url)
+    android_intent_url_js = json.dumps(android_intent_url)
+    selected_android_url = _selected_platform_store_url("android")
+    selected_ios_url = _selected_platform_store_url("ios")
+    selected_windows_url = _selected_platform_store_url("windows")
+    selected_macos_url = _selected_platform_store_url("macos")
+    android_url = html.escape(selected_android_url, quote=True)
+    android_url_js = json.dumps(selected_android_url)
+    ios_url = html.escape(selected_ios_url, quote=True)
+    ios_url_js = json.dumps(selected_ios_url)
+    windows_url = html.escape(selected_windows_url, quote=True)
+    macos_url = html.escape(selected_macos_url, quote=True)
+    bot_url_attr = html.escape(bot_url, quote=True)
+    title = html.escape(page_text["title"])
+    headline = html.escape(page_text["headline"])
+    body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
+    body = html.escape(body_value)
+    open_button = html.escape(page_text["open_button"] if supports_native_launch else page_text["copy_button"])
+    android_button = html.escape(page_text["android_button"])
+    ios_button = html.escape(page_text["ios_button"])
+    windows_button = html.escape(page_text["windows_button"])
+    macos_button = html.escape(page_text["macos_button"])
+    bot_button = html.escape(page_text["bot_button"])
+    html_page = f"""<!doctype html>
+<html lang="{norm_lang}">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{title}</title>
+  <style>
+    :root {{ color-scheme: dark; }}
+    body {{ margin: 0; font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0b1220; color: #f3f4f6; }}
+    .wrap {{ max-width: 560px; margin: 0 auto; min-height: 100vh; display: flex; align-items: center; justify-content: center; padding: 24px; box-sizing: border-box; }}
+    .card {{ width: 100%; background: #111827; border: 1px solid #1f2937; border-radius: 24px; padding: 24px; box-sizing: border-box; box-shadow: 0 10px 30px rgba(0,0,0,.35); }}
+    h1 {{ margin: 0 0 12px; font-size: 28px; line-height: 1.2; }}
+    p {{ margin: 0 0 20px; color: #cbd5e1; font-size: 16px; line-height: 1.5; }}
+    .actions {{ display: grid; gap: 12px; }}
+    .btn {{ display: block; text-align: center; text-decoration: none; padding: 14px 16px; border-radius: 14px; font-weight: 700; }}
+    .btn-primary {{ background: #22c55e; color: #04130a; }}
+    .btn-secondary {{ background: #1f2937; color: #f3f4f6; }}
+    .code {{ margin: 0 0 20px; padding: 16px; border-radius: 16px; background: #0f172a; border: 1px solid #1e293b; }}
+    .label {{ font-size: 13px; color: #94a3b8; margin-bottom: 8px; }}
+    code {{ display: block; font-size: 15px; font-weight: 700; word-break: break-all; }}
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="card">
+      <h1>{headline}</h1>
+      <p>{body}</p>
+      {copy_block}
+      <div class="actions">
+        <a class="btn btn-primary" href="{native_url_attr}">{open_button}</a>
+        <a class="btn btn-secondary" href="{android_url}">{android_button}</a>
+        <a class="btn btn-secondary" href="{ios_url}">{ios_button}</a>
+        <a class="btn btn-secondary" href="{windows_url}">{windows_button}</a>
+        <a class="btn btn-secondary" href="{macos_url}">{macos_button}</a>
+        <a class="btn btn-secondary" href="{bot_url_attr}">{bot_button}</a>
+      </div>
+    </div>
+  </div>
+  <script>
+    (function () {{
+      const initialNativeUrl = {native_url_js};
+      const baseSubscriptionUrl = {subscription_url_js};
+      const clientMode = {client_mode_js};
+      const supportsNativeLaunch = {supports_native_launch_js};
+      const importName = {import_name_js};
+      const copyDoneText = {copy_done_js};
+      const copyFailedText = {copy_failed_js};
+      const androidStoreUrl = {android_url_js};
+      const iosStoreUrl = {ios_url_js};
+      const primaryButton = document.querySelector('.btn-primary');
+      const buttonDefaultText = primaryButton ? primaryButton.textContent : '';
+      const subscriptionCode = document.getElementById('subscription-link-value');
+      const userAgent = navigator.userAgent || '';
+      const isAndroid = /Android/i.test(userAgent);
+      const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
+      let hiddenAt = 0;
+
+      const markHidden = function () {{
+        hiddenAt = Date.now();
+      }};
+      document.addEventListener('visibilitychange', function () {{
+        if (document.visibilityState === 'hidden') {{
+          markHidden();
+        }}
+      }});
+      window.addEventListener('pagehide', markHidden);
+      window.addEventListener('blur', markHidden);
+
+      const getClientId = function () {{
+        const key = 'inet-subscription-client-id';
+        try {{
+          if (baseSubscriptionUrl) {{
+            const parsed = new URL(baseSubscriptionUrl);
+            const fromUrl = parsed.searchParams.get('client_id');
+            if (fromUrl) {{
+              try {{ window.localStorage.setItem(key, fromUrl); }} catch (storageError) {{}}
+              return fromUrl;
+            }}
+          }}
+        }} catch (error) {{}}
+        try {{
+          const cookieMatch = document.cookie.match(/(?:^|; )inet_sub_cid=([^;]+)/);
+          if (cookieMatch && cookieMatch[1]) {{
+            const fromCookie = decodeURIComponent(cookieMatch[1]);
+            if (fromCookie) {{
+              try {{ window.localStorage.setItem(key, fromCookie); }} catch (storageError) {{}}
+              return fromCookie;
+            }}
+          }}
+        }} catch (error) {{}}
+        try {{
+          let existing = window.localStorage.getItem(key);
+          if (existing) return existing;
+          const generated = 'cid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
+          window.localStorage.setItem(key, generated);
+          return generated;
+        }} catch (error) {{
+          return 'cid-' + Date.now().toString(36);
+        }}
+      }};
+
+      const buildTrackedSubscriptionUrl = function () {{
+        if (!baseSubscriptionUrl) return '';
+        try {{
+          const url = new URL(baseSubscriptionUrl);
+          url.searchParams.set('client_id', getClientId());
+          return url.toString();
+        }} catch (error) {{
+          return baseSubscriptionUrl;
+        }}
+      }};
+
+      const buildNativeUrl = function () {{
+        const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
+        if (!trackedSubscriptionUrl) return initialNativeUrl || '';
+        if (clientMode === 'happ') {{
+          return '';
+        }}
+        if (clientMode === 'v2raytun') {{
+          return 'v2raytun://import/' + encodeURIComponent(trackedSubscriptionUrl);
+        }}
+        return 'hiddify://import/' + encodeURIComponent(trackedSubscriptionUrl) + '#' + encodeURIComponent(importName || 'Subscription');
+      }};
+
+      const currentNativeUrl = function () {{
+        return buildNativeUrl() || initialNativeUrl || '';
+      }};
+
+      const currentAndroidIntentUrl = function () {{
+        const nativeUrl = currentNativeUrl();
+        if (!nativeUrl || !isAndroid) return '';
+        const packageId = {json.dumps(_detect_android_app_package(platform=target_platform))};
+        if (!packageId) return '';
+        try {{
+          const parsed = new URL(nativeUrl);
+          const path = (parsed.host ? '//' + parsed.host : '') + (parsed.pathname || '');
+          const query = parsed.search || '';
+          const hash = parsed.hash || '';
+          return 'intent:' + path + query + hash + '#Intent;scheme=' + parsed.protocol.replace(':', '') + ';package=' + packageId + ';end';
+        }} catch (error) {{
+          return '';
+        }}
+      }};
+
+      const launchByAnchor = function (url) {{
+        if (!url) return;
+        const link = document.createElement('a');
+        link.href = url;
+        link.style.display = 'none';
+        document.body.appendChild(link);
+        link.click();
+        window.setTimeout(function () {{
+          link.remove();
+        }}, 250);
+      }};
+
+      const copySubscriptionLink = async function () {{
+        const trackedSubscriptionUrl = buildTrackedSubscriptionUrl();
+        if (!trackedSubscriptionUrl) return false;
+        try {{
+          if (navigator.clipboard && navigator.clipboard.writeText) {{
+            await navigator.clipboard.writeText(trackedSubscriptionUrl);
+          }} else {{
+            const temp = document.createElement('textarea');
+            temp.value = trackedSubscriptionUrl;
+            temp.setAttribute('readonly', 'readonly');
+            temp.style.position = 'fixed';
+            temp.style.opacity = '0';
+            document.body.appendChild(temp);
+            temp.focus();
+            temp.select();
+            document.execCommand('copy');
+            temp.remove();
+          }}
+          if (primaryButton) primaryButton.textContent = copyDoneText;
+          window.setTimeout(function () {{
+            if (primaryButton) primaryButton.textContent = buttonDefaultText;
+          }}, 1600);
+          return true;
+        }} catch (error) {{
+          if (primaryButton) primaryButton.textContent = copyFailedText;
+          window.setTimeout(function () {{
+            if (primaryButton) primaryButton.textContent = buttonDefaultText;
+          }}, 1800);
+          return false;
+        }}
+      }};
+
+      const openStoreIfNeeded = function () {{
+        if (Date.now() - hiddenAt < 1200) {{
+          return;
+        }}
+        const storeUrl = isAndroid ? androidStoreUrl : (isIOS ? iosStoreUrl : '');
+        if (storeUrl) {{
+          window.location.href = storeUrl;
+        }}
+      }};
+
+      const tryOpen = function () {{
+        if (!supportsNativeLaunch) {{
+          copySubscriptionLink();
+          return;
+        }}
+        const nativeUrl = currentNativeUrl();
+        if (!nativeUrl) return;
+        if (primaryButton) {{
+          primaryButton.href = nativeUrl;
+        }}
+        const androidIntentUrl = currentAndroidIntentUrl();
+        if (isAndroid && androidIntentUrl) {{
+          launchByAnchor(androidIntentUrl);
+          window.setTimeout(function () {{
+            if (Date.now() - hiddenAt < 1200) {{
+              return;
+            }}
+            launchByAnchor(nativeUrl);
+          }}, 250);
+          window.setTimeout(openStoreIfNeeded, 1800);
+          return;
+        }}
+
+        launchByAnchor(nativeUrl);
+        window.setTimeout(function () {{
+          if (Date.now() - hiddenAt < 1200) {{
+            return;
+          }}
+          window.location.href = nativeUrl;
+        }}, 180);
+        window.setTimeout(openStoreIfNeeded, 1800);
+      }};
+
+      if (subscriptionCode) {{
+        subscriptionCode.textContent = buildTrackedSubscriptionUrl() || subscriptionCode.textContent || '';
+      }}
+      if (primaryButton) {{
+        primaryButton.href = currentNativeUrl() || '#';
+      }}
+      if (supportsNativeLaunch) {{
+        window.setTimeout(tryOpen, 80);
+      }}
+      primaryButton?.addEventListener('click', function (event) {{
+        event.preventDefault();
+        tryOpen();
+      }});
+    }})();
+  </script>
+</body>
+</html>"""
+    response = HTMLResponse(content=html_page)
+    response.headers["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response.headers["Pragma"] = "no-cache"
+    response.headers["Expires"] = "0"
+    if active_token and subscription_client_id:
+        try:
+            response.set_cookie(
+                key="inet_sub_cid",
+                value=subscription_client_id,
+                max_age=31536000,
+                httponly=False,
+                samesite="lax",
+                secure=_request_is_https(request),
             )
-            row = cur.fetchone()
-            return dict(row) if row else None
+        except Exception:
+            pass
+    return response
 
 
-def get_payment_by_internal_or_external(payment_ref: str) -> Optional[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM payments WHERE id = %s OR external_payment_id = %s LIMIT 1",
-                (payment_ref, payment_ref),
-            )
-            row = cur.fetchone()
-            return dict(row) if row else None
+@app.get("/robots.txt", include_in_schema=False)
+def robots_txt() -> Response:
+    response = Response(content="User-agent: *\nAllow: /\n", media_type="text/plain")
+    response.headers["Cache-Control"] = "public, max-age=3600"
+    return response
+
+@app.get("/health")
+def health() -> Dict[str, Any]:
+    locations = _public_locations_health_snapshot()
+    return {
+        "ok": bool(locations.get("healthy")),
+        "service": settings.APP_NAME,
+        "locations": locations,
+        "ru_lte_refresh": dict(_ru_lte_refresh_state),
+        "black_refresh": dict(_black_refresh_state),
+        "locations_cache_ttl_sec": int(_LOCATIONS_CACHE_TTL_SEC),
+    }
 
 
-def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
-    payment = get_payment_by_internal_or_external(payment_id)
-    if not payment:
-        raise ValueError("Payment not found")
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM plans WHERE id = %s", (payment["plan_id"],))
-            plan = cur.fetchone()
-            cur.execute("SELECT * FROM users WHERE id = %s", (payment["user_id"],))
-            user = cur.fetchone()
-            if not plan or not user:
-                raise ValueError("Plan or user not found")
-            if user["status"] == "blocked":
-                raise PermissionError("Blocked user cannot be activated")
-            if payment["status"] != "paid":
-                cur.execute(
-                    "UPDATE payments SET status = 'paid', paid_at = COALESCE(paid_at, NOW()) WHERE id = %s RETURNING *",
-                    (payment["id"],),
-                )
-                payment = dict(cur.fetchone())
-            cur.execute(
-                "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1",
-                (payment["user_id"],),
-            )
-            latest = cur.fetchone()
-            start_at = now_utc()
-            if latest and latest["expires_at"] and latest["expires_at"] > start_at:
-                start_at = latest["expires_at"]
-            expires_at = start_at + timedelta(days=int(plan["duration_days"]))
-            cur.execute(
-                """
-                INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status)
-                VALUES (%s, %s, %s, %s, 'active')
-                RETURNING *
-                """,
-                (payment["user_id"], plan["id"], start_at, expires_at),
-            )
-            subscription = cur.fetchone()
-        conn.commit()
-    refresh_subscription_statuses(payment["user_id"])
-    user_info = _normalize_user(user) or {}
-    subscription_token = ensure_user_subscription_token(payment["user_id"])
-    enqueue_notification(
-        user_id=payment["user_id"],
-        event_type="payment_paid",
-        unique_key=f"payment_paid:{payment['id']}",
-        payload={
-            "payment_id": payment["id"],
-            "plan_code": plan["code"],
-            "plan_name_ru": plan["name_ru"],
-            "plan_name_en": plan["name_en"],
-            "duration_days": int(plan["duration_days"]),
-            "device_limit": _resolve_effective_device_limit(plan["device_limit"], user_info.get("device_limit_override")),
-            "expires_at": subscription["expires_at"].isoformat(),
-            "subscription_token": subscription_token,
+@app.post("/auth/telegram")
+def auth_telegram(payload: TelegramAuthIn) -> Dict[str, Any]:
+    existing = get_user_by_telegram_id(payload.telegram_id)
+    user = upsert_telegram_user(payload.model_dump())
+    return _issue_auth_payload(user, is_new=existing is None)
+
+
+@app.post("/auth/code/issue")
+def auth_code_issue(request: Request, payload: IssueCodeIn, _: bool = Depends(require_code_issuer)) -> Dict[str, Any]:
+    existing = get_user_by_telegram_id(payload.telegram_id)
+    user = upsert_telegram_user(payload.model_dump())
+    refresh_subscription_statuses(int(user["id"]))
+    fresh_user = get_user_by_id(int(user["id"])) or user
+    issued = issue_auth_code(
+        int(fresh_user["id"]),
+        ttl_minutes=settings.AUTH_CODE_TTL_MINUTES,
+        meta={
+            "telegram_id": payload.telegram_id,
+            "language": payload.language,
         },
     )
-    return payment
-
-
-def list_admin_users(search: str = "", status_filter: str = "all") -> Dict[str, Any]:
-    refresh_subscription_statuses()
-    clauses = []
-    values: List[Any] = []
-    if search:
-        clauses.append("(CAST(u.telegram_id AS TEXT) ILIKE %s OR COALESCE(u.username, '') ILIKE %s)")
-        values.extend([f"%{search}%", f"%{search}%"])
-    if status_filter == "blocked":
-        clauses.append("u.status = 'blocked'")
-    elif status_filter == "active":
-        clauses.append("u.status = 'active' AND EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active')")
-    elif status_filter == "expired":
-        clauses.append("u.status <> 'blocked' AND NOT EXISTS (SELECT 1 FROM subscriptions s WHERE s.user_id = u.id AND s.status = 'active')")
-    where_sql = f"WHERE {' AND '.join(clauses)}" if clauses else ""
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                SELECT
-                    u.id AS user_id,
-                    u.telegram_id,
-                    u.username,
-                    u.first_name,
-                    u.last_name,
-                    u.language,
-                    u.status,
-                    u.device_limit_override,
-                    s.id AS subscription_id,
-                    s.expires_at,
-                    p.code AS plan_code,
-                    p.name_ru AS plan_name_ru,
-                    p.name_en AS plan_name_en,
-                    p.device_limit,
-                    COALESCE((SELECT COUNT(*) FROM devices d WHERE d.user_id = u.id AND d.is_active = TRUE), 0) AS devices_used
-                FROM users u
-                LEFT JOIN LATERAL (
-                    SELECT * FROM subscriptions s1
-                    WHERE s1.user_id = u.id
-                    ORDER BY s1.expires_at DESC
-                    LIMIT 1
-                ) s ON TRUE
-                LEFT JOIN plans p ON p.id = s.plan_id
-                {where_sql}
-                ORDER BY u.created_at DESC
-                """,
-                tuple(values),
-            )
-            items = []
-            for row in cur.fetchall():
-                item = dict(row)
-                item["device_limit_override"] = _normalize_device_limit_override(item.get("device_limit_override"))
-                item["device_limit"] = _resolve_effective_device_limit(item.get("device_limit"), item.get("device_limit_override"))
-                items.append(item)
-            cur.execute("SELECT COUNT(*) AS total FROM users")
-            total = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(*) AS total FROM users WHERE status = 'blocked'")
-            blocked = cur.fetchone()["total"]
-            cur.execute("SELECT COUNT(DISTINCT user_id) AS total FROM subscriptions WHERE status = 'active'")
-            active = cur.fetchone()["total"]
-    summary = {
-        "total_users": total,
-        "blocked_users": blocked,
-        "active_subscriptions": active,
-        "expired_or_no_subscription": max(total - blocked - active, 0),
-    }
-    return {"items": items, "summary": summary}
-
-
-def admin_create_or_update_user(payload: Dict[str, Any], admin_name: str) -> Dict[str, Any]:
-    plan = get_plan_by_code(payload["plan_code"])
-    if not plan:
-        raise ValueError("Plan not found")
-    user = upsert_telegram_user(payload)
-    if "device_limit_override" in payload:
-        user = set_user_device_limit_override_by_telegram(int(user["telegram_id"]), payload.get("device_limit_override"), admin_name)["user"]
-    refresh_subscription_statuses(user["id"])
-    expires_at = payload.get("expires_at")
-    if expires_at:
-        if isinstance(expires_at, str):
-            expires_dt = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
-        else:
-            expires_dt = expires_at
-        starts_at = now_utc()
-        if expires_dt <= starts_at:
-            starts_at = expires_dt - timedelta(days=int(plan["duration_days"]))
-    else:
-        starts_at = now_utc()
-        expires_dt = starts_at + timedelta(days=int(plan["duration_days"]))
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT * FROM subscriptions WHERE user_id = %s AND status = 'active' ORDER BY expires_at DESC, id DESC LIMIT 1",
-                (user["id"],),
-            )
-            current = cur.fetchone()
-            if not current:
-                cur.execute(
-                    "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC, id DESC LIMIT 1",
-                    (user["id"],),
-                )
-                current = cur.fetchone()
-            if current:
-                cur.execute(
-                    """
-                    UPDATE subscriptions
-                    SET plan_id = %s, starts_at = %s, expires_at = %s, updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (plan["id"], starts_at, expires_dt, current["id"]),
-                )
-                note = f"Manual access updated for plan {plan['code']}"
-            else:
-                cur.execute(
-                    "INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status) VALUES (%s, %s, %s, %s, 'active')",
-                    (user["id"], plan["id"], starts_at, expires_dt),
-                )
-                note = f"Manual access issued for plan {plan['code']}"
-            cur.execute(
-                "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
-                (user["id"], admin_name, note),
-            )
-        conn.commit()
-    refresh_subscription_statuses(user["id"])
-    return get_user_snapshot_by_telegram(int(user["telegram_id"]))
-
-
-def get_user_snapshot_by_telegram(telegram_id: int) -> Dict[str, Any]:
-    user = get_user_by_telegram_id(telegram_id)
-    if not user:
-        raise ValueError("User not found")
-    view = get_user_subscription_view(user["id"])
-    return {
-        "user": user,
-        "subscription": view["subscription"],
-        "devices": view["devices"],
-        "devices_used": view["devices_used"],
-        "device_limit": view["device_limit"],
-        "device_limit_override": view.get("device_limit_override"),
-    }
-
-
-def extend_user_subscription_by_telegram(telegram_id: int, days_added: int, reason: str, admin_name: str) -> Dict[str, Any]:
-    user = get_user_by_telegram_id(telegram_id)
-    if not user:
-        raise ValueError("User not found")
-    if days_added <= 0:
-        raise ValueError("days_added must be positive")
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1", (user["id"],))
-            sub = cur.fetchone()
-            if not sub:
-                plan = next((item for item in get_all_plans() if bool(item.get("is_active", True))), None) or get_all_plans()[0]
-                starts_at = now_utc()
-                expires_at = starts_at + timedelta(days=days_added)
-                cur.execute(
-                    "INSERT INTO subscriptions (user_id, plan_id, starts_at, expires_at, status) VALUES (%s, %s, %s, %s, 'active')",
-                    (user["id"], plan["id"], starts_at, expires_at),
-                )
-            else:
-                base = sub["expires_at"] if sub["expires_at"] > now_utc() else now_utc()
-                new_expiry = base + timedelta(days=days_added)
-                cur.execute(
-                    "UPDATE subscriptions SET expires_at = %s, status = 'active', updated_at = NOW() WHERE id = %s",
-                    (new_expiry, sub["id"]),
-                )
-            cur.execute(
-                "INSERT INTO manual_extensions (user_id, days_added, reason, admin_name) VALUES (%s, %s, %s, %s)",
-                (user["id"], days_added, reason, admin_name),
-            )
-        conn.commit()
-    refresh_subscription_statuses(user["id"])
-    return get_user_snapshot_by_telegram(telegram_id)
-
-
-def set_user_device_limit_override_by_telegram(telegram_id: int, device_limit_override: Optional[int], admin_name: str) -> Dict[str, Any]:
-    user = get_user_by_telegram_id(telegram_id)
-    if not user:
-        raise ValueError("User not found")
-    normalized_override = _normalize_device_limit_override(device_limit_override)
-    note = (
-        f"Device limit override set to {normalized_override}"
-        if normalized_override is not None
-        else "Device limit override cleared (plan default)"
+    code = str(issued["code"])
+    deep_link = _build_open_app_bridge_url(
+        request,
+        code=code,
+        lang=fresh_user.get("language") or payload.language or "ru",
     )
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "UPDATE users SET device_limit_override = %s, updated_at = NOW() WHERE telegram_id = %s RETURNING *",
-                (normalized_override, telegram_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("User not found")
-            cur.execute(
-                "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
-                (row["id"], admin_name, note),
-            )
-        conn.commit()
-    return get_user_snapshot_by_telegram(telegram_id)
+    return {
+        "ok": True,
+        "code": code,
+        "deep_link": deep_link,
+        "expires_at": issued["expires_at"].isoformat(),
+        "user": fresh_user,
+        "is_new": existing is None,
+    }
 
 
-def reset_user_devices_by_telegram(telegram_id: int, admin_name: str) -> Dict[str, Any]:
-    user = get_user_by_telegram_id(telegram_id)
+@app.post("/auth/code")
+def auth_code(payload: CodeAuthIn) -> Dict[str, Any]:
+    normalized_code = (payload.code or "").strip()
+    if settings.AUTH_ALLOW_DEV_CODE and normalized_code == settings.AUTH_DEV_LOGIN_CODE:
+        user_payload = _fallback_code_user_payload(payload)
+        existing = get_user_by_telegram_id(int(user_payload["telegram_id"]))
+        user = upsert_telegram_user(user_payload)
+        return _issue_auth_payload(user, is_new=existing is None)
+
+    user = consume_auth_code(normalized_code)
     if not user:
-        raise ValueError("User not found")
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE", (user["id"],))
-            devices = [dict(row) for row in cur.fetchall()]
-            cur.execute("DELETE FROM devices WHERE user_id = %s", (user["id"],))
-            cur.execute(
-                "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
-                (user["id"], admin_name, "Devices reset from admin panel"),
-            )
-        conn.commit()
-    if devices:
-        enqueue_notification(
-            user_id=user["id"],
-            event_type="device_removed",
-            unique_key=f"device_reset:{user['id']}:{int(now_utc().timestamp())}",
-            payload={"count": len(devices), "device_name": "all", "platform": "all"},
-        )
-    return get_user_snapshot_by_telegram(telegram_id)
+        raise HTTPException(status_code=401, detail="Invalid or expired code")
+
+    requested_language = "en" if payload.language == "en" else "ru"
+    if user.get("language") != requested_language:
+        user = set_user_language(int(user["id"]), requested_language)
+    return _issue_auth_payload(user, is_new=False)
 
 
-def list_payments(status_filter: str = "all") -> List[Dict[str, Any]]:
-    query = """
-        SELECT pay.*, u.telegram_id, u.username, p.code AS plan_code, p.name_ru AS plan_name_ru, p.name_en AS plan_name_en
-        FROM payments pay
-        JOIN users u ON u.id = pay.user_id
-        JOIN plans p ON p.id = pay.plan_id
-    """
-    values: Tuple[Any, ...] = tuple()
-    if status_filter != "all":
-        query += " WHERE pay.status = %s"
-        values = (status_filter,)
-    query += " ORDER BY pay.created_at DESC"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query, values)
-            return [dict(row) for row in cur.fetchall()]
+@app.post("/auth/refresh")
+def auth_refresh(
+    payload: RefreshIn,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
+) -> Dict[str, Any]:
+    raw_token = (payload.refresh_token or "").strip()
+    if not raw_token and credentials and credentials.credentials:
+        raw_token = credentials.credentials
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Missing refresh token")
+    decoded = _decode_token(raw_token, expected_type="refresh")
+    user_id = int(decoded["sub"])
+    user = get_user_by_id(user_id)
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+    return _issue_auth_payload(user, is_new=False)
 
 
-def export_payments_csv(status_filter: str = "all") -> str:
-    rows = list_payments(status_filter)
-    output = io.StringIO()
-    writer = csv.writer(output)
-    writer.writerow(["payment_id", "telegram_id", "username", "plan_code", "amount", "currency", "status", "external_payment_id", "created_at", "paid_at"])
-    for row in rows:
-        writer.writerow([
-            row.get("id"),
-            row.get("telegram_id"),
-            row.get("username"),
-            row.get("plan_code"),
-            row.get("amount"),
-            row.get("currency"),
-            row.get("status"),
-            row.get("external_payment_id"),
-            row.get("created_at"),
-            row.get("paid_at"),
-        ])
-    return output.getvalue()
+@app.get("/auth/me")
+def auth_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    view = get_user_subscription_view(user["id"])
+    return {"ok": True, "user": user, **view, "language": user.get("language") or "ru"}
 
 
-def issue_auth_code(user_id: int, ttl_minutes: Optional[int] = None, meta: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
-    ttl = max(1, int(ttl_minutes or settings.AUTH_CODE_TTL_MINUTES or 5))
-    code = secrets.token_urlsafe(18)
-    expires_at = now_utc() + timedelta(minutes=ttl)
-    payload = meta or {}
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE auth_codes
-                SET used_at = NOW()
-                WHERE user_id = %s AND used_at IS NULL
-                """,
-                (user_id,),
-            )
-            cur.execute(
-                """
-                INSERT INTO auth_codes (code, user_id, expires_at, meta)
-                VALUES (%s, %s, %s, %s)
-                RETURNING *
-                """,
-                (code, user_id, expires_at, Jsonb(payload)),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return dict(row)
+@app.post("/auth/logout")
+def auth_logout(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    return {"ok": True, "logged_out": True, "user_id": user["id"]}
 
 
-def consume_auth_code(code: str) -> Optional[Dict[str, Any]]:
-    normalized = (code or "").strip()
-    if not normalized:
-        return None
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT *
-                FROM auth_codes
-                WHERE code = %s
-                FOR UPDATE
-                """,
-                (normalized,),
-            )
-            row = cur.fetchone()
-            if not row:
-                conn.rollback()
-                return None
-            if row.get("used_at") is not None or row.get("expires_at") <= now_utc():
-                conn.rollback()
-                return None
-            cur.execute(
-                "UPDATE auth_codes SET used_at = NOW() WHERE code = %s",
-                (normalized,),
-            )
-            cur.execute(
-                "SELECT * FROM users WHERE id = %s",
-                (row["user_id"],),
-            )
-            user = cur.fetchone()
-        conn.commit()
-    return _normalize_user(user)
+@app.patch("/users/me/language")
+def patch_language(payload: LanguageIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    updated = set_user_language(user["id"], payload.language)
+    return {"ok": True, "user": updated}
 
 
-def settings_snapshot() -> Dict[str, Any]:
-    plans = _current_runtime_plan_payloads()
-    urls = _client_store_urls()
-    client_mode = _normalize_client_mode(getattr(settings, "VPN_CLIENT_MODE", "hiddify"))
+@app.get("/app/config")
+def app_config() -> Dict[str, Any]:
     return {
         "app_name": settings.APP_NAME,
-        "client_mode": client_mode,
-        "client_name": _active_client_name(client_mode),
-        "mobile_client_mode": client_mode,
-        "mobile_client_name": _active_client_name(client_mode),
-        "desktop_client_mode": "happ",
-        "desktop_client_name": _desktop_client_name(),
-        "app_env": settings.APP_ENV,
-        "languages": settings.APP_LANGS,
-        "device_limit": settings.VPN_DEFAULT_DEVICE_LIMIT,
-        "max_devices_per_account": settings.VPN_MAX_DEVICES_PER_ACCOUNT,
+        "support_url": settings.SUPPORT_TELEGRAM_URL,
+        "bot_url": _bot_public_url(),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
-        "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
         "payments_enabled": settings.PAYMENTS_ENABLED,
-        "payments_provider": settings.PAYMENTS_PROVIDER,
-        "support_telegram_url": settings.SUPPORT_TELEGRAM_URL,
-        "support_faq_ru": settings.SUPPORT_FAQ_RU,
-        "support_faq_en": settings.SUPPORT_FAQ_EN,
-        "bot_name": settings.BOT_NAME,
-        "bot_username": settings.BOT_USERNAME,
-        "open_app_url": settings.OPEN_APP_URL,
-        "android_app_url": urls["android_app_url"],
-        "ios_app_url": urls["ios_app_url"],
-        "windows_app_url": urls["windows_app_url"],
-        "macos_app_url": urls["macos_app_url"],
-        "android_app_package": urls["android_app_package"],
-        "settings_editable": True,
-        "locations_catalog_source": "env_override" if settings.DEFAULT_LOCATIONS_ENV_OVERRIDE_ENABLED else "builtin_mvp",
-        "plans": plans,
+        "client_mode": _selected_client_mode(),
+        "client_name": _selected_client_name(),
+        "mobile_client_mode": _selected_client_mode(),
+        "mobile_client_name": _selected_client_name(),
+        "desktop_client_mode": "happ",
+        "desktop_client_name": "Happ",
+        "android_app_url": _selected_platform_store_url("android"),
+        "ios_app_url": _selected_platform_store_url("ios"),
+        "windows_app_url": _selected_platform_store_url("windows"),
+        "macos_app_url": _selected_platform_store_url("macos"),
+        "device_limit_default": settings.VPN_DEFAULT_DEVICE_LIMIT,
+        "feature_flags": {
+            "auth_refresh": True,
+            "auth_logout": True,
+            "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
+            "payments_enabled": settings.PAYMENTS_ENABLED,
+            "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
+            "settings_editable": True,
+        },
     }
 
 
-def enqueue_notification(user_id: int, event_type: str, unique_key: str, payload: Dict[str, Any]) -> bool:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bot_notifications (unique_key, user_id, event_type, payload)
-                VALUES (%s, %s, %s, %s)
-                ON CONFLICT (unique_key) DO NOTHING
-                RETURNING id
-                """,
-                (unique_key, user_id, event_type, Jsonb(payload or {})),
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return bool(row)
+@app.get("/plans")
+def plans() -> Dict[str, Any]:
+    sync_plans_from_env()
+    return {"ok": True, "items": get_active_plans()}
 
 
-def purge_stale_subscription_notifications() -> None:
-    warning_hours = max(1, int(getattr(settings, "SUBSCRIPTION_WARNING_HOURS", 12) or 12))
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                f"""
-                DELETE FROM bot_notifications n
-                WHERE n.sent_at IS NULL
-                  AND n.event_type = 'subscription_expiring'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM (
-                          SELECT DISTINCT ON (s.user_id) s.id, s.user_id, s.expires_at
-                          FROM subscriptions s
-                          WHERE s.status = 'active' AND s.expires_at > NOW()
-                          ORDER BY s.user_id, s.expires_at DESC, s.id DESC
-                      ) latest
-                      WHERE latest.user_id = n.user_id
-                        AND latest.expires_at <= NOW() + INTERVAL '1 day'
-                        AND latest.id = CASE
-                            WHEN COALESCE(n.payload->>'subscription_id', '') ~ '^[0-9]+$'
-                                THEN (n.payload->>'subscription_id')::BIGINT
-                            ELSE NULL
-                        END
-                  )
-                """
-            )
-            cur.execute(
-                f"""
-                DELETE FROM bot_notifications n
-                WHERE n.sent_at IS NULL
-                  AND n.event_type = 'subscription_expiring_12h'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM (
-                          SELECT DISTINCT ON (s.user_id) s.id, s.user_id, s.expires_at
-                          FROM subscriptions s
-                          WHERE s.status = 'active' AND s.expires_at > NOW()
-                          ORDER BY s.user_id, s.expires_at DESC, s.id DESC
-                      ) latest
-                      WHERE latest.user_id = n.user_id
-                        AND latest.expires_at <= NOW() + INTERVAL '{warning_hours} hour'
-                        AND latest.id = CASE
-                            WHEN COALESCE(n.payload->>'subscription_id', '') ~ '^[0-9]+$'
-                                THEN (n.payload->>'subscription_id')::BIGINT
-                            ELSE NULL
-                        END
-                  )
-                """
-            )
-            cur.execute(
-                """
-                DELETE FROM bot_notifications n
-                WHERE n.sent_at IS NULL
-                  AND n.event_type = 'subscription_expired'
-                  AND EXISTS (
-                      SELECT 1
-                      FROM subscriptions s
-                      WHERE s.user_id = n.user_id
-                        AND s.status = 'active'
-                  )
-                """
-            )
-        conn.commit()
+@app.get("/subscriptions/me")
+def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+        view = _get_user_subscription_view_with_conn(conn, user["id"])
+    if view.get("is_active") and view.get("subscription"):
+        subscription_token = view.get("subscription_token") or ensure_user_subscription_token(int(user["id"]))
+        subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, subscription_token)
+    else:
+        subscription_token = None
+        subscription_url = None
+    return {"ok": True, **view, "subscription_token": subscription_token, "subscription_url": subscription_url}
+
+
+@app.get("/devices")
+def devices(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+        view = _get_user_subscription_view_with_conn(conn, user["id"])
+    return {"ok": True, "items": view["devices"], "devices_used": view["devices_used"], "device_limit": view["device_limit"]}
+
+
+@app.post("/devices/register")
+def devices_register(payload: DeviceRegisterIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    try:
+        item = register_device(user["id"], payload.platform, payload.device_name, payload.device_fingerprint)
+        return {"ok": True, "device": item}
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/devices/{device_id}")
+def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    item = delete_device(user["id"], device_id)
+    if not item:
+        raise HTTPException(status_code=404, detail="Device not found")
+    return {"ok": True, "device": item}
+
+
+@app.get("/config/version")
+def config_version() -> JSONResponse:
+    payload = _config_version_payload()
+    version = str(payload.get("version") or "")
+    return JSONResponse(content=payload, headers=_json_no_cache_headers(etag_seed=version))
+
+
+@app.get("/sync")
+def sync_state(user: Dict[str, Any] = Depends(get_current_user)) -> JSONResponse:
+    items = _cached_locations_payload()
+    payload = {
+        **_config_version_payload(),
+        "user_id": int(user["id"]),
+        "items": items,
+    }
+    version = str(payload.get("version") or "")
+    return JSONResponse(content=payload, headers=_json_no_cache_headers(etag_seed=version))
+
+
+@app.get("/locations")
+def locations() -> JSONResponse:
+    items = _cached_locations_payload()
+    seed = json.dumps(items, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return JSONResponse(content={"ok": True, "items": items}, headers=_json_no_cache_headers(etag_seed=seed))
+
+
+@app.get("/locations/status")
+def locations_status() -> JSONResponse:
+    items = [{"code": row["code"], "status": row["status"], "is_active": row["is_active"]} for row in _cached_locations_payload()]
+    seed = json.dumps(items, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    return JSONResponse(content={"ok": True, "items": items}, headers=_json_no_cache_headers(etag_seed=seed))
+
+
+@app.get("/vpn/config/{location_code}")
+def vpn_config(location_code: str, user: Dict[str, Any] = Depends(get_current_user)) -> JSONResponse:
+    try:
+        config = get_vpn_config_for_user(user["id"], location_code)
+        seed = json.dumps(config, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+        return JSONResponse(content={"ok": True, "config": config}, headers=_json_no_cache_headers(etag_seed=seed))
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/support/faq")
+def support_faq(lang: str = Query(default="ru")) -> Dict[str, Any]:
+    norm = "en" if lang == "en" else "ru"
+    return {
+        "ok": True,
+        "lang": norm,
+        "support_url": settings.SUPPORT_TELEGRAM_URL,
+        "faq": settings.SUPPORT_FAQ_EN if norm == "en" else settings.SUPPORT_FAQ_RU,
+    }
 
 
 
-def enqueue_subscription_notifications() -> None:
-    refresh_subscription_statuses()
-    purge_stale_subscription_notifications()
-    warning_hours = max(1, int(getattr(settings, "SUBSCRIPTION_WARNING_HOURS", 12) or 12))
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT latest.id, latest.user_id, latest.expires_at, latest.plan_code, latest.name_ru, latest.name_en, latest.duration_days, latest.device_limit
-                FROM (
-                    SELECT DISTINCT ON (s.user_id)
-                        s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
-                    FROM subscriptions s
-                    JOIN plans p ON p.id = s.plan_id
-                    WHERE s.status = 'active' AND s.expires_at > NOW()
-                    ORDER BY s.user_id, s.expires_at DESC, s.id DESC
-                ) latest
-                WHERE latest.expires_at <= NOW() + INTERVAL '1 day'
-                """
+def _create_yookassa_payment(local_payment_id: str, amount_rub: float, description: str) -> Dict[str, Any]:
+    response = requests.post(
+        "https://api.yookassa.ru/v3/payments",
+        headers={"Idempotence-Key": str(uuid4())},
+        auth=(settings.YOOKASSA_SHOP_ID, settings.YOOKASSA_SECRET_KEY),
+        json={
+            "amount": {"value": f"{float(amount_rub):.2f}", "currency": "RUB"},
+            "capture": True,
+            "confirmation": {"type": "redirect", "return_url": settings.YOOKASSA_RETURN_URL},
+            "description": description,
+            "metadata": {"local_payment_id": local_payment_id, "app_name": settings.APP_NAME},
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+    return response.json()
+
+
+@app.post("/payments/create")
+def payments_create(payload: PaymentCreateIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    if settings.VPN_MAINTENANCE_MODE:
+        raise HTTPException(status_code=503, detail="Maintenance mode is enabled")
+    if user["status"] == "blocked":
+        raise HTTPException(status_code=403, detail="Blocked user cannot create payment")
+    plan = get_plan_by_code(payload.plan_code)
+    if not plan or not plan["is_active"]:
+        raise HTTPException(status_code=404, detail="Plan not found or inactive")
+    payment = create_payment_record(
+        user_id=user["id"],
+        plan_id=plan["id"],
+        provider=settings.PAYMENTS_PROVIDER,
+        method=payload.method,
+        amount=float(plan["price_rub"]),
+        currency="RUB",
+        status="disabled" if not settings.PAYMENTS_ENABLED else "created",
+    )
+    if not settings.PAYMENTS_ENABLED:
+        return {
+            "ok": True,
+            "payments_enabled": False,
+            "message": "Payment module is ready, but PAYMENTS_ENABLED=false now.",
+            "payment": payment,
+            "plan": plan,
+        }
+    if settings.PAYMENTS_PROVIDER == "yookassa":
+        if not settings.YOOKASSA_SHOP_ID or not settings.YOOKASSA_SECRET_KEY:
+            raise HTTPException(status_code=500, detail="YooKassa credentials are missing")
+        try:
+            remote = _create_yookassa_payment(payment["id"], float(plan["price_rub"]), f"{settings.APP_NAME} {plan['name_ru']}")
+            payment = update_payment(
+                payment["id"],
+                external_payment_id=remote.get("id"),
+                checkout_url=((remote.get("confirmation") or {}).get("confirmation_url")),
+                status=remote.get("status", "pending"),
             )
-            expiring = [dict(row) for row in cur.fetchall()]
-            cur.execute(
-                f"""
-                SELECT latest.id, latest.user_id, latest.expires_at, latest.plan_code, latest.name_ru, latest.name_en, latest.duration_days, latest.device_limit
-                FROM (
-                    SELECT DISTINCT ON (s.user_id)
-                        s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
-                    FROM subscriptions s
-                    JOIN plans p ON p.id = s.plan_id
-                    WHERE s.status = 'active' AND s.expires_at > NOW()
-                    ORDER BY s.user_id, s.expires_at DESC, s.id DESC
-                ) latest
-                WHERE latest.expires_at <= NOW() + INTERVAL '{warning_hours} hour'
-                """
-            )
-            expiring_critical = [dict(row) for row in cur.fetchall()]
-            cur.execute(
-                """
-                SELECT DISTINCT ON (s.user_id)
-                    s.id, s.user_id, s.expires_at, p.code AS plan_code, p.name_ru, p.name_en, p.duration_days, p.device_limit
-                FROM subscriptions s
-                JOIN plans p ON p.id = s.plan_id
-                WHERE s.status = 'expired'
-                  AND NOT EXISTS (
-                      SELECT 1
-                      FROM subscriptions s2
-                      WHERE s2.user_id = s.user_id
-                        AND s2.status = 'active'
-                  )
-                ORDER BY s.user_id, s.expires_at DESC
-                LIMIT 500
-                """
-            )
-            expired = [dict(row) for row in cur.fetchall()]
-    for row in expiring:
-        user = get_user_by_id(int(row["user_id"])) or {}
+        except requests.RequestException as exc:
+            update_payment(payment["id"], status="error")
+            raise HTTPException(status_code=502, detail=f"YooKassa create payment failed: {exc}") from exc
+    return {"ok": True, "payments_enabled": True, "payment": payment, "plan": plan}
+
+
+@app.get("/payments/{payment_id}")
+def payments_get(payment_id: str, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    payment = get_payment_for_user(payment_id, user["id"])
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+    return {"ok": True, "payment": payment}
+
+
+@app.post("/payments/webhook/yookassa")
+def payments_webhook(payload: Dict[str, Any]) -> Dict[str, Any]:
+    obj = payload.get("object") or {}
+    remote_payment_id = obj.get("id") or ((obj.get("metadata") or {}).get("local_payment_id"))
+    if not remote_payment_id:
+        return {"ok": True, "ignored": True}
+    payment = get_payment_by_internal_or_external(remote_payment_id)
+    if not payment:
+        return {"ok": True, "ignored": True}
+    status_value = obj.get("status") or payload.get("event") or payment["status"]
+    if status_value in {"succeeded", "paid"}:
+        activate_payment_and_extend_subscription(payment["id"])
+    elif status_value in {"canceled", "cancelled"}:
+        update_payment(payment["id"], status="cancelled")
         enqueue_notification(
-            user_id=row["user_id"],
-            event_type="subscription_expiring",
-            unique_key=f"subscription_expiring:{row['id']}",
-            payload={
-                "subscription_id": row["id"],
-                "expires_at": row["expires_at"].isoformat(),
-                "plan_code": row["plan_code"],
-                "plan_name_ru": row["name_ru"],
-                "plan_name_en": row["name_en"],
-                "duration_days": int(row["duration_days"]),
-                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
-            },
+            user_id=payment['user_id'],
+            event_type='payment_failed',
+            unique_key=f'payment_failed:{payment["id"]}',
+            payload={'payment_id': payment['id']},
         )
-    for row in expiring_critical:
-        user = get_user_by_id(int(row["user_id"])) or {}
-        enqueue_notification(
-            user_id=row["user_id"],
-            event_type="subscription_expiring_12h",
-            unique_key=f"subscription_expiring_12h:{row['id']}",
-            payload={
-                "subscription_id": row["id"],
-                "expires_at": row["expires_at"].isoformat(),
-                "plan_code": row["plan_code"],
-                "plan_name_ru": row["name_ru"],
-                "plan_name_en": row["name_en"],
-                "duration_days": int(row["duration_days"]),
-                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
-                "warning_hours": warning_hours,
+    else:
+        update_payment(payment["id"], status=status_value)
+    return {"ok": True}
+
+
+@app.get("/api/infra/admin/vpn/users")
+def admin_users(
+    search: str = Query(default=""),
+    query_text: str = Query(default="", alias="query"),
+    status_filter: str = Query(default="all", alias="status"),
+    filter_text: str = Query(default="", alias="filter"),
+    admin_name: str = Depends(require_admin),
+) -> Dict[str, Any]:
+    _ = admin_name
+    effective_search = query_text or search
+    effective_status = filter_text or status_filter or "all"
+    data = list_admin_users(search=effective_search, status_filter=effective_status)
+    return {"ok": True, **data}
+
+
+@app.post("/api/infra/admin/vpn/users")
+def admin_users_create(payload: AdminUserUpsertIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    try:
+        item = admin_create_or_update_user(payload.model_dump(exclude_none=True), admin_name)
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.patch("/api/infra/admin/vpn/users/{telegram_id}")
+def admin_user_patch(telegram_id: int, payload: AdminUserPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    data = payload.model_dump(exclude_unset=True)
+    if "device_limit_override" not in data:
+        raise HTTPException(status_code=400, detail="No changes provided")
+    try:
+        item = set_user_device_limit_override_by_telegram(telegram_id, data.get("device_limit_override"), admin_name)
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/infra/admin/vpn/users/{telegram_id}/block")
+def admin_user_block(telegram_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    try:
+        user = set_user_status_by_telegram(telegram_id, "blocked", admin_name, "User blocked from VPN admin")
+        return {"ok": True, "user": user}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.patch("/api/infra/admin/vpn/users/{telegram_id}/unblock")
+def admin_user_unblock(telegram_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    try:
+        user = set_user_status_by_telegram(telegram_id, "active", admin_name, "User unblocked from VPN admin")
+        return {"ok": True, "user": user}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.post("/api/infra/admin/vpn/users/{telegram_id}/extend")
+def admin_user_extend(telegram_id: int, payload: ExtendIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    try:
+        item = extend_user_subscription_by_telegram(telegram_id, payload.normalized_days(), payload.reason, admin_name)
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/infra/admin/vpn/users/{telegram_id}/reset-devices")
+def admin_user_reset_devices(telegram_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    try:
+        item = reset_user_devices_by_telegram(telegram_id, admin_name)
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/infra/admin/vpn/payments")
+def admin_payments(status_filter: str = Query(default="all", alias="status"), admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return {"ok": True, "items": list_payments(status_filter=status_filter)}
+
+
+@app.get("/api/infra/admin/vpn/payments/export.csv")
+def admin_payments_export(status_filter: str = Query(default="all", alias="status"), admin_name: str = Depends(require_admin)) -> Response:
+    _ = admin_name
+    content = export_payments_csv(status_filter=status_filter)
+    return Response(content=content, media_type="text/csv", headers={"Content-Disposition": "attachment; filename=vpn-payments.csv"})
+
+
+def _safe_speed_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not (number >= 0):
+        return None
+    return round(number, 2)
+
+
+def _safe_speed_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    try:
+        number = int(round(float(value)))
+    except (TypeError, ValueError):
+        return None
+    if number < 0:
+        return None
+    return number
+
+
+def _location_speed_test_url(row: Dict[str, Any]) -> Optional[str]:
+    payload = _compose_vpn_payload_for_location(dict(row))
+    candidates = [
+        payload.get("speed_test_url"),
+        payload.get("speedtest_url"),
+        payload.get("speed_url"),
+        payload.get("metrics_url"),
+    ]
+    for value in candidates:
+        text = str(value or "").strip()
+        if text.lower().startswith(("http://", "https://")):
+            return text
+
+    server = str(payload.get("speed_test_host") or payload.get("server") or "").strip()
+    if not server or "://" in server:
+        return None
+    scheme = str(payload.get("speed_test_scheme") or "https").strip() or "https"
+    path = str(payload.get("speed_test_path") or "/speed").strip() or "/speed"
+    if not path.startswith("/"):
+        path = "/" + path
+    try:
+        port = int(payload.get("speed_test_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    base = f"{scheme}://{server}"
+    if port > 0 and not ((scheme == "https" and port == 443) or (scheme == "http" and port == 80)):
+        base += f":{port}"
+    return base + path
+
+
+def _extract_speed_metrics(data: Any) -> Dict[str, Any]:
+    if not isinstance(data, dict):
+        raise ValueError("Speed test response must be a JSON object")
+
+    source = data
+    for key in ("data", "result", "speed", "metrics"):
+        nested = source.get(key)
+        if isinstance(nested, dict):
+            source = nested
+            break
+
+    download = _safe_speed_float(
+        source.get("download_mbps")
+        or source.get("downloadMbps")
+        or source.get("download")
+        or data.get("download_mbps")
+        or data.get("downloadMbps")
+        or data.get("download")
+    )
+    upload = _safe_speed_float(
+        source.get("upload_mbps")
+        or source.get("uploadMbps")
+        or source.get("upload")
+        or data.get("upload_mbps")
+        or data.get("uploadMbps")
+        or data.get("upload")
+    )
+    ping = _safe_speed_int(
+        source.get("ping_ms")
+        or source.get("pingMs")
+        or source.get("ping")
+        or data.get("ping_ms")
+        or data.get("pingMs")
+        or data.get("ping")
+    )
+    checked_at = (
+        source.get("checked_at")
+        or source.get("checkedAt")
+        or source.get("timestamp")
+        or data.get("checked_at")
+        or data.get("checkedAt")
+        or data.get("timestamp")
+    )
+
+    if download is None and upload is None and ping is None:
+        raise ValueError("Response has no speed fields")
+
+    if checked_at:
+        checked_text = str(checked_at).strip()
+        try:
+            checked_iso = datetime.fromisoformat(checked_text.replace("Z", "+00:00")).astimezone(timezone.utc).isoformat()
+        except ValueError:
+            checked_iso = datetime.now(timezone.utc).isoformat()
+    else:
+        checked_iso = datetime.now(timezone.utc).isoformat()
+
+    return {
+        "download_mbps": download,
+        "upload_mbps": upload,
+        "ping_ms": ping,
+        "speed_checked_at": checked_iso,
+    }
+
+
+def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
+    code = str(row.get("code") or "")
+    status = str(row.get("status") or "").lower()
+    is_active = bool(row.get("is_active"))
+    result: Dict[str, Any] = {
+        "id": row.get("id"),
+        "code": code,
+        "name_ru": row.get("name_ru"),
+        "status": "skipped",
+    }
+
+    if code in {"auto-fastest", "auto-reserve"}:
+        result["reason"] = "virtual_location"
+        return result
+    if not is_active:
+        result["reason"] = "inactive"
+        return result
+    if status != "online":
+        result["reason"] = "not_online"
+        return result
+
+    payload = _compose_vpn_payload_for_location(dict(row))
+    if not payload or not _config_is_complete(payload):
+        result["reason"] = "payload_incomplete"
+        return result
+
+    url = _location_speed_test_url(row)
+    if not url:
+        result["reason"] = "speed_test_url_missing"
+        result["hint"] = "Set vpn_payload.speed_test_url or speed_test_host/scheme/path."
+        return result
+
+    try:
+        response = requests.get(url, timeout=12, headers={"Accept": "application/json"})
+        response.raise_for_status()
+        metrics = _extract_speed_metrics(response.json())
+        item = patch_location(int(row.get("id")), metrics)
+        result.update({
+            "status": "ok",
+            "url": url,
+            "metrics": {
+                "download_mbps": item.get("download_mbps"),
+                "upload_mbps": item.get("upload_mbps"),
+                "ping_ms": item.get("ping_ms"),
+                "speed_checked_at": (
+                    item.get("speed_checked_at").astimezone(timezone.utc).isoformat()
+                    if isinstance(item.get("speed_checked_at"), datetime)
+                    else item.get("speed_checked_at")
+                ),
             },
-        )
-    for row in expired:
-        user = get_user_by_id(int(row["user_id"])) or {}
-        enqueue_notification(
-            user_id=row["user_id"],
-            event_type="subscription_expired",
-            unique_key=f"subscription_expired:{row['id']}",
-            payload={
-                "subscription_id": row["id"],
-                "expires_at": row["expires_at"].isoformat(),
-                "plan_code": row["plan_code"],
-                "plan_name_ru": row["name_ru"],
-                "plan_name_en": row["name_en"],
-                "duration_days": int(row["duration_days"]),
-                "device_limit": _resolve_effective_device_limit(row["device_limit"], user.get("device_limit_override")),
-            },
-        )
+        })
+        return result
+    except requests.RequestException as exc:
+        result.update({"status": "error", "url": url, "reason": str(exc)})
+        return result
+    except ValueError as exc:
+        result.update({"status": "error", "url": url, "reason": str(exc)})
+        return result
+
+
+@app.post("/api/infra/admin/vpn/locations/speed-test")
+def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    rows = list_locations(active_only=False)
+    results = [_run_location_speed_test(row) for row in rows]
+    ok_count = sum(1 for item in results if item.get("status") == "ok")
+    error_count = sum(1 for item in results if item.get("status") == "error")
+    skipped_count = sum(1 for item in results if item.get("status") == "skipped")
+    _invalidate_locations_cache()
+    return {
+        "ok": True,
+        "tested": len(results),
+        "updated": ok_count,
+        "errors": error_count,
+        "skipped": skipped_count,
+        "items": results,
+    }
+
+@app.post("/api/infra/admin/vpn/locations/refresh-ru-lte")
+def admin_refresh_ru_lte(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return _run_ru_lte_refresh_safe(source="manual")
+
+
+@app.post("/api/infra/admin/vpn/locations/refresh-black")
+def admin_refresh_black(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return _run_black_refresh_safe(source="manual")
+
+
+@app.get("/api/infra/admin/vpn/locations")
+def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return {
+        "ok": True,
+        "items": [serialize_location(row, include_payload=True) for row in list_locations(active_only=False)],
+        "ru_lte_refresh": dict(_ru_lte_refresh_state),
+        "ru_lte_auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
+        "ru_lte_auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
+        "black_refresh": dict(_black_refresh_state),
+        "black_auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
+        "black_auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
+    }
+
+
+@app.post("/api/infra/admin/vpn/locations")
+def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        item = create_location(payload.model_dump())
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        detail = str(exc).strip() or "Database error while saving location"
+        raise HTTPException(status_code=500, detail=detail) from exc
+
+
+@app.patch("/api/infra/admin/vpn/locations/{location_id}")
+def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    data = {key: value for key, value in payload.model_dump().items() if value is not None}
+    try:
+        item = patch_location(location_id, data)
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.delete("/api/infra/admin/vpn/locations/{location_id}")
+def admin_locations_delete(location_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        item = delete_location(location_id)
+        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+    except ValueError as exc:
+        raise HTTPException(status_code=404, detail=str(exc)) from exc
+
+
+@app.get("/api/infra/admin/vpn/settings")
+def admin_settings(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    sync_plans_from_env()
+    return {"ok": True, "settings": settings_snapshot()}
+
+
+@app.post("/api/infra/admin/vpn/settings")
+def admin_settings_save(payload: AdminVpnSettingsIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    save_runtime_settings_payload(payload.model_dump(exclude_none=True))
+    return {
+        "ok": True,
+        "message": "Settings saved to database and applied immediately.",
+        "settings": settings_snapshot(),
+    }
 
 
 
-def list_pending_notifications(limit: int = 100) -> List[Dict[str, Any]]:
-    purge_stale_subscription_notifications()
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT n.*, u.telegram_id, u.language, u.status AS user_status
-                FROM bot_notifications n
-                JOIN users u ON u.id = n.user_id
-                WHERE n.sent_at IS NULL
-                ORDER BY n.created_at ASC
-                LIMIT %s
-                """,
-                (limit,),
-            )
-            rows = [dict(row) for row in cur.fetchall()]
-    return rows
+def _telegram_api_url(method: str) -> str:
+    if not settings.BOT_TOKEN:
+        raise RuntimeError("BOT_TOKEN is not configured")
+    return f"https://api.telegram.org/bot{settings.BOT_TOKEN}/{method}"
 
 
-def mark_notification_sent(notification_id: int) -> None:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("UPDATE bot_notifications SET sent_at = NOW() WHERE id = %s", (notification_id,))
-        conn.commit()
+
+def telegram_send_message(telegram_id: int, text: str, reply_markup: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"chat_id": int(telegram_id), "text": text}
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+    response = requests.post(_telegram_api_url("sendMessage"), json=payload, timeout=20)
+    response.raise_for_status()
+    return response.json()
 
 
-def record_bot_error(source: str, context: str, error_message: str) -> None:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "INSERT INTO bot_error_log (source, context, error_message) VALUES (%s, %s, %s)",
-                (source, context, error_message[:4000]),
-            )
-        conn.commit()
+@app.post("/api/infra/admin/vpn/test-send")
+def admin_test_send(payload: TestSendIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        telegram_send_message(payload.telegram_id, payload.text)
+        return {"ok": True}
+    except Exception as exc:
+        record_bot_error("vpn-admin-test", str(payload.telegram_id), str(exc))
+        raise HTTPException(status_code=502, detail=f"Telegram send failed: {exc}") from exc
 
 
-def list_bot_errors(limit: int = 50) -> List[Dict[str, Any]]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT * FROM bot_error_log ORDER BY created_at DESC LIMIT %s", (limit,))
-            return [dict(row) for row in cur.fetchall()]
+@app.post("/api/infra/admin/vpn/broadcast")
+def admin_broadcast(payload: BroadcastIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    text = payload.text.strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+    sent = 0
+    failed = 0
+    for target in list_broadcast_targets(payload.statuses or ["active"]):
+        try:
+            telegram_send_message(int(target["telegram_id"]), text)
+            sent += 1
+        except Exception as exc:
+            failed += 1
+            record_bot_error("vpn-broadcast", str(target.get("telegram_id")), str(exc))
+    return {"ok": True, "sent": sent, "failed": failed, "total": sent + failed}
 
 
-def list_broadcast_targets(statuses: Optional[List[str]] = None) -> List[Dict[str, Any]]:
-    statuses = statuses or ["active"]
-    statuses = [item.strip().lower() for item in statuses if item]
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT u.id, u.telegram_id, u.language, u.status,
-                       s.expires_at
-                FROM users u
-                LEFT JOIN LATERAL (
-                    SELECT * FROM subscriptions s1
-                    WHERE s1.user_id = u.id
-                    ORDER BY s1.expires_at DESC
-                    LIMIT 1
-                ) s ON TRUE
-                ORDER BY u.created_at DESC
-                """
-            )
-            rows = [dict(row) for row in cur.fetchall()]
-    result = []
-    now = now_utc()
-    for row in rows:
-        if row["status"] == "blocked":
-            user_bucket = "blocked"
-        elif row.get("expires_at") and row["expires_at"] >= now:
-            user_bucket = "active"
-        else:
-            user_bucket = "expired"
-        if user_bucket in statuses:
-            result.append(row)
-    return result
+@app.post("/vpn/client-events")
+def vpn_client_events(payload: VpnClientEventIn, user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    platform = _diagnostic_text(payload.platform).lower() or "unknown"
+    stage = _diagnostic_text(payload.stage).lower() or "runtime"
+    status = _diagnostic_text(payload.status).lower()
+    location_code = _diagnostic_text(payload.location_code)
+    user_label = str(user.get("telegram_id") or user.get("id") or "unknown")
+    context_parts = [f"user={user_label}"]
+    if location_code:
+        context_parts.append(f"location={location_code}")
+    if status:
+        context_parts.append(f"status={status}")
+    message = _diagnostic_text(payload.error_message) or _diagnostic_text(payload.details) or f"Client VPN event: {stage}"
+    record_bot_error(f"vpn-client-{platform}-{stage}", " | ".join(context_parts), message)
+    return {"ok": True}
+
+
+@app.get("/api/infra/admin/vpn/errors")
+def admin_errors(limit: int = Query(default=50, ge=1, le=500), admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    items = list_bot_errors(limit=limit) + build_location_tun_error_items()
+    items.sort(key=lambda item: _diagnostic_text(item.get("created_at")) or "", reverse=True)
+    return {"ok": True, "items": items[:limit]}
