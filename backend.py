@@ -251,24 +251,31 @@ _DEAD_CANDIDATE_LOCK = threading.Lock()
 _PROJECT_ROOT = Path(__file__).resolve().parent
 
 
-_VPN_CONFIGS_RAW_BASE = "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main"
-_REMOTE_SOURCE_ALIASES: Dict[str, str] = {
-    "Vless-Reality-White-Lists-Rus-Mobile.txt": f"{_VPN_CONFIGS_RAW_BASE}/Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": f"{_VPN_CONFIGS_RAW_BASE}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
-    "WHITE-CIDR-RU-checked.txt": f"{_VPN_CONFIGS_RAW_BASE}/WHITE-CIDR-RU-checked.txt",
-    "WHITE-CIDR-RU-all.txt": f"{_VPN_CONFIGS_RAW_BASE}/WHITE-CIDR-RU-all.txt",
-    "BLACK_VLESS_RUS_mobile.txt": f"{_VPN_CONFIGS_RAW_BASE}/BLACK_VLESS_RUS_mobile.txt",
-    "BLACK_VLESS_RUS.txt": f"{_VPN_CONFIGS_RAW_BASE}/BLACK_VLESS_RUS.txt",
-}
+def _vpn_configs_raw_base() -> str:
+    return str(getattr(settings, "VPN_CONFIGS_REPO_RAW_BASE", "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main") or "https://raw.githubusercontent.com/igareck/vpn-configs-for-russia/main").strip().rstrip("/")
 
-_LOCAL_SOURCE_FALLBACKS: Dict[str, Path] = {
-    "Vless-Reality-White-Lists-Rus-Mobile.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile.txt",
-    "Vless-Reality-White-Lists-Rus-Mobile-2.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile-2.txt",
-    "WHITE-CIDR-RU-checked.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-checked.txt",
-    "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
-    "BLACK_VLESS_RUS_mobile.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS_mobile.txt",
-    "BLACK_VLESS_RUS.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS.txt",
-}
+
+def _remote_source_aliases() -> Dict[str, str]:
+    base = _vpn_configs_raw_base()
+    return {
+        "Vless-Reality-White-Lists-Rus-Mobile.txt": f"{base}/Vless-Reality-White-Lists-Rus-Mobile.txt",
+        "Vless-Reality-White-Lists-Rus-Mobile-2.txt": f"{base}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+        "WHITE-CIDR-RU-checked.txt": f"{base}/WHITE-CIDR-RU-checked.txt",
+        "WHITE-CIDR-RU-all.txt": f"{base}/WHITE-CIDR-RU-all.txt",
+        "BLACK_VLESS_RUS_mobile.txt": f"{base}/BLACK_VLESS_RUS_mobile.txt",
+        "BLACK_VLESS_RUS.txt": f"{base}/BLACK_VLESS_RUS.txt",
+    }
+
+
+def _local_source_fallbacks() -> Dict[str, Path]:
+    return {
+        "Vless-Reality-White-Lists-Rus-Mobile.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile.txt",
+        "Vless-Reality-White-Lists-Rus-Mobile-2.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "Vless-Reality-White-Lists-Rus-Mobile-2.txt",
+        "WHITE-CIDR-RU-checked.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-checked.txt",
+        "WHITE-CIDR-RU-all.txt": _PROJECT_ROOT / "sources" / "ru_lte" / "WHITE-CIDR-RU-all.txt",
+        "BLACK_VLESS_RUS_mobile.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS_mobile.txt",
+        "BLACK_VLESS_RUS.txt": _PROJECT_ROOT / "sources" / "black" / "BLACK_VLESS_RUS.txt",
+    }
 
 
 def _canonical_source_name(source: str) -> str:
@@ -282,7 +289,7 @@ def _canonical_remote_source_url(source: str) -> Optional[str]:
         return None
     if raw.startswith(("http://", "https://")):
         return raw
-    return _REMOTE_SOURCE_ALIASES.get(_canonical_source_name(raw))
+    return _remote_source_aliases().get(_canonical_source_name(raw))
 
 
 def _fresh_source_url(url: str) -> str:
@@ -311,7 +318,7 @@ def _read_text_from_source(source: str) -> str:
     raw = str(source or "").strip()
     if not raw:
         return ""
-    fallback_path = _LOCAL_SOURCE_FALLBACKS.get(_canonical_source_name(raw))
+    fallback_path = _local_source_fallbacks().get(_canonical_source_name(raw))
     remote_url = _canonical_remote_source_url(raw)
     request_headers = {
         "Accept": "text/plain, text/html;q=0.9, */*;q=0.8",
@@ -1175,7 +1182,7 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
         "status": str(updates.get("status") or "offline"),
         "sort_order": int(updates.get("sort_order") or {"ru-lte": 30, "ru-lte-reserve-1": 31, "ru-lte-reserve-2": 32, "ru-lte-reserve-3": 33, "intl-fast": 80, "intl-fast-reserve-1": 81, "intl-fast-reserve-2": 82, "intl-fast-reserve-3": 83}.get(code, 100)),
         "vpn_payload": base_payload,
-        "location_source": "catalog",
+        "location_source": str(updates.get("location_source") or "catalog"),
     }
     return create_location(payload)
 
@@ -1322,6 +1329,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                 "is_reserve": True,
                 "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
+                "location_source": "github",
             }
             row = _patch_location_by_code(code, updates)
             assigned.append({
@@ -1351,6 +1359,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                             "is_reserve": True,
                             "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "speed_checked_at": now_iso,
+                            "location_source": str(existing.get("location_source") or "github"),
                         })
                         assigned.append({
                             "code": code,
@@ -1376,6 +1385,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
                     "is_reserve": True,
                     "ping_ms": None,
                     "speed_checked_at": now_iso,
+                    "location_source": "github",
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
@@ -1425,6 +1435,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "refresh_summary": refresh_summary,
         "auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
+        "repo_raw_base": _vpn_configs_raw_base(),
     }
 
 
@@ -1573,6 +1584,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                 "is_reserve": True,
                 "ping_ms": latency_ms if latency_ms > 0 else None,
                 "speed_checked_at": now_iso,
+                "location_source": "github",
             }
             row = _patch_location_by_code(code, updates)
             assigned.append({
@@ -1604,6 +1616,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                             "is_reserve": True,
                             "ping_ms": int(probe.get("latency_ms") or existing.get("ping_ms") or 0) or None,
                             "speed_checked_at": now_iso,
+                            "location_source": str(existing.get("location_source") or "github"),
                         })
                         assigned.append({
                             "code": code,
@@ -1631,6 +1644,7 @@ def refresh_black_locations() -> Dict[str, Any]:
                     "is_reserve": True,
                     "ping_ms": None,
                     "speed_checked_at": now_iso,
+                    "location_source": "github",
                 })
                 assigned.append({"code": code, "server": None, "transport": None, "security": None, "remark": None, "latency_ms": None, "updated": bool(row), "kept_old": False})
 
@@ -1677,6 +1691,7 @@ def refresh_black_locations() -> Dict[str, Any]:
         "refresh_summary": refresh_summary,
         "auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
+        "repo_raw_base": _vpn_configs_raw_base(),
     }
 
 
