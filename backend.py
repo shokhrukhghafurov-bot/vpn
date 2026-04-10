@@ -1085,14 +1085,24 @@ def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
 
 
 def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout: float) -> Dict[str, Any]:
+    real_probe_error = ""
     if bool(getattr(settings, "VPN_REAL_PROBE_ENABLED", True)):
         real_probe = _probe_candidate_via_real_tunnel(payload, pool=pool)
         if real_probe.get("ok"):
             return real_probe
-        if bool(getattr(settings, "VPN_REAL_PROBE_REQUIRED", True)):
+        real_probe_error = str(real_probe.get("error") or "").strip().lower()
+        hard_fallback_errors = (
+            "xray_binary_missing",
+            "singbox_binary_missing",
+            "socks_not_ready",
+            "real_probe_timeout",
+        )
+        if bool(getattr(settings, "VPN_REAL_PROBE_REQUIRED", True)) and not real_probe_error.startswith(hard_fallback_errors):
             return real_probe
     fallback_probe = _probe_candidate_with_timeout(payload, float(tcp_timeout or 4))
     fallback_probe["method"] = "tcp_fallback"
+    if real_probe_error:
+        fallback_probe["real_probe_error"] = real_probe_error
     return fallback_probe
 
 
@@ -4497,6 +4507,7 @@ def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> 
         "probe_urls_ok": list(probe.get("probe_urls_ok") or []),
         "probe_labels_ok": list(probe.get("probe_labels_ok") or []),
         "error": str(probe.get("error") or ""),
+        "real_probe_error": str(probe.get("real_probe_error") or ""),
     }
     patch: Dict[str, Any] = {
         "ping_ms": int(probe.get("latency_ms") or 0) or None if probe_ok else None,
@@ -4504,8 +4515,8 @@ def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> 
         "vpn_payload": payload,
     }
     status = str(row.get("status") or "").strip().lower()
-    if probe_ok and status not in {"online", "reserve", "offline"}:
-        patch["status"] = "online"
+    if probe_ok:
+        patch["status"] = "reserve" if status == "reserve" else "online"
     item = patch_location(int(row.get("id")), patch)
     return item
 
@@ -4532,7 +4543,7 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
         result["reason"] = "payload_incomplete"
         return result
 
-    probe = _probe_candidate_via_real_tunnel(payload, pool=_probe_pool_for_location_code(code))
+    probe = _generic_probe_candidate(payload, pool=_probe_pool_for_location_code(code), tcp_timeout=float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
     _log_location_probe_result(row, probe)
     previous_status = str(row.get("status") or "")
     previous_ping_ms = _normalize_optional_int(row.get("ping_ms"))
@@ -4544,6 +4555,7 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
         "probe_urls_ok": probe.get("probe_urls_ok") or [],
         "probe_labels_ok": probe.get("probe_labels_ok") or [],
         "reason": probe.get("error"),
+        "real_probe_error": probe.get("real_probe_error"),
         "before": {
             "status": previous_status,
             "ping_ms": previous_ping_ms,
