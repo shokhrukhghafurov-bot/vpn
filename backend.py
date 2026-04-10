@@ -1745,6 +1745,13 @@ def refresh_black_locations() -> Dict[str, Any]:
     }
 
 
+
+
+@app.get("/api/infra/admin/vpn/debug/probe-runtime")
+def admin_probe_runtime(credentials: HTTPBasicCredentials = Depends(require_admin_basic)) -> Dict[str, Any]:
+    return {"ok": True, **_probe_binary_status()}
+
+
 @app.on_event("startup")
 def on_startup() -> None:
     bootstrap()
