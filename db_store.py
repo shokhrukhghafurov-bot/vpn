@@ -949,6 +949,18 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
     if not normalized:
         return {}
+
+    def _text_value(key: str) -> str:
+        return str(normalized.get(key) or "").strip()
+
+    def _sync_alias(primary_key: str, alias_key: str) -> None:
+        primary_value = _text_value(primary_key)
+        alias_value = _text_value(alias_key)
+        chosen = primary_value or alias_value
+        if chosen:
+            normalized[primary_key] = chosen
+            normalized[alias_key] = chosen
+
     if "server_port" in normalized and "port" not in normalized:
         normalized["port"] = normalized.get("server_port")
     if "id" in normalized and "uuid" not in normalized:
@@ -957,22 +969,10 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["transport"] = normalized.get("network")
     if "transport" in normalized and "network" not in normalized:
         normalized["network"] = normalized.get("transport")
-    if "server_name" in normalized and "sni" not in normalized:
-        normalized["sni"] = normalized.get("server_name")
-    if "sni" in normalized and "server_name" not in normalized:
-        normalized["server_name"] = normalized.get("sni")
-    if "serviceName" in normalized and "service_name" not in normalized:
-        normalized["service_name"] = normalized.get("serviceName")
-    if "service_name" in normalized and "serviceName" not in normalized:
-        normalized["serviceName"] = normalized.get("service_name")
-    if "publicKey" in normalized and "public_key" not in normalized:
-        normalized["public_key"] = normalized.get("publicKey")
-    if "public_key" in normalized and "publicKey" not in normalized:
-        normalized["publicKey"] = normalized.get("public_key")
-    if "shortId" in normalized and "short_id" not in normalized:
-        normalized["short_id"] = normalized.get("shortId")
-    if "short_id" in normalized and "shortId" not in normalized:
-        normalized["shortId"] = normalized.get("short_id")
+    _sync_alias("server_name", "sni")
+    _sync_alias("service_name", "serviceName")
+    _sync_alias("public_key", "publicKey")
+    _sync_alias("short_id", "shortId")
     if "dnsServers" in normalized and "dns_servers" not in normalized:
         normalized["dns_servers"] = normalized.get("dnsServers")
     if "dns_servers" in normalized and "dnsServers" not in normalized:
@@ -981,14 +981,8 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["allow_insecure"] = normalized.get("allowInsecure")
     if "allow_insecure" in normalized and "allowInsecure" not in normalized:
         normalized["allowInsecure"] = normalized.get("allow_insecure")
-    if "domainResolver" in normalized and "domain_resolver" not in normalized:
-        normalized["domain_resolver"] = normalized.get("domainResolver")
-    if "domain_resolver" in normalized and "domainResolver" not in normalized:
-        normalized["domainResolver"] = normalized.get("domain_resolver")
-    if "packetEncoding" in normalized and "packet_encoding" not in normalized:
-        normalized["packet_encoding"] = normalized.get("packetEncoding")
-    if "packet_encoding" in normalized and "packetEncoding" not in normalized:
-        normalized["packetEncoding"] = normalized.get("packet_encoding")
+    _sync_alias("domain_resolver", "domainResolver")
+    _sync_alias("packet_encoding", "packetEncoding")
     if "rawSingBoxConfig" in normalized and "raw_sing_box_config" not in normalized:
         normalized["raw_sing_box_config"] = normalized.get("rawSingBoxConfig")
     if "raw_sing_box_config" in normalized and "rawSingBoxConfig" not in normalized:
