@@ -73,6 +73,7 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
 VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
 VIRTUAL_LOCATION_POOL_SIZE = 5
 VIRTUAL_LOCATION_FRESH_CHECK_MINUTES = 15
+VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS = 120
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1067,75 +1068,14 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
 
 
 def _location_speed_rank(row: Dict[str, Any]) -> tuple:
-    """
-    Rank virtual auto candidates with real liveness/latency first.
-
-    Auto | Fastest should prefer the lowest fresh ping among live configs.
-    Download/upload can still help as tie-breakers, but they must not outrank
-    a materially faster ping because the refresh pipeline mostly measures
-    latency, not throughput.
-    """
     download = _normalize_optional_float(row.get("download_mbps")) or 0.0
     upload = _normalize_optional_float(row.get("upload_mbps")) or 0.0
     ping = _normalize_optional_int(row.get("ping_ms"))
-    ping_ok = ping is not None and ping > 0
-    metrics_fresh = _speed_metrics_fresh(row)
-    has_speed = 1 if (download > 0 or upload > 0 or ping_ok) else 0
+    has_speed = 1 if (download > 0 or upload > 0 or (ping is not None and ping > 0)) else 0
+    ping_score = 0 if ping is None else max(0, 10000 - ping)
     recommended = 1 if bool(row.get("is_recommended")) else 0
-    reserve_penalty = 1 if bool(row.get("is_reserve")) else 0
-    sort_order = int(row.get("sort_order") or 9999)
-
-    # Smaller tuples are better.
-    return (
-        0 if metrics_fresh else 1,
-        0 if ping_ok else 1,
-        ping if ping_ok else 10 ** 9,
-        0 if has_speed else 1,
-        -(recommended),
-        reserve_penalty,
-        -(download),
-        -(upload),
-        sort_order,
-        str(row.get("code") or "").strip().lower(),
-    )
-
-
-def _virtual_best_ping(pool: List[Dict[str, Any]]) -> Optional[int]:
-    pings = [
-        ping for ping in (_normalize_optional_int(row.get("ping_ms")) for row in pool)
-        if ping is not None and ping > 0
-    ]
-    return min(pings) if pings else None
-
-
-def _virtual_assignment_reusable(code: str, assigned_row: Dict[str, Any], pool: List[Dict[str, Any]]) -> bool:
-    if not pool:
-        return False
-    assigned_code = str(assigned_row.get("code") or "").strip()
-    if not assigned_code:
-        return False
-    ranked_pool = sorted(pool, key=_location_speed_rank)
-    try:
-        rank = next(idx for idx, row in enumerate(ranked_pool) if str(row.get("code") or "").strip() == assigned_code)
-    except StopIteration:
-        return False
-
-    if not _speed_metrics_fresh(assigned_row):
-        return False
-
-    best_ping = _virtual_best_ping(ranked_pool)
-    assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
-    if best_ping is not None:
-        if assigned_ping is None or assigned_ping <= 0:
-            return False
-        allowed_ping = max(best_ping + 60, int(best_ping * 1.25))
-        if assigned_ping > allowed_ping:
-            return False
-
-    # Auto | Fastest should stay very close to the top of the live ranking.
-    # Reserve can be slightly looser because it intentionally avoids the main pick.
-    max_rank = 0 if code == "auto-fastest" else 1
-    return rank <= max_rank
+    reserve = 1 if bool(row.get("is_reserve")) else 0
+    return (has_speed, download, upload, ping_score, recommended, -reserve, -(int(row.get("sort_order") or 9999)))
 
 
 def _is_lte_location(row: Dict[str, Any]) -> bool:
@@ -1163,6 +1103,27 @@ def _speed_metrics_fresh(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_
     return age <= timedelta(minutes=max(1, int(max_age_minutes or 1)))
 
 
+def _speed_ping_present(row: Dict[str, Any]) -> bool:
+    ping = _normalize_optional_int(row.get("ping_ms"))
+    return ping is not None and ping > 0
+
+
+def _speed_ping_fresh(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_LOCATION_FRESH_CHECK_MINUTES) -> bool:
+    return _speed_ping_present(row) and _speed_metrics_fresh(row, max_age_minutes=max_age_minutes)
+
+
+def _virtual_ping_sort_key(row: Dict[str, Any]) -> tuple:
+    ping = _normalize_optional_int(row.get("ping_ms"))
+    ping_rank = ping if ping is not None and ping > 0 else 10**9
+    reserve_rank = 1 if bool(row.get("is_reserve")) else 0
+    recommended_rank = 0 if bool(row.get("is_recommended")) else 1
+    sort_order = int(row.get("sort_order") or 9999)
+    name_rank = str(row.get("name_en") or row.get("name_ru") or row.get("code") or "").strip().lower()
+    download = _normalize_optional_float(row.get("download_mbps")) or 0.0
+    upload = _normalize_optional_float(row.get("upload_mbps")) or 0.0
+    return (ping_rank, reserve_rank, recommended_rank, -download, -upload, sort_order, name_rank)
+
+
 def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
     row_code = str(row.get("code") or "").strip()
     if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
@@ -1177,22 +1138,23 @@ def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
 def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     usable_live = [row for row in rows if _virtual_live_and_usable(row)]
     fresh_ping = sorted(
-        [row for row in usable_live if _speed_metrics_fresh(row) and (_normalize_optional_int(row.get("ping_ms")) or 0) > 0],
-        key=_location_speed_rank,
+        [row for row in usable_live if _speed_ping_fresh(row)],
+        key=_virtual_ping_sort_key,
+    )
+    measured_ping = sorted(
+        [row for row in usable_live if _speed_ping_present(row)],
+        key=_virtual_ping_sort_key,
     )
     fresh_measured = sorted(
         [row for row in usable_live if _speed_metrics_present(row) and _speed_metrics_fresh(row)],
         key=_location_speed_rank,
+        reverse=True,
     )
-    measured = sorted(
-        [row for row in usable_live if _speed_metrics_present(row)],
-        key=_location_speed_rank,
-    )
-    all_live = sorted(usable_live, key=_location_speed_rank)
+    all_live = sorted(usable_live, key=_location_speed_rank, reverse=True)
     return [
         _dedupe_location_rows(fresh_ping),
+        _dedupe_location_rows(measured_ping),
         _dedupe_location_rows(fresh_measured),
-        _dedupe_location_rows(measured),
         _dedupe_location_rows(all_live),
     ]
 
@@ -1343,11 +1305,23 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if assigned_code:
         sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
         if not sibling_collision:
-            for row in pool:
-                if str(row.get("code") or "").strip() == assigned_code:
-                    if _virtual_assignment_reusable(code, row, pool):
-                        return row
-                    break
+            best_row = pool[0] if pool else None
+            assigned_row = next((row for row in pool if str(row.get("code") or "").strip() == assigned_code), None)
+            if assigned_row is not None:
+                assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
+                best_ping = _normalize_optional_int(best_row.get("ping_ms")) if best_row is not None else None
+                best_has_fresh_ping = bool(best_row and _speed_ping_fresh(best_row))
+                assigned_has_fresh_ping = _speed_ping_fresh(assigned_row)
+                if best_has_fresh_ping:
+                    if (
+                        assigned_has_fresh_ping
+                        and assigned_ping is not None
+                        and best_ping is not None
+                        and assigned_ping <= best_ping + max(1, int(VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS or 1))
+                    ):
+                        return assigned_row
+                elif best_row is not None and str(best_row.get("code") or "").strip() == assigned_code:
+                    return assigned_row
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
     effective_pool = _prefer_primary_virtual_pool(pool, loads)
