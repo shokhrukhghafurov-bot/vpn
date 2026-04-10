@@ -1197,12 +1197,18 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
         return is_live(row) and bool(row.get("is_reserve"))
 
     if code == "auto-fastest":
-        # Pick from all live usable locations by real speed first, regardless of whether
-        # the row is a manual location, LTE, or reserve. Tie-breakers still slightly prefer
-        # non-reserve rows via _location_speed_rank.
+        # Main auto row should prefer live non-reserve locations first:
+        # manual locations, LTE main, and regular fast main rows.
+        # Reserve rows are used only as a fallback when there is no live main candidate.
+        main_candidates = _dedupe_location_rows(
+            ranked_measured(is_main)
+            + ranked(is_main)
+        )
+        if main_candidates:
+            return main_candidates
         return _dedupe_location_rows(
-            ranked_measured(is_live)
-            + ranked(is_live)
+            ranked_measured(is_reserve)
+            + ranked(is_reserve)
         )
 
     if code == "auto-reserve":
