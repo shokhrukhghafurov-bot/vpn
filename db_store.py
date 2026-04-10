@@ -1234,25 +1234,40 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
     return counts
 
 
+def _virtual_role_order(code: str) -> List[bool]:
+    # False -> primary/manual/LTE rows, True -> reserve rows.
+    # Auto | Fastest should strongly prefer primary rows across *all* health
+    # tiers before it ever falls back to reserve. Auto | Fastest Reserve should
+    # do the opposite.
+    if code == "auto-reserve":
+        return [True, False]
+    return [False, True]
+
+
 def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if code in {"auto-fastest", "auto-reserve"}:
-        # Both virtual rows compete across the same global live pool:
-        # ordinary manual locations, LTE rows, and reserve rows together.
-        # But we strongly prefer candidates with fresh speed/liveness data;
-        # stale assignments should not pin auto rows to a dead server.
-        tiers = _virtual_selection_tiers(rows)
-        return _dedupe_location_rows([row for tier in tiers for row in tier])
-    return []
+    if code not in {"auto-fastest", "auto-reserve"}:
+        return []
 
-
-def _virtual_strict_candidate_pool(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     tiers = _virtual_selection_tiers(rows)
-    for tier in tiers:
-        if tier:
-            # Hard rule: as soon as we have a stronger tier, do not mix in weaker
-            # rows. This prevents Auto | Fastest from sticking to stale / n-a
-            # configs when fresh live ping rows already exist.
-            return list(tier[: max(1, VIRTUAL_LOCATION_POOL_SIZE)])
+    ordered: List[Dict[str, Any]] = []
+    for want_reserve in _virtual_role_order(code):
+        for tier in tiers:
+            for row in tier:
+                if bool(row.get("is_reserve")) == want_reserve:
+                    ordered.append(row)
+    return _dedupe_location_rows(ordered)
+
+
+def _virtual_strict_candidate_pool(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tiers = _virtual_selection_tiers(rows)
+    for want_reserve in _virtual_role_order(code):
+        for tier in tiers:
+            scoped = [row for row in tier if bool(row.get("is_reserve")) == want_reserve]
+            if scoped:
+                # Hard rule: do not mix weaker tiers into a stronger tier, and do
+                # not let reserve rows win for Auto | Fastest while there is at
+                # least one usable primary row in any stronger or weaker tier.
+                return list(scoped[: max(1, VIRTUAL_LOCATION_POOL_SIZE)])
     return []
 
 
@@ -1409,7 +1424,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    pool = _virtual_strict_candidate_pool(rows)
+    pool = _virtual_strict_candidate_pool(code, rows)
     if not pool:
         pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     pool = _virtual_pool_best_quality(pool)
