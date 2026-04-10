@@ -2728,6 +2728,88 @@ def _client_ip_from_request(request: Request) -> str:
 
 
 
+def _normalize_optional_int(value: Any) -> Optional[int]:
+    if value is None:
+        return None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(round(value))
+    raw = str(value).strip().replace(',', '.')
+    if not raw:
+        return None
+    try:
+        return int(round(float(raw)))
+    except ValueError:
+        return None
+
+
+def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
+    if value is None:
+        return None
+    if isinstance(value, datetime):
+        return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    raw = str(value).strip()
+    if not raw:
+        return None
+    normalized = raw.replace('Z', '+00:00')
+    try:
+        parsed = datetime.fromisoformat(normalized)
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _subscription_browser_preview_request(request: Request) -> bool:
+    if not bool(getattr(settings, 'SUBSCRIPTION_BROWSER_PREVIEW_NO_DEVICE_TRACK', True)):
+        return False
+    client_hint = str(request.query_params.get('client') or '').strip().lower()
+    if client_hint in {'hiddify', 'v2raytun', 'happ', 'nekobox', 'nekoray', 'sing-box', 'singbox'}:
+        return False
+    if _subscription_client_id_from_request(request):
+        return False
+    ua = str(request.headers.get('user-agent') or '').strip().lower()
+    if not ua:
+        return False
+    known_vpn_clients = ('hiddify', 'v2raytun', 'happ', 'nekobox', 'nekoray', 'sing-box', 'singbox')
+    if any(marker in ua for marker in known_vpn_clients):
+        return False
+    browser_markers = ('mozilla/', 'chrome/', 'safari/', 'firefox/', 'edg/', 'opr/', 'opera/')
+    return any(marker in ua for marker in browser_markers)
+
+
+def _subscription_row_has_fresh_live_signal(row: Dict[str, Any]) -> bool:
+    if not _location_status_is_online(row):
+        return False
+    if not _row_has_ready_payload(row):
+        return False
+    ping_ms = _normalize_optional_int(row.get('ping_ms'))
+    if ping_ms is None or ping_ms <= 0:
+        return False
+    checked_at = _normalize_optional_timestamp(row.get('speed_checked_at'))
+    if checked_at is None:
+        return False
+    max_age_minutes = max(1, int(getattr(settings, 'SUBSCRIPTION_STRICT_FRESH_PING_MINUTES', 20) or 20))
+    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+    return age <= timedelta(minutes=max_age_minutes)
+
+
+def _subscription_row_allowed_for_publish(row: Dict[str, Any], *, user_id: Optional[int], strict_health: bool) -> bool:
+    code = str(row.get('code') or '').strip()
+    if not code:
+        return False
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        picked = _pick_virtual_location(code, user_id=user_id)
+        if not picked:
+            return False
+        return _subscription_row_has_fresh_live_signal(dict(picked)) if strict_health else _public_concrete_location_allowed(dict(picked))
+    if strict_health:
+        return _subscription_row_has_fresh_live_signal(row)
+    return _public_concrete_location_allowed(row)
+
+
 def _subscription_client_id_from_request(request: Request) -> str:
     raw_value = (
         request.query_params.get("client_id")
@@ -2783,32 +2865,6 @@ def _subscription_cookie_value(request: Request, token: str) -> str:
 
 
 
-def _browser_like_subscription_preview_request(request: Request) -> bool:
-    client_id = _subscription_client_id_from_request(request)
-    if client_id:
-        return False
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    if client_hint in {"hiddify", "v2raytun", "happ", "nekobox", "nekoray", "sing-box", "singbox"}:
-        return False
-    platform, device_name = _detect_device_platform_and_name(request)
-    if _device_client_family(device_name) != "generic":
-        return False
-    ua = str(request.headers.get("user-agent") or "").strip().lower()
-    browser_tokens = ("mozilla/", "chrome/", "safari/", "firefox/", "edg/", "opr/", "opera/")
-    client_tokens = ("happ", "hiddify", "v2raytun", "nekobox", "nekoray", "sing-box", "singbox")
-    if not any(token in ua for token in browser_tokens):
-        return False
-    if any(token in ua for token in client_tokens):
-        return False
-    accept = str(request.headers.get("accept") or "").strip().lower()
-    sec_fetch_mode = str(request.headers.get("sec-fetch-mode") or "").strip().lower()
-    sec_fetch_dest = str(request.headers.get("sec-fetch-dest") or "").strip().lower()
-    if "text/html" in accept or sec_fetch_mode == "navigate" or sec_fetch_dest == "document":
-        return True
-    return platform in {"windows", "macos", "linux"}
-
-
-
 def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, Any]], gate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not gate or gate.get("allowed"):
         return gate
@@ -2849,7 +2905,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         if str(item.get("platform") or "").strip().lower() == normalized_platform
         and str(item.get("device_name") or "").strip() == normalized_name
     ]
-    if exact_matches:
+    if len(exact_matches) == 1:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2862,7 +2918,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         for item in devices
         if str(item.get("platform") or "").strip().lower() == normalized_platform
     ]
-    if same_platform_matches:
+    if len(same_platform_matches) == 1:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2880,7 +2936,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
         if same_family and compatible_client:
             same_family_matches.append(item)
-    if same_family_matches:
+    if len(same_family_matches) == 1:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2909,8 +2965,6 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
 
 
 def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> None:
-    if _browser_like_subscription_preview_request(request):
-        return
     if not access or access.get("kind") != "user":
         return
     user = access.get("user") or {}
@@ -2929,8 +2983,6 @@ def _track_subscription_device_access(request: Request, token: str, access: Opti
 
 
 def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if _browser_like_subscription_preview_request(request):
-        return {"allowed": True, "reason": "browser_preview", "detail": "Browser preview requests do not consume device slots"}
     if not access or access.get("kind") != "user":
         return None
     user = access.get("user") or {}
@@ -3045,12 +3097,23 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
 
 
 def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
-    concrete: List[Dict[str, Any]] = []
-    for row in _public_location_rows():
-        payload, _ = _subscription_payload_and_fallback_name(dict(row), user_id=user_id)
-        if payload and _hiddify_subscription_transport_allowed(payload):
-            concrete.append(dict(row))
-    return concrete
+    public_rows = _public_location_rows()
+
+    def collect(*, strict_health: bool) -> List[Dict[str, Any]]:
+        published: List[Dict[str, Any]] = []
+        for row in public_rows:
+            base_row = dict(row)
+            if not _subscription_row_allowed_for_publish(base_row, user_id=user_id, strict_health=strict_health):
+                continue
+            payload, _ = _subscription_payload_and_fallback_name(base_row, user_id=user_id)
+            if payload and _hiddify_subscription_transport_allowed(payload):
+                published.append(base_row)
+        return published
+
+    strict_rows = collect(strict_health=True)
+    if strict_rows:
+        return strict_rows
+    return collect(strict_health=False)
 
 
 def _hiddify_profile_update_interval_header_value() -> str:
@@ -3142,17 +3205,19 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
         subscription_user_id = int(user["id"])
 
-        gate = _subscription_device_gate(request, token, access)
-        if gate and not gate.get("allowed"):
-            used = int(gate.get("devices_used") or 0)
-            limit = int(gate.get("device_limit") or 0)
-            content = (
-                f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
-                f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
-            )
-            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+        is_browser_preview = _subscription_browser_preview_request(request)
+        if not is_browser_preview:
+            gate = _subscription_device_gate(request, token, access)
+            if gate and not gate.get("allowed"):
+                used = int(gate.get("devices_used") or 0)
+                limit = int(gate.get("device_limit") or 0)
+                content = (
+                    f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
+                    f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
+                )
+                return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
 
-    if not head_only:
+    if not head_only and not _subscription_browser_preview_request(request):
         _track_subscription_device_access(request, token, access)
 
     rows = _subscription_location_rows(subscription_user_id)
