@@ -72,10 +72,6 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
 
 VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
 VIRTUAL_LOCATION_POOL_SIZE = 5
-VIRTUAL_LOCATION_FRESH_CHECK_MINUTES = 15
-VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS = 120
-VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD = 1
-VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS = 180
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -328,8 +324,8 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
-    "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
-    "UPDATE locations SET name_en = 'Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en IN ('Auto | Fastest', '★ Auto | Fastest'))",
+    "UPDATE locations SET name_ru = '★ Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru = 'Авто | Самый быстрый')",
+    "UPDATE locations SET name_en = '★ Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en = 'Auto | Fastest')",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
     "UPDATE locations SET name_en = 'Auto | Fastest Reserve' WHERE code = 'auto-reserve' AND (name_en IS NULL OR BTRIM(name_en) = '')",
 ]
@@ -1037,7 +1033,7 @@ def _config_is_complete(payload: Dict[str, Any]) -> bool:
     if not isinstance(dns_servers, list) or not [str(item).strip() for item in dns_servers if str(item).strip() and not _placeholder_like_value(item)]:
         return False
     if security == "reality":
-        if _placeholder_like_value(public_key) or _placeholder_like_value(sni):
+        if _placeholder_like_value(public_key) or _placeholder_like_value(short_id) or _placeholder_like_value(sni):
             return False
     if transport == "grpc" and _placeholder_like_value(service_name):
         return False
@@ -1095,70 +1091,6 @@ def _speed_metrics_present(row: Dict[str, Any]) -> bool:
         or (_normalize_optional_float(row.get("upload_mbps")) or 0) > 0
         or (_normalize_optional_int(row.get("ping_ms")) or 0) > 0
     )
-
-
-def _speed_metrics_fresh(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_LOCATION_FRESH_CHECK_MINUTES) -> bool:
-    checked_at = _normalize_optional_timestamp(row.get("speed_checked_at"))
-    if checked_at is None:
-        return False
-    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
-    return age <= timedelta(minutes=max(1, int(max_age_minutes or 1)))
-
-
-def _speed_ping_present(row: Dict[str, Any]) -> bool:
-    ping = _normalize_optional_int(row.get("ping_ms"))
-    return ping is not None and ping > 0
-
-
-def _speed_ping_fresh(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_LOCATION_FRESH_CHECK_MINUTES) -> bool:
-    return _speed_ping_present(row) and _speed_metrics_fresh(row, max_age_minutes=max_age_minutes)
-
-
-def _virtual_ping_sort_key(row: Dict[str, Any]) -> tuple:
-    ping = _normalize_optional_int(row.get("ping_ms"))
-    ping_rank = ping if ping is not None and ping > 0 else 10**9
-    reserve_rank = 1 if bool(row.get("is_reserve")) else 0
-    recommended_rank = 0 if bool(row.get("is_recommended")) else 1
-    sort_order = int(row.get("sort_order") or 9999)
-    name_rank = str(row.get("name_en") or row.get("name_ru") or row.get("code") or "").strip().lower()
-    download = _normalize_optional_float(row.get("download_mbps")) or 0.0
-    upload = _normalize_optional_float(row.get("upload_mbps")) or 0.0
-    return (ping_rank, reserve_rank, recommended_rank, -download, -upload, sort_order, name_rank)
-
-
-def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
-    row_code = str(row.get("code") or "").strip()
-    if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
-        return False
-    status = str(row.get("status") or "").strip().lower()
-    if status not in {"online", "reserve"}:
-        return False
-    payload = _compose_vpn_payload_for_location(dict(row))
-    return bool(payload and _config_is_complete(payload))
-
-
-def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
-    usable_live = [row for row in rows if _virtual_live_and_usable(row)]
-    fresh_ping = sorted(
-        [row for row in usable_live if _speed_ping_fresh(row)],
-        key=_virtual_ping_sort_key,
-    )
-    measured_ping = sorted(
-        [row for row in usable_live if _speed_ping_present(row)],
-        key=_virtual_ping_sort_key,
-    )
-    fresh_measured = sorted(
-        [row for row in usable_live if _speed_metrics_present(row) and _speed_metrics_fresh(row)],
-        key=_location_speed_rank,
-        reverse=True,
-    )
-    all_live = sorted(usable_live, key=_location_speed_rank, reverse=True)
-    return [
-        _dedupe_location_rows(fresh_ping),
-        _dedupe_location_rows(measured_ping),
-        _dedupe_location_rows(fresh_measured),
-        _dedupe_location_rows(all_live),
-    ]
 
 
 def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1234,60 +1166,85 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
     return counts
 
 
-def _virtual_role_order(code: str) -> List[bool]:
-    # False -> primary/manual/LTE rows, True -> reserve rows.
-    # Auto | Fastest should strongly prefer primary rows across *all* health
-    # tiers before it ever falls back to reserve. Auto | Fastest Reserve should
-    # do the opposite.
-    if code == "auto-reserve":
-        return [True, False]
-    return [False, True]
-
-
 def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if code not in {"auto-fastest", "auto-reserve"}:
-        return []
+    excluded = {"auto-fastest", "auto-reserve"}
+    preferred_main_codes = ["intl-fast", "ru-lte"]
+    preferred_reserve_codes = ["intl-fast-reserve-1", "intl-fast-reserve-2", "intl-fast-reserve-3", "ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3"]
 
-    tiers = _virtual_selection_tiers(rows)
-    ordered: List[Dict[str, Any]] = []
-    for want_reserve in _virtual_role_order(code):
-        for tier in tiers:
-            for row in tier:
-                if bool(row.get("is_reserve")) == want_reserve:
-                    ordered.append(row)
-    return _dedupe_location_rows(ordered)
+    def is_online(row: Dict[str, Any]) -> bool:
+        return str(row.get("status") or "").strip().lower() == "online"
 
+    def with_payload(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        valid = []
+        for row in items:
+            row_code = str(row.get("code") or "").strip()
+            if row_code in excluded:
+                continue
+            payload = _compose_vpn_payload_for_location(dict(row))
+            if payload and _config_is_complete(payload):
+                valid.append(row)
+        return valid
 
-def _virtual_strict_candidate_pool(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    tiers = _virtual_selection_tiers(rows)
-    for want_reserve in _virtual_role_order(code):
-        for tier in tiers:
-            scoped = [row for row in tier if bool(row.get("is_reserve")) == want_reserve]
-            if scoped:
-                # Hard rule: do not mix weaker tiers into a stronger tier, and do
-                # not let reserve rows win for Auto | Fastest while there is at
-                # least one usable primary row in any stronger or weaker tier.
-                return list(scoped[: max(1, VIRTUAL_LOCATION_POOL_SIZE)])
+    def by_codes(codes: List[str]) -> List[Dict[str, Any]]:
+        order = {code_item: idx for idx, code_item in enumerate(codes)}
+        found = [row for row in rows if is_online(row) and str(row.get("code") or "") in order]
+        return sorted(with_payload(found), key=lambda row: order.get(str(row.get("code") or ""), 999))
+
+    def generic(predicate) -> List[Dict[str, Any]]:
+        return sorted(with_payload([row for row in rows if predicate(row)]), key=_location_speed_rank, reverse=True)
+
+    def measured(predicate) -> List[Dict[str, Any]]:
+        return generic(lambda row: predicate(row) and _speed_metrics_present(row))
+
+    def non_lte_main(row: Dict[str, Any]) -> bool:
+        return is_online(row) and not bool(row.get("is_reserve")) and not _is_lte_location(row)
+
+    def non_lte_reserve(row: Dict[str, Any]) -> bool:
+        return is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row)
+
+    def lte_main_row(row: Dict[str, Any]) -> bool:
+        return is_online(row) and not bool(row.get("is_reserve")) and _is_lte_location(row)
+
+    def lte_reserve_row(row: Dict[str, Any]) -> bool:
+        return is_online(row) and bool(row.get("is_reserve")) and _is_lte_location(row)
+
+    lte_main = by_codes([code_item for code_item in preferred_main_codes if code_item == "ru-lte"])
+    lte_reserve = by_codes([code_item for code_item in preferred_reserve_codes if code_item.startswith("ru-lte-")])
+    fast_main = by_codes([code_item for code_item in preferred_main_codes if code_item != "ru-lte"])
+    fast_reserve = by_codes([code_item for code_item in preferred_reserve_codes if not code_item.startswith("ru-lte-")])
+
+    if code == "auto-fastest":
+        return _dedupe_location_rows(
+            measured(non_lte_main)
+            + fast_main
+            + measured(non_lte_reserve)
+            + fast_reserve
+            + generic(lambda row: is_online(row) and bool(row.get("is_recommended")) and not _is_lte_location(row))
+            + generic(lambda row: is_online(row) and not _is_lte_location(row))
+            + lte_main
+            + lte_reserve
+            + generic(is_online)
+        )
+
+    if code == "auto-reserve":
+        # Reserve must prefer real reserve rows first. Only when there is no live reserve candidate
+        # do we fall back to ordinary main rows.
+        return _dedupe_location_rows(
+            measured(non_lte_reserve)
+            + fast_reserve
+            + generic(lambda row: is_online(row) and bool(row.get("is_reserve")) and not _is_lte_location(row))
+            + measured(lte_reserve_row)
+            + lte_reserve
+            + generic(lte_reserve_row)
+            + measured(non_lte_main)
+            + fast_main
+            + generic(lambda row: is_online(row) and not bool(row.get("is_reserve")) and not _is_lte_location(row))
+            + measured(lte_main_row)
+            + lte_main
+            + generic(lte_main_row)
+            + generic(is_online)
+        )
     return []
-
-
-def _virtual_role_preferred_pool(code: str, pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not pool:
-        return []
-
-    non_reserve = [row for row in pool if not bool(row.get("is_reserve"))]
-    reserve = [row for row in pool if bool(row.get("is_reserve"))]
-
-    # User expectation:
-    # - Auto | Fastest should first try real/manual/LTE locations and only fall
-    #   back to reserve rows when there is no better primary candidate.
-    # - Auto | Fastest Reserve should do the opposite and stay in the reserve
-    #   pool whenever at least one usable reserve candidate exists.
-    if code == "auto-fastest" and non_reserve:
-        return list(non_reserve)
-    if code == "auto-reserve" and reserve:
-        return list(reserve)
-    return list(pool)
 
 
 def _virtual_sibling_code(code: str) -> Optional[str]:
@@ -1298,48 +1255,12 @@ def _virtual_sibling_code(code: str) -> Optional[str]:
     return None
 
 
-def _virtual_row_health_band(row: Dict[str, Any]) -> int:
-    if _speed_ping_fresh(row):
-        return 0
-    if _speed_ping_present(row):
-        return 1
-    if _speed_metrics_present(row) and _speed_metrics_fresh(row):
-        return 2
-    if _speed_metrics_present(row):
-        return 3
-    return 4
-
-
-def _virtual_pool_best_quality(pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    if not pool:
-        return []
-    best_band = min(_virtual_row_health_band(row) for row in pool)
-    filtered = [row for row in pool if _virtual_row_health_band(row) == best_band]
-    ping_rows: List[Dict[str, Any]] = []
-    for row in filtered:
-        ping = _normalize_optional_int(row.get("ping_ms"))
-        if ping is not None and ping > 0:
-            ping_rows.append(row)
-    if ping_rows:
-        best_ping = min(_normalize_optional_int(row.get("ping_ms")) or 0 for row in ping_rows)
-        max_drift = max(60, int(VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS or 180))
-        near_best = [
-            row for row in ping_rows
-            if (_normalize_optional_int(row.get("ping_ms")) or 10**9) <= best_ping + max_drift
-        ]
-        if near_best:
-            return near_best
-        return ping_rows
-    return filtered
-
-
 def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
-    quality_pool = _virtual_pool_best_quality(pool)
-    if len(quality_pool) <= 3:
-        return list(quality_pool)
+    if len(pool) <= 3:
+        return list(pool)
 
-    primary = list(quality_pool[:3])
-    overflow = list(quality_pool[3:])
+    primary = list(pool[:3])
+    overflow = list(pool[3:])
     if not overflow:
         return primary
 
@@ -1353,68 +1274,6 @@ def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, in
     return primary
 
 
-def _virtual_row_load(row: Dict[str, Any], loads: Dict[str, int]) -> int:
-    return int(loads.get(str(row.get("code") or "").strip(), 0))
-
-
-def _virtual_row_not_overloaded(row: Dict[str, Any], loads: Dict[str, int], *, threshold: int = VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD) -> bool:
-    if not loads:
-        return True
-    min_load = min(int(value or 0) for value in loads.values()) if loads else 0
-    return _virtual_row_load(row, loads) <= min_load + max(0, int(threshold or 0))
-
-
-def _pick_balanced_virtual_candidate(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> Optional[Dict[str, Any]]:
-    if not pool:
-        return None
-    threshold = max(0, int(VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD or 0))
-    min_load = min(_virtual_row_load(row, loads) for row in pool) if pool else 0
-    for row in pool:
-        if _virtual_row_load(row, loads) <= min_load + threshold:
-            return row
-    return min(
-        enumerate(pool),
-        key=lambda item: (_virtual_row_load(item[1], loads), item[0]),
-    )[1]
-
-
-def _virtual_assignment_reusable(assigned_row: Dict[str, Any], best_row: Optional[Dict[str, Any]], loads: Dict[str, int]) -> bool:
-    if best_row is None:
-        return False
-    if not _virtual_row_not_overloaded(assigned_row, loads):
-        return False
-
-    assigned_band = _virtual_row_health_band(assigned_row)
-    best_band = _virtual_row_health_band(best_row)
-    if assigned_band != best_band:
-        return False
-
-    assigned_code = str(assigned_row.get("code") or "").strip()
-    best_code = str(best_row.get("code") or "").strip()
-    if assigned_code == best_code:
-        return True
-
-    assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
-    best_ping = _normalize_optional_int(best_row.get("ping_ms"))
-    assigned_has_fresh_ping = _speed_ping_fresh(assigned_row)
-    best_has_fresh_ping = _speed_ping_fresh(best_row)
-    if best_has_fresh_ping:
-        if not assigned_has_fresh_ping:
-            return False
-        if assigned_ping is None or best_ping is None:
-            return False
-        return assigned_ping <= best_ping + max(1, int(VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS or 1))
-
-    if _speed_ping_present(best_row):
-        if not _speed_ping_present(assigned_row):
-            return False
-        if assigned_ping is None or best_ping is None:
-            return False
-        return assigned_ping <= best_ping + max(20, int(VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS or 180))
-
-    return False
-
-
 def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     rows = list_locations(active_only=True)
     if not rows:
@@ -1424,13 +1283,14 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    pool = _virtual_strict_candidate_pool(code, rows)
-    if not pool:
-        pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
-    pool = _virtual_pool_best_quality(pool)
-    pool = _virtual_role_preferred_pool(code, pool)
-    if not pool:
-        return None
+    # Reserve virtual route should resolve to a real reserve candidate whenever at least one
+    # live reserve exists. Only then do we fall back to non-reserve rows.
+    if code == "auto-reserve":
+        reserve_ranked_candidates = [row for row in ranked_candidates if bool(row.get("is_reserve"))]
+        if reserve_ranked_candidates:
+            ranked_candidates = reserve_ranked_candidates
+
+    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not user_id:
         return pool[0]
 
@@ -1443,30 +1303,22 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
             if str(row.get("code") or "").strip() != sibling_assigned_code
         ]
         if sibling_filtered_pool:
-            pool = _virtual_pool_best_quality(sibling_filtered_pool)
-            pool = _virtual_role_preferred_pool(code, pool)
-            if not pool:
-                return None
-
-    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
+            pool = sibling_filtered_pool
 
     assigned_code = get_user_virtual_location_assignment(user_id, code)
     if assigned_code:
         sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
         if not sibling_collision:
-            best_row = pool[0] if pool else None
-            assigned_row = next((row for row in pool if str(row.get("code") or "").strip() == assigned_code), None)
-            if assigned_row is not None and _virtual_assignment_reusable(assigned_row, best_row, loads):
-                return assigned_row
+            for row in pool:
+                if str(row.get("code") or "").strip() == assigned_code:
+                    return row
 
-    effective_pool = _virtual_pool_best_quality(_prefer_primary_virtual_pool(pool, loads))
-    effective_pool = _virtual_role_preferred_pool(code, effective_pool)
-    if not effective_pool:
-        effective_pool = _virtual_pool_best_quality(pool)
-        effective_pool = _virtual_role_preferred_pool(code, effective_pool)
-    if not effective_pool:
-        return None
-    selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
+    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
+    effective_pool = _prefer_primary_virtual_pool(pool, loads)
+    selected = min(
+        enumerate(effective_pool),
+        key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
+    )[1]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
