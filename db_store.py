@@ -1136,6 +1136,14 @@ def _location_has_fresh_live_signal(row: Dict[str, Any], *, max_age_minutes: int
     return _speed_ping_fresh(row, max_age_minutes=max_age_minutes)
 
 
+def _location_payload_ready_for_publish(row: Dict[str, Any]) -> bool:
+    status = str(row.get("status") or "").strip().lower()
+    if status not in {"online", "reserve"}:
+        return False
+    payload = _compose_vpn_payload_for_location(dict(row))
+    return bool(payload) and _config_is_complete(payload)
+
+
 def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
     row_code = str(row.get("code") or "").strip()
     if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
@@ -1143,8 +1151,16 @@ def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
     return _location_has_fresh_live_signal(row)
 
 
+def _virtual_payload_ready_and_usable(row: Dict[str, Any]) -> bool:
+    row_code = str(row.get("code") or "").strip()
+    if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
+        return False
+    return _location_payload_ready_for_publish(row)
+
+
 def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
     usable_live = [row for row in rows if _virtual_live_and_usable(row)]
+    usable_ready = [row for row in rows if _virtual_payload_ready_and_usable(row)]
     fresh_ping = sorted(
         [row for row in usable_live if _speed_ping_fresh(row)],
         key=_virtual_ping_sort_key,
@@ -1159,11 +1175,18 @@ def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, 
         reverse=True,
     )
     all_live = sorted(usable_live, key=_location_speed_rank, reverse=True)
+    ready_with_ping = sorted(
+        [row for row in usable_ready if _speed_ping_present(row)],
+        key=_virtual_ping_sort_key,
+    )
+    ready_any = sorted(usable_ready, key=_location_speed_rank, reverse=True)
     return [
         _dedupe_location_rows(fresh_ping),
         _dedupe_location_rows(measured_ping),
         _dedupe_location_rows(fresh_measured),
         _dedupe_location_rows(all_live),
+        _dedupe_location_rows(ready_with_ping),
+        _dedupe_location_rows(ready_any),
     ]
 
 
@@ -2384,14 +2407,16 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         with db() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE AND status = 'online' LIMIT 1",
+                    "SELECT * FROM locations WHERE code = %s AND is_active = TRUE AND is_deleted = FALSE AND status IN ('online', 'reserve') LIMIT 1",
                     (location_code,),
                 )
                 row = cur.fetchone()
     if not row:
         raise ValueError("Location not found")
-    if location_code not in {"auto-fastest", "auto-reserve"} and not _location_has_fresh_live_signal(dict(row)):
-        raise ValueError("Location failed the last live tunnel check or the check is stale")
+    if location_code not in {"auto-fastest", "auto-reserve"}:
+        current_row = dict(row)
+        if not _location_has_fresh_live_signal(current_row) and not _location_payload_ready_for_publish(current_row):
+            raise ValueError("Location is offline or its VLESS config is incomplete")
 
     payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
     if not payload:
