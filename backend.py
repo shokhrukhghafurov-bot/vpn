@@ -2783,6 +2783,32 @@ def _subscription_cookie_value(request: Request, token: str) -> str:
 
 
 
+def _browser_like_subscription_preview_request(request: Request) -> bool:
+    client_id = _subscription_client_id_from_request(request)
+    if client_id:
+        return False
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    if client_hint in {"hiddify", "v2raytun", "happ", "nekobox", "nekoray", "sing-box", "singbox"}:
+        return False
+    platform, device_name = _detect_device_platform_and_name(request)
+    if _device_client_family(device_name) != "generic":
+        return False
+    ua = str(request.headers.get("user-agent") or "").strip().lower()
+    browser_tokens = ("mozilla/", "chrome/", "safari/", "firefox/", "edg/", "opr/", "opera/")
+    client_tokens = ("happ", "hiddify", "v2raytun", "nekobox", "nekoray", "sing-box", "singbox")
+    if not any(token in ua for token in browser_tokens):
+        return False
+    if any(token in ua for token in client_tokens):
+        return False
+    accept = str(request.headers.get("accept") or "").strip().lower()
+    sec_fetch_mode = str(request.headers.get("sec-fetch-mode") or "").strip().lower()
+    sec_fetch_dest = str(request.headers.get("sec-fetch-dest") or "").strip().lower()
+    if "text/html" in accept or sec_fetch_mode == "navigate" or sec_fetch_dest == "document":
+        return True
+    return platform in {"windows", "macos", "linux"}
+
+
+
 def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, Any]], gate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not gate or gate.get("allowed"):
         return gate
@@ -2823,7 +2849,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         if str(item.get("platform") or "").strip().lower() == normalized_platform
         and str(item.get("device_name") or "").strip() == normalized_name
     ]
-    if len(exact_matches) == 1:
+    if exact_matches:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2836,7 +2862,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         for item in devices
         if str(item.get("platform") or "").strip().lower() == normalized_platform
     ]
-    if len(same_platform_matches) == 1:
+    if same_platform_matches:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2854,7 +2880,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
         if same_family and compatible_client:
             same_family_matches.append(item)
-    if len(same_family_matches) == 1:
+    if same_family_matches:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -2883,6 +2909,8 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
 
 
 def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> None:
+    if _browser_like_subscription_preview_request(request):
+        return
     if not access or access.get("kind") != "user":
         return
     user = access.get("user") or {}
@@ -2901,6 +2929,8 @@ def _track_subscription_device_access(request: Request, token: str, access: Opti
 
 
 def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    if _browser_like_subscription_preview_request(request):
+        return {"allowed": True, "reason": "browser_preview", "detail": "Browser preview requests do not consume device slots"}
     if not access or access.get("kind") != "user":
         return None
     user = access.get("user") or {}
