@@ -1959,7 +1959,16 @@ def _device_client_family(device_name: Any) -> str:
 
 
 
-def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
+def _sort_devices_newest_first(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def _key(item: Dict[str, Any]) -> Tuple[str, str, int]:
+        last_seen = str(item.get("last_seen_at") or "")
+        created = str(item.get("created_at") or "")
+        return (last_seen, created, int(item.get("id") or 0))
+    return sorted(items, key=_key, reverse=True)
+
+
+
+def _select_soft_match_candidates(existing: List[Dict[str, Any]], platform: str, device_name: str) -> List[Dict[str, Any]]:
     normalized_platform = str(platform or "").strip().lower()
     normalized_name = str(device_name or "").strip()
     platform_family = _device_platform_family(normalized_platform)
@@ -1970,15 +1979,15 @@ def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, dev
         if str(item.get("platform") or "").strip().lower() == normalized_platform
         and str(item.get("device_name") or "").strip() == normalized_name
     ]
-    if len(exact_matches) == 1:
-        return exact_matches[0]
+    if exact_matches:
+        return _sort_devices_newest_first(exact_matches)
 
     same_platform = [
         item for item in existing
         if str(item.get("platform") or "").strip().lower() == normalized_platform
     ]
-    if len(same_platform) == 1:
-        return same_platform[0]
+    if same_platform:
+        return _sort_devices_newest_first(same_platform)
 
     same_family = []
     for item in existing:
@@ -1990,8 +1999,8 @@ def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, dev
         compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
         if compatible_family and compatible_client:
             same_family.append(item)
-    if len(same_family) == 1:
-        return same_family[0]
+    if same_family:
+        return _sort_devices_newest_first(same_family)
 
     if len(existing) == 1:
         only_item = existing[0]
@@ -2002,9 +2011,29 @@ def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, dev
         compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
         compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
         if compatible_family and compatible_client:
-            return only_item
+            return [only_item]
 
-    return None
+    return []
+
+
+
+def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
+    matches = _select_soft_match_candidates(existing, platform, device_name)
+    return matches[0] if matches else None
+
+
+
+def _deactivate_device_ids(device_ids: List[int]) -> None:
+    ids = [int(item) for item in device_ids if int(item) > 0]
+    if not ids:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE devices SET is_active = FALSE, last_seen_at = NOW() WHERE id = ANY(%s)",
+                (ids,),
+            )
+        conn.commit()
 
 
 def _upsert_device_record(
@@ -2043,28 +2072,33 @@ def _upsert_device_record(
                     row = cur.fetchone()
                 conn.commit()
             return dict(row) if row else None
+
+    soft_matches = _select_soft_match_candidates(existing, platform, device_name) if not enforce_limit else []
+    if soft_matches:
+        keeper = soft_matches[0]
+        duplicate_ids = [int(item.get("id") or 0) for item in soft_matches[1:] if int(item.get("id") or 0) > 0]
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET device_fingerprint = %s,
+                        platform = %s,
+                        device_name = %s,
+                        is_active = TRUE,
+                        last_seen_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (device_fingerprint, platform, device_name, keeper["id"]),
+                )
+                row = cur.fetchone()
+            conn.commit()
+        if duplicate_ids:
+            _deactivate_device_ids(duplicate_ids)
+        return dict(row) if row else None
+
     if len(existing) >= allowed_limit:
-        if not enforce_limit:
-            matched_item = _select_soft_match_device(existing, platform, device_name)
-            if matched_item:
-                with db() as conn:
-                    with conn.cursor() as cur:
-                        cur.execute(
-                            """
-                            UPDATE devices
-                            SET device_fingerprint = %s,
-                                platform = %s,
-                                device_name = %s,
-                                is_active = TRUE,
-                                last_seen_at = NOW()
-                            WHERE id = %s
-                            RETURNING *
-                            """,
-                            (device_fingerprint, platform, device_name, matched_item["id"]),
-                        )
-                        row = cur.fetchone()
-                    conn.commit()
-                return dict(row) if row else None
         if enforce_limit:
             raise PermissionError(f"Device limit reached ({allowed_limit})")
         return None
