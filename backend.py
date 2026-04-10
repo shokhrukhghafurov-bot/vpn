@@ -1774,8 +1774,14 @@ def on_startup() -> None:
             _run_black_refresh_safe(source="startup")
         except Exception as exc:
             _set_black_refresh_error(exc)
+    if bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)):
+        try:
+            _run_vpn_live_check_safe(source="startup", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
+        except Exception as exc:
+            _set_vpn_live_check_error(exc)
     _start_ru_lte_auto_refresh_loop()
     _start_black_auto_refresh_loop()
+    _start_vpn_live_check_auto_loop()
 
 
 app.add_middleware(
@@ -1792,6 +1798,16 @@ _LOCATIONS_CACHE_TTL_SEC = 5
 _locations_cache: Dict[str, Any] = {"expires_at": 0.0, "items": None}
 _ru_lte_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
 _black_refresh_state: Dict[str, Any] = {"last_success_at": None, "last_error": None, "last_error_at": None}
+_vpn_live_check_state: Dict[str, Any] = {
+    "last_success_at": None,
+    "last_error": None,
+    "last_error_at": None,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_source": None,
+    "last_summary": None,
+}
+_vpn_live_check_lock = threading.Lock()
 
 
 def _json_no_cache_headers(*, etag_seed: Optional[str] = None) -> Dict[str, str]:
@@ -1928,6 +1944,105 @@ def _start_black_auto_refresh_loop() -> None:
             time.sleep(max(5.0, sleep_for - elapsed))
 
     thread = threading.Thread(target=worker, name="black-auto-refresh", daemon=True)
+    thread.start()
+
+
+def _set_vpn_live_check_success(summary: Dict[str, Any], *, source: str) -> None:
+    _vpn_live_check_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_live_check_state["last_error"] = None
+    _vpn_live_check_state["last_error_at"] = None
+    _vpn_live_check_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_live_check_state["last_source"] = source
+    _vpn_live_check_state["last_summary"] = dict(summary)
+
+
+def _set_vpn_live_check_error(exc: Exception) -> None:
+    _vpn_live_check_state["last_error"] = str(exc)
+    _vpn_live_check_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_live_check_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_vpn_live_checks(*, source: str = "manual", active_only: bool = True) -> Dict[str, Any]:
+    rows = list_locations(active_only=False)
+    results: List[Dict[str, Any]] = []
+    tested_rows = 0
+    for row in rows:
+        code = str(row.get("code") or "").strip()
+        if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            logger.info("[vpn][probe] source=%s code=%s result=skipped reason=virtual_location", source, code or "unknown")
+            continue
+        if active_only and not bool(row.get("is_active")):
+            logger.info("[vpn][probe] source=%s code=%s result=skipped reason=inactive", source, code or "unknown")
+            continue
+        tested_rows += 1
+        results.append(_run_location_speed_test(row, source=source))
+    ok_count = sum(1 for item in results if item.get("status") == "ok")
+    error_count = sum(1 for item in results if item.get("status") == "error")
+    skipped_count = sum(1 for item in results if item.get("status") == "skipped")
+    summary = {
+        "ok": True,
+        "source": source,
+        "active_only": bool(active_only),
+        "tested": tested_rows,
+        "updated": ok_count,
+        "errors": error_count,
+        "skipped": skipped_count,
+        "items": results,
+    }
+    _invalidate_locations_cache()
+    logger.info(
+        "[vpn][probe][summary] source=%s tested=%s ok=%s errors=%s skipped=%s active_only=%s",
+        source,
+        tested_rows,
+        ok_count,
+        error_count,
+        skipped_count,
+        int(bool(active_only)),
+    )
+    return summary
+
+
+def _run_vpn_live_check_safe(*, source: str = "manual", active_only: bool = True) -> Dict[str, Any]:
+    if not _vpn_live_check_lock.acquire(blocking=False):
+        snapshot = dict(_vpn_live_check_state.get("last_summary") or {})
+        snapshot.update({"ok": True, "busy": True, "source": source, "active_only": bool(active_only)})
+        return snapshot
+    _vpn_live_check_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
+    try:
+        summary = _run_vpn_live_checks(source=source, active_only=active_only)
+        _set_vpn_live_check_success({k: v for k, v in summary.items() if k != "items"}, source=source)
+        return summary
+    except Exception as exc:
+        _set_vpn_live_check_error(exc)
+        raise
+    finally:
+        _vpn_live_check_lock.release()
+
+
+def _start_vpn_live_check_auto_loop() -> None:
+    if not bool(getattr(settings, "VPN_LIVE_CHECK_AUTO_ENABLED", True)):
+        return
+    interval_seconds = max(60, int(getattr(settings, "VPN_LIVE_CHECK_AUTO_MINUTES", 3) or 3) * 60)
+    retry_seconds = max(20, int(getattr(settings, "VPN_LIVE_CHECK_RETRY_SECONDS", 45) or 45))
+    initial_delay = interval_seconds if bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)) else 15
+    active_only = bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True))
+
+    def worker() -> None:
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+        while True:
+            started = time.monotonic()
+            degraded = False
+            try:
+                summary = _run_vpn_live_check_safe(source="auto", active_only=active_only)
+                degraded = bool(summary.get("errors")) or bool(summary.get("busy"))
+            except Exception:
+                degraded = True
+            elapsed = time.monotonic() - started
+            sleep_for = retry_seconds if degraded else interval_seconds
+            time.sleep(max(5.0, sleep_for - elapsed))
+
+    thread = threading.Thread(target=worker, name="vpn-live-check-auto", daemon=True)
     thread.start()
 
 
@@ -2378,7 +2493,7 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
             platform_item["issues"] = list(dict.fromkeys([live_state.get("text")] + platform_item.get("issues", [])))
             platform_item["fixes"] = list(dict.fromkeys(platform_item.get("fixes", []) + ([live_state.get("fix")] if live_state.get("fix") else [])))
         elif live_state.get("status") == "ready" and platform_item.get("status") == "ready":
-            platform_item["label"] = f"{platform_label}: live ok"
+            platform_item["label"] = f"{platform_label}: {live_state.get('label') or 'live ok'}"
 
     platform_items = (android, ios, windows, macos)
 
@@ -2425,6 +2540,7 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "live_publishable": bool(live_state.get("publishable")),
         "live_ping_ms": live_state.get("ping_ms"),
         "live_checked_at": checked_text,
+        "live_probe": dict((payload if isinstance(payload, dict) else {}).get("_last_live_probe") or {}),
         "preview_payload": payload if isinstance(payload, dict) else {},
         "preview_target_code": preview_target_code,
         "preview_target_name": preview_target_name,
@@ -2503,6 +2619,7 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["live_publishable"] = bool(diagnostics.get("live_publishable"))
     item["live_checked_at"] = diagnostics.get("live_checked_at")
     item["live_ping_ms"] = diagnostics.get("live_ping_ms")
+    item["live_probe"] = diagnostics.get("live_probe") or {}
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
@@ -4531,42 +4648,95 @@ def _probe_pool_for_location_code(code: str) -> str:
     return "generic"
 
 
-def _log_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> None:
+def _probe_payload_debug_fields(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if isinstance(payload, dict) else {}
+    public_key = str(normalized.get("public_key") or normalized.get("publicKey") or "").strip()
+    return {
+        "server": str(normalized.get("server") or "").strip(),
+        "port": _normalize_optional_int(normalized.get("port")),
+        "transport": _payload_transport(normalized),
+        "security": _payload_security(normalized),
+        "server_name": str(normalized.get("server_name") or normalized.get("sni") or "").strip(),
+        "public_key_len": len(public_key),
+        "short_id": str(normalized.get("short_id") or normalized.get("shortId") or "").strip(),
+        "flow": str(normalized.get("flow") or "").strip(),
+        "service_name": str(normalized.get("service_name") or normalized.get("serviceName") or "").strip(),
+        "path": str(normalized.get("path") or "").strip(),
+        "host": str(normalized.get("host") or "").strip(),
+    }
+
+
+def _probe_debug_summary(fields: Dict[str, Any]) -> str:
+    return (
+        f"server={fields.get('server') or '-'} "
+        f"port={fields.get('port') if fields.get('port') is not None else '-'} "
+        f"transport={fields.get('transport') or '-'} "
+        f"security={fields.get('security') or '-'} "
+        f"server_name={fields.get('server_name') or '-'} "
+        f"public_key_len={fields.get('public_key_len') or 0} "
+        f"short_id={fields.get('short_id') or '-'} "
+        f"flow={fields.get('flow') or '-'} "
+        f"service_name={fields.get('service_name') or '-'} "
+        f"path={fields.get('path') or '-'} "
+        f"host={fields.get('host') or '-'}"
+    )
+
+
+def _log_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any], *, source: str = "manual") -> None:
     code = str(row.get("code") or "").strip() or "unknown"
     method = str(probe.get("method") or "")
     reason = str(probe.get("error") or "")
+    real_probe_error = str(probe.get("real_probe_error") or "")
     latency_ms = probe.get("latency_ms")
     labels = ",".join(str(item) for item in (probe.get("probe_labels_ok") or []))
     urls = ",".join(str(item) for item in (probe.get("probe_urls_ok") or []))
     payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get("vpn_payload") or {})
-    transport = _payload_transport(payload)
-    server = str(payload.get("server") or "")
+    debug_fields = _probe_payload_debug_fields(payload)
     probe_url = str(probe.get("probe_url") or "")
+    debug_summary = _probe_debug_summary(debug_fields)
     if probe.get("ok"):
         logger.info(
-            "[vpn][probe] code=%s result=ok method=%s transport=%s server=%s latency_ms=%s labels=%s probe_url=%s urls=%s",
-            code, method, transport, server, latency_ms, labels or "-", probe_url or "-", urls or "-",
+            "[vpn][probe] source=%s code=%s result=ok method=%s latency_ms=%s labels=%s probe_url=%s urls=%s %s",
+            source,
+            code,
+            method,
+            latency_ms,
+            labels or "-",
+            probe_url or "-",
+            urls or "-",
+            debug_summary,
         )
     else:
         logger.warning(
-            "[vpn][probe] code=%s result=error method=%s transport=%s server=%s reason=%s labels=%s probe_url=%s urls=%s",
-            code, method, transport, server, reason or "unknown", labels or "-", probe_url or "-", urls or "-",
+            "[vpn][probe] source=%s code=%s result=error method=%s reason=%s real_probe_error=%s labels=%s probe_url=%s urls=%s %s",
+            source,
+            code,
+            method,
+            reason or "unknown",
+            real_probe_error or "-",
+            labels or "-",
+            probe_url or "-",
+            urls or "-",
+            debug_summary,
         )
 
 
-def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> Dict[str, Any]:
+def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any], *, source: str = "manual") -> Dict[str, Any]:
     checked_iso = datetime.now(timezone.utc).isoformat()
     payload = dict(row.get("vpn_payload") or {})
+    effective_payload = _compose_vpn_payload_for_location(dict(row)) or payload
     probe_ok = bool(probe.get("ok"))
     payload["_last_live_probe"] = {
         "ok": probe_ok,
         "at": checked_iso,
+        "source": str(source or "manual"),
         "method": str(probe.get("method") or ""),
         "probe_url": str(probe.get("probe_url") or ""),
         "probe_urls_ok": list(probe.get("probe_urls_ok") or []),
         "probe_labels_ok": list(probe.get("probe_labels_ok") or []),
         "error": str(probe.get("error") or ""),
         "real_probe_error": str(probe.get("real_probe_error") or ""),
+        "debug": _probe_payload_debug_fields(effective_payload),
     }
     patch: Dict[str, Any] = {
         "ping_ms": int(probe.get("latency_ms") or 0) or None if probe_ok else None,
@@ -4580,7 +4750,7 @@ def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> 
     return item
 
 
-def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
+def _run_location_speed_test(row: Dict[str, Any], *, source: str = "manual") -> Dict[str, Any]:
     code = str(row.get("code") or "")
     is_active = bool(row.get("is_active"))
     result: Dict[str, Any] = {
@@ -4602,13 +4772,17 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
         result["reason"] = "payload_incomplete"
         return result
 
-    probe = _generic_probe_candidate(payload, pool=_probe_pool_for_location_code(code), tcp_timeout=float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
-    _log_location_probe_result(row, probe)
+    pool = _probe_pool_for_location_code(code)
+    tcp_timeout = float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4) if pool == "ru_lte" else float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4)
+    probe = _generic_probe_candidate(payload, pool=pool, tcp_timeout=tcp_timeout)
+    _log_location_probe_result(row, probe, source=source)
     previous_status = str(row.get("status") or "")
     previous_ping_ms = _normalize_optional_int(row.get("ping_ms"))
-    item = _store_location_probe_result(row, probe)
+    item = _store_location_probe_result(row, probe, source=source)
     result.update({
         "status": "ok" if probe.get("ok") else "error",
+        "source": source,
+        "debug_fields": _probe_payload_debug_fields(payload),
         "method": probe.get("method"),
         "probe_url": probe.get("probe_url"),
         "probe_urls_ok": probe.get("probe_urls_ok") or [],
@@ -4640,20 +4814,7 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations/speed-test")
 def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    rows = list_locations(active_only=False)
-    results = [_run_location_speed_test(row) for row in rows]
-    ok_count = sum(1 for item in results if item.get("status") == "ok")
-    error_count = sum(1 for item in results if item.get("status") == "error")
-    skipped_count = sum(1 for item in results if item.get("status") == "skipped")
-    _invalidate_locations_cache()
-    return {
-        "ok": True,
-        "tested": len(results),
-        "updated": ok_count,
-        "errors": error_count,
-        "skipped": skipped_count,
-        "items": results,
-    }
+    return _run_vpn_live_check_safe(source="manual", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
 
 @app.post("/api/infra/admin/vpn/locations/refresh-ru-lte")
 def admin_refresh_ru_lte(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
@@ -4679,6 +4840,11 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
         "black_refresh": dict(_black_refresh_state),
         "black_auto_refresh_enabled": bool(settings.BLACK_AUTO_REFRESH_ENABLED),
         "black_auto_refresh_minutes": max(1, int(settings.BLACK_AUTO_REFRESH_MINUTES or 30)),
+        "vpn_live_check": dict(_vpn_live_check_state),
+        "vpn_live_check_on_startup": bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)),
+        "vpn_live_check_auto_enabled": bool(getattr(settings, "VPN_LIVE_CHECK_AUTO_ENABLED", True)),
+        "vpn_live_check_auto_minutes": max(1, int(getattr(settings, "VPN_LIVE_CHECK_AUTO_MINUTES", 3) or 3)),
+        "vpn_live_check_active_only": bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)),
     }
 
 
