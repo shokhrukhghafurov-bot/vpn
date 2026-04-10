@@ -72,6 +72,7 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
 
 VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
 VIRTUAL_LOCATION_POOL_SIZE = 5
+VIRTUAL_LOCATION_FRESH_CHECK_MINUTES = 15
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1093,6 +1094,45 @@ def _speed_metrics_present(row: Dict[str, Any]) -> bool:
     )
 
 
+def _speed_metrics_fresh(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_LOCATION_FRESH_CHECK_MINUTES) -> bool:
+    checked_at = _normalize_optional_timestamp(row.get("speed_checked_at"))
+    if checked_at is None:
+        return False
+    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+    return age <= timedelta(minutes=max(1, int(max_age_minutes or 1)))
+
+
+def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
+    row_code = str(row.get("code") or "").strip()
+    if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
+        return False
+    status = str(row.get("status") or "").strip().lower()
+    if status not in {"online", "reserve"}:
+        return False
+    payload = _compose_vpn_payload_for_location(dict(row))
+    return bool(payload and _config_is_complete(payload))
+
+
+def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
+    usable_live = [row for row in rows if _virtual_live_and_usable(row)]
+    fresh_measured = sorted(
+        [row for row in usable_live if _speed_metrics_present(row) and _speed_metrics_fresh(row)],
+        key=_location_speed_rank,
+        reverse=True,
+    )
+    measured = sorted(
+        [row for row in usable_live if _speed_metrics_present(row)],
+        key=_location_speed_rank,
+        reverse=True,
+    )
+    all_live = sorted(usable_live, key=_location_speed_rank, reverse=True)
+    return [
+        _dedupe_location_rows(fresh_measured),
+        _dedupe_location_rows(measured),
+        _dedupe_location_rows(all_live),
+    ]
+
+
 def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     unique: List[Dict[str, Any]] = []
     seen: set[str] = set()
@@ -1167,41 +1207,13 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
 
 
 def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    excluded = {"auto-fastest", "auto-reserve"}
-
-    def is_live(row: Dict[str, Any]) -> bool:
-        return str(row.get("status") or "").strip().lower() in {"online", "reserve"}
-
-    def usable(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-        valid: List[Dict[str, Any]] = []
-        for row in items:
-            row_code = str(row.get("code") or "").strip()
-            if not row_code or row_code in excluded:
-                continue
-            payload = _compose_vpn_payload_for_location(dict(row))
-            if payload and _config_is_complete(payload):
-                valid.append(row)
-        return valid
-
-    def ranked(predicate) -> List[Dict[str, Any]]:
-        filtered = usable([row for row in rows if predicate(row)])
-        return sorted(filtered, key=_location_speed_rank, reverse=True)
-
-    def ranked_measured(predicate) -> List[Dict[str, Any]]:
-        return ranked(lambda row: predicate(row) and _speed_metrics_present(row))
-
-    def is_any_live(row: Dict[str, Any]) -> bool:
-        return is_live(row)
-
     if code in {"auto-fastest", "auto-reserve"}:
-        # Both virtual rows now compete across the same global live pool:
+        # Both virtual rows compete across the same global live pool:
         # ordinary manual locations, LTE rows, and reserve rows together.
-        # auto-fastest will take the best live candidate;
-        # auto-reserve will take the next best different live candidate via sibling filtering.
-        return _dedupe_location_rows(
-            ranked_measured(is_any_live)
-            + ranked(is_any_live)
-        )
+        # But we strongly prefer candidates with fresh speed/liveness data;
+        # stale assignments should not pin auto rows to a dead server.
+        tiers = _virtual_selection_tiers(rows)
+        return _dedupe_location_rows([row for tier in tiers for row in tier])
     return []
 
 
@@ -1241,7 +1253,14 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
+    tiers = _virtual_selection_tiers(rows)
+    pool: List[Dict[str, Any]] = []
+    for tier in tiers:
+        if tier:
+            pool = tier[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
+            break
+    if not pool:
+        pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not user_id:
         return pool[0]
 
