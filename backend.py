@@ -1747,8 +1747,16 @@ def refresh_black_locations() -> Dict[str, Any]:
 
 
 
+def require_admin(credentials: HTTPBasicCredentials = Depends(basic_security)) -> str:
+    valid_user = _safe_compare_secret(credentials.username, settings.ADMIN_BASIC_USER)
+    valid_pass = _safe_compare_secret(credentials.password, settings.ADMIN_BASIC_PASS)
+    if not (valid_user and valid_pass):
+        raise HTTPException(status_code=401, detail="Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
+    return credentials.username
+
+
 @app.get("/api/infra/admin/vpn/debug/probe-runtime")
-def admin_probe_runtime(credentials: HTTPBasicCredentials = Depends(require_admin_basic)) -> Dict[str, Any]:
+def admin_probe_runtime(credentials: HTTPBasicCredentials = Depends(require_admin)) -> Dict[str, Any]:
     return {"ok": True, **_probe_binary_status()}
 
 
@@ -2114,14 +2122,6 @@ def require_code_issuer(x_auth_code_secret: Optional[str] = Header(default=None)
         return True
     raise HTTPException(status_code=401, detail="Invalid code issuer secret")
 
-
-
-def require_admin(credentials: HTTPBasicCredentials = Depends(basic_security)) -> str:
-    valid_user = _safe_compare_secret(credentials.username, settings.ADMIN_BASIC_USER)
-    valid_pass = _safe_compare_secret(credentials.password, settings.ADMIN_BASIC_PASS)
-    if not (valid_user and valid_pass):
-        raise HTTPException(status_code=401, detail="Invalid admin credentials", headers={"WWW-Authenticate": "Basic"})
-    return credentials.username
 
 
 def _flag_emoji(country_code: Optional[str]) -> str:
