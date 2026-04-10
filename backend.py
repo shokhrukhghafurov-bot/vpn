@@ -163,6 +163,9 @@ class LocationIn(BaseModel):
     is_active: bool = True
     is_recommended: bool = False
     is_reserve: bool = False
+    active: Optional[bool] = None
+    recommended: Optional[bool] = None
+    reserve: Optional[bool] = None
     status: str = "online"
     sort_order: int = 100
     download_mbps: Optional[float] = None
@@ -179,6 +182,9 @@ class LocationPatchIn(BaseModel):
     is_active: Optional[bool] = None
     is_recommended: Optional[bool] = None
     is_reserve: Optional[bool] = None
+    active: Optional[bool] = None
+    recommended: Optional[bool] = None
+    reserve: Optional[bool] = None
     status: Optional[str] = None
     sort_order: Optional[int] = None
     download_mbps: Optional[float] = None
@@ -506,9 +512,6 @@ def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[st
         reasons.append("grpc_missing_service_name")
     if transport in {"ws", "websocket"} and not path:
         reasons.append("ws_missing_path")
-    if pool == "ru_lte" and security == "reality" and not short_id:
-        reasons.append("missing_short_id")
-
     return reasons
 
 
@@ -2096,10 +2099,8 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
             issues.append("Reality public_key is missing or still contains a placeholder")
         if not sni or _diagnostic_placeholder(sni):
             issues.append("Reality server_name / sni is missing or still contains a placeholder")
-        if not short_id or _diagnostic_placeholder(short_id):
-            issues.append("Reality short_id is missing or still contains a placeholder")
         if any(issue.startswith("Reality ") for issue in issues):
-            fixes.append("For Reality fill real public_key, short_id, and server_name/sni values.")
+            fixes.append("For Reality fill real public_key and server_name/sni values.")
 
     if transport in {"grpc"} and (not service_name or _diagnostic_placeholder(service_name)):
         issues.append("gRPC service_name is missing or still contains a placeholder")
@@ -2134,7 +2135,6 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         "uuid is missing or still contains a placeholder",
         "Reality public_key is missing or still contains a placeholder",
         "Reality server_name / sni is missing or still contains a placeholder",
-        "Reality short_id is missing or still contains a placeholder",
         "connect_mode must be tun",
     )
     fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
@@ -2258,6 +2258,11 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "preview_payload": payload if isinstance(payload, dict) else {},
         "preview_target_code": preview_target_code,
         "preview_target_name": preview_target_name,
+        "preview_target_status": preview_row.get("status"),
+        "preview_download_mbps": preview_row.get("download_mbps"),
+        "preview_upload_mbps": preview_row.get("upload_mbps"),
+        "preview_ping_ms": preview_row.get("ping_ms"),
+        "preview_speed_checked_at": preview_row.get("speed_checked_at"),
         "preview_is_virtual": is_virtual,
     }
 
@@ -2316,12 +2321,31 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
     item["resolved_target_code"] = diagnostics.get("preview_target_code")
     item["resolved_target_name"] = diagnostics.get("preview_target_name")
+    if str(item.get("code") or "").strip() in PUBLIC_VIRTUAL_LOCATION_CODES and diagnostics.get("preview_target_code"):
+        item["status"] = diagnostics.get("preview_target_status") or item.get("status")
+        item["download_mbps"] = diagnostics.get("preview_download_mbps")
+        item["upload_mbps"] = diagnostics.get("preview_upload_mbps")
+        item["ping_ms"] = diagnostics.get("preview_ping_ms")
+        item["speed_checked_at"] = diagnostics.get("preview_speed_checked_at")
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
         item["tun_diagnostics"] = diagnostics
     return item
 
+
+
+def _normalize_admin_location_input(data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(data or {})
+    alias_pairs = (
+        ("active", "is_active"),
+        ("recommended", "is_recommended"),
+        ("reserve", "is_reserve"),
+    )
+    for alias_key, canonical_key in alias_pairs:
+        if canonical_key not in normalized and alias_key in normalized:
+            normalized[canonical_key] = normalized.get(alias_key)
+    return normalized
 
 
 def _bot_public_url() -> str:
@@ -2976,8 +3000,12 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
             or payload_for_subscription.get("resolved_location_code")
             or "VLESS"
         ).strip() or "VLESS"
-        payload_for_subscription["remark"] = f"{virtual_name} → {resolved_name}"
-        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+        virtual_remark = f"{virtual_name} → {resolved_name}"
+        payload_for_subscription["remark"] = virtual_remark
+        payload_for_subscription["display_name"] = virtual_remark
+        decorated_virtual_remark = _subscription_remark_for_row(row, payload_for_subscription)
+        payload_for_subscription["remark"] = decorated_virtual_remark
+        payload_for_subscription["display_name"] = decorated_virtual_remark
     else:
         payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
         payload_for_subscription["display_name"] = payload_for_subscription["remark"]
@@ -4229,7 +4257,7 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
     try:
-        item = create_location(payload.model_dump())
+        item = create_location(_normalize_admin_location_input(payload.model_dump(exclude_none=True)))
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4241,7 +4269,7 @@ def admin_locations_create(payload: LocationIn, admin_name: str = Depends(requir
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
 def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    data = {key: value for key, value in payload.model_dump().items() if value is not None}
+    data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
     try:
         item = patch_location(location_id, data)
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
