@@ -75,6 +75,7 @@ VIRTUAL_LOCATION_POOL_SIZE = 5
 VIRTUAL_LOCATION_FRESH_CHECK_MINUTES = 15
 VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS = 120
 VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD = 1
+VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS = 180
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1252,12 +1253,48 @@ def _virtual_sibling_code(code: str) -> Optional[str]:
     return None
 
 
-def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
-    if len(pool) <= 3:
-        return list(pool)
+def _virtual_row_health_band(row: Dict[str, Any]) -> int:
+    if _speed_ping_fresh(row):
+        return 0
+    if _speed_ping_present(row):
+        return 1
+    if _speed_metrics_present(row) and _speed_metrics_fresh(row):
+        return 2
+    if _speed_metrics_present(row):
+        return 3
+    return 4
 
-    primary = list(pool[:3])
-    overflow = list(pool[3:])
+
+def _virtual_pool_best_quality(pool: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    if not pool:
+        return []
+    best_band = min(_virtual_row_health_band(row) for row in pool)
+    filtered = [row for row in pool if _virtual_row_health_band(row) == best_band]
+    ping_rows: List[Dict[str, Any]] = []
+    for row in filtered:
+        ping = _normalize_optional_int(row.get("ping_ms"))
+        if ping is not None and ping > 0:
+            ping_rows.append(row)
+    if ping_rows:
+        best_ping = min(_normalize_optional_int(row.get("ping_ms")) or 0 for row in ping_rows)
+        max_drift = max(60, int(VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS or 180))
+        near_best = [
+            row for row in ping_rows
+            if (_normalize_optional_int(row.get("ping_ms")) or 10**9) <= best_ping + max_drift
+        ]
+        if near_best:
+            return near_best
+        return ping_rows
+    return filtered
+
+
+def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
+    quality_pool = _virtual_pool_best_quality(pool)
+    if len(quality_pool) <= 3:
+        return list(quality_pool)
+
+    primary = list(quality_pool[:3])
+    overflow = list(quality_pool[3:])
     if not overflow:
         return primary
 
@@ -1319,6 +1356,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     sibling_code = _virtual_sibling_code(code)
     sibling_assigned_code = get_user_virtual_location_assignment(user_id, sibling_code) if sibling_code else None
 
+    pool = _virtual_pool_best_quality(pool)
     if sibling_assigned_code:
         sibling_filtered_pool = [
             row for row in pool
@@ -1326,6 +1364,7 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
         ]
         if sibling_filtered_pool:
             pool = sibling_filtered_pool
+            pool = _virtual_pool_best_quality(pool)
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
 
@@ -1351,7 +1390,9 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
                 elif best_row is not None and str(best_row.get("code") or "").strip() == assigned_code:
                     return assigned_row
 
-    effective_pool = _prefer_primary_virtual_pool(pool, loads)
+    effective_pool = _virtual_pool_best_quality(_prefer_primary_virtual_pool(pool, loads))
+    if not effective_pool:
+        effective_pool = _virtual_pool_best_quality(pool)
     selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
