@@ -512,9 +512,6 @@ def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[st
         reasons.append("grpc_missing_service_name")
     if transport in {"ws", "websocket"} and not path:
         reasons.append("ws_missing_path")
-    if pool == "ru_lte" and security == "reality" and not short_id:
-        reasons.append("missing_short_id")
-
     return reasons
 
 
@@ -2102,10 +2099,8 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
             issues.append("Reality public_key is missing or still contains a placeholder")
         if not sni or _diagnostic_placeholder(sni):
             issues.append("Reality server_name / sni is missing or still contains a placeholder")
-        if not short_id or _diagnostic_placeholder(short_id):
-            issues.append("Reality short_id is missing or still contains a placeholder")
         if any(issue.startswith("Reality ") for issue in issues):
-            fixes.append("For Reality fill real public_key, short_id, and server_name/sni values.")
+            fixes.append("For Reality fill real public_key and server_name/sni values.")
 
     if transport in {"grpc"} and (not service_name or _diagnostic_placeholder(service_name)):
         issues.append("gRPC service_name is missing or still contains a placeholder")
@@ -2140,7 +2135,6 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         "uuid is missing or still contains a placeholder",
         "Reality public_key is missing or still contains a placeholder",
         "Reality server_name / sni is missing or still contains a placeholder",
-        "Reality short_id is missing or still contains a placeholder",
         "connect_mode must be tun",
     )
     fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
