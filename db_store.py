@@ -1190,39 +1190,17 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
     def ranked_measured(predicate) -> List[Dict[str, Any]]:
         return ranked(lambda row: predicate(row) and _speed_metrics_present(row))
 
-    def is_main(row: Dict[str, Any]) -> bool:
-        return is_live(row) and not bool(row.get("is_reserve"))
+    def is_any_live(row: Dict[str, Any]) -> bool:
+        return is_live(row)
 
-    def is_reserve(row: Dict[str, Any]) -> bool:
-        return is_live(row) and bool(row.get("is_reserve"))
-
-    if code == "auto-fastest":
-        # Main auto row should prefer live non-reserve locations first:
-        # manual locations, LTE main, and regular fast main rows.
-        # Reserve rows are used only as a fallback when there is no live main candidate.
-        main_candidates = _dedupe_location_rows(
-            ranked_measured(is_main)
-            + ranked(is_main)
-        )
-        if main_candidates:
-            return main_candidates
+    if code in {"auto-fastest", "auto-reserve"}:
+        # Both virtual rows now compete across the same global live pool:
+        # ordinary manual locations, LTE rows, and reserve rows together.
+        # auto-fastest will take the best live candidate;
+        # auto-reserve will take the next best different live candidate via sibling filtering.
         return _dedupe_location_rows(
-            ranked_measured(is_reserve)
-            + ranked(is_reserve)
-        )
-
-    if code == "auto-reserve":
-        # Reserve row must choose the fastest live reserve first. Only if there is no live
-        # reserve candidate at all do we fall back to ordinary main rows.
-        reserve_candidates = _dedupe_location_rows(
-            ranked_measured(is_reserve)
-            + ranked(is_reserve)
-        )
-        if reserve_candidates:
-            return reserve_candidates
-        return _dedupe_location_rows(
-            ranked_measured(is_main)
-            + ranked(is_main)
+            ranked_measured(is_any_live)
+            + ranked(is_any_live)
         )
     return []
 
@@ -1262,13 +1240,6 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     ranked_candidates = _virtual_location_candidates(code, rows)
     if not ranked_candidates:
         return None
-
-    # Reserve virtual route should resolve to a real reserve candidate whenever at least one
-    # live reserve exists. Only then do we fall back to non-reserve rows.
-    if code == "auto-reserve":
-        reserve_ranked_candidates = [row for row in ranked_candidates if bool(row.get("is_reserve"))]
-        if reserve_ranked_candidates:
-            ranked_candidates = reserve_ranked_candidates
 
     pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not user_id:
