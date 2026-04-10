@@ -1126,15 +1126,21 @@ def _virtual_ping_sort_key(row: Dict[str, Any]) -> tuple:
     return (ping_rank, reserve_rank, recommended_rank, -download, -upload, sort_order, name_rank)
 
 
-def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
-    row_code = str(row.get("code") or "").strip()
-    if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
-        return False
+def _location_has_fresh_live_signal(row: Dict[str, Any], *, max_age_minutes: int = VIRTUAL_LOCATION_FRESH_CHECK_MINUTES) -> bool:
     status = str(row.get("status") or "").strip().lower()
     if status not in {"online", "reserve"}:
         return False
     payload = _compose_vpn_payload_for_location(dict(row))
-    return bool(payload and _config_is_complete(payload))
+    if not (payload and _config_is_complete(payload)):
+        return False
+    return _speed_ping_fresh(row, max_age_minutes=max_age_minutes)
+
+
+def _virtual_live_and_usable(row: Dict[str, Any]) -> bool:
+    row_code = str(row.get("code") or "").strip()
+    if not row_code or row_code in {"auto-fastest", "auto-reserve"}:
+        return False
+    return _location_has_fresh_live_signal(row)
 
 
 def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, Any]]]:
@@ -2384,6 +2390,8 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
                 row = cur.fetchone()
     if not row:
         raise ValueError("Location not found")
+    if location_code not in {"auto-fastest", "auto-reserve"} and not _location_has_fresh_live_signal(dict(row)):
+        raise ValueError("Location failed the last live tunnel check or the check is stale")
 
     payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
     if not payload:
