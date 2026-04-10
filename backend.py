@@ -2264,6 +2264,11 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "preview_payload": payload if isinstance(payload, dict) else {},
         "preview_target_code": preview_target_code,
         "preview_target_name": preview_target_name,
+        "preview_target_status": preview_row.get("status"),
+        "preview_download_mbps": preview_row.get("download_mbps"),
+        "preview_upload_mbps": preview_row.get("upload_mbps"),
+        "preview_ping_ms": preview_row.get("ping_ms"),
+        "preview_speed_checked_at": preview_row.get("speed_checked_at"),
         "preview_is_virtual": is_virtual,
     }
 
@@ -2322,6 +2327,12 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     item["vpn_payload_complete"] = bool(resolved_payload) and _config_is_complete(resolved_payload)
     item["resolved_target_code"] = diagnostics.get("preview_target_code")
     item["resolved_target_name"] = diagnostics.get("preview_target_name")
+    if str(item.get("code") or "").strip() in PUBLIC_VIRTUAL_LOCATION_CODES and diagnostics.get("preview_target_code"):
+        item["status"] = diagnostics.get("preview_target_status") or item.get("status")
+        item["download_mbps"] = diagnostics.get("preview_download_mbps")
+        item["upload_mbps"] = diagnostics.get("preview_upload_mbps")
+        item["ping_ms"] = diagnostics.get("preview_ping_ms")
+        item["speed_checked_at"] = diagnostics.get("preview_speed_checked_at")
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
