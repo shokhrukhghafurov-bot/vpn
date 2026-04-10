@@ -1760,28 +1760,38 @@ def admin_probe_runtime(credentials: HTTPBasicCredentials = Depends(require_admi
     return {"ok": True, **_probe_binary_status()}
 
 
-@app.on_event("startup")
-def on_startup() -> None:
-    bootstrap()
-    _log_probe_binary_status()
+def _run_startup_background_tasks() -> None:
+    logger.info("[vpn][startup] background_tasks_started=1")
     if settings.RU_LTE_REFRESH_ON_STARTUP:
         try:
             _run_ru_lte_refresh_safe(source="startup")
         except Exception as exc:
+            logger.exception("[vpn][startup] ru_lte_refresh_failed: %s", exc)
             _set_ru_lte_refresh_error(exc)
     if settings.BLACK_REFRESH_ON_STARTUP:
         try:
             _run_black_refresh_safe(source="startup")
         except Exception as exc:
+            logger.exception("[vpn][startup] black_refresh_failed: %s", exc)
             _set_black_refresh_error(exc)
     if bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)):
         try:
             _run_vpn_live_check_safe(source="startup", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
         except Exception as exc:
+            logger.exception("[vpn][startup] live_check_failed: %s", exc)
             _set_vpn_live_check_error(exc)
+    logger.info("[vpn][startup] background_tasks_finished=1")
+
+
+@app.on_event("startup")
+def on_startup() -> None:
+    bootstrap()
+    _log_probe_binary_status()
     _start_ru_lte_auto_refresh_loop()
     _start_black_auto_refresh_loop()
     _start_vpn_live_check_auto_loop()
+    thread = threading.Thread(target=_run_startup_background_tasks, name="vpn-startup-tasks", daemon=True)
+    thread.start()
 
 
 app.add_middleware(
