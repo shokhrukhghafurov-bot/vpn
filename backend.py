@@ -596,6 +596,43 @@ def _probe_candidate_with_timeout(payload: Dict[str, Any], timeout_seconds: floa
     return {"ok": False, "latency_ms": None, "error": last_error or "connect_failed"}
 
 
+def _probe_binary_status() -> Dict[str, Any]:
+    runner_name, runner_bin = _resolve_probe_runner()
+    xray_raw = str(getattr(settings, "VPN_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray"
+    singbox_raw = str(getattr(settings, "VPN_REAL_PROBE_SINGBOX_BIN", "sing-box") or "sing-box").strip() or "sing-box"
+    xray_path = shutil.which(xray_raw) or (xray_raw if xray_raw.startswith("/") and Path(xray_raw).is_file() else None)
+    singbox_path = shutil.which(singbox_raw) or (singbox_raw if singbox_raw.startswith("/") and Path(singbox_raw).is_file() else None)
+    resolved_path = runner_bin if runner_bin and Path(runner_bin).is_file() else None
+
+    version = ""
+    if resolved_path:
+        try:
+            output = subprocess.check_output([resolved_path, "version"], stderr=subprocess.STDOUT, timeout=8)
+            version = (output.decode(errors="ignore").splitlines() or [""])[0].strip()
+        except Exception as exc:
+            version = f"version_check_failed:{exc}"
+
+    return {
+        "runner": runner_name,
+        "resolved_path": resolved_path,
+        "version": version,
+        "xray_path": xray_path,
+        "singbox_path": singbox_path,
+    }
+
+
+def _log_probe_binary_status() -> None:
+    info = _probe_binary_status()
+    logging.info(
+        "[vpn][probe-runtime] runner=%s resolved=%s xray=%s singbox=%s version=%s",
+        info.get("runner") or "-",
+        info.get("resolved_path") or "missing",
+        info.get("xray_path") or "missing",
+        info.get("singbox_path") or "missing",
+        info.get("version") or "-",
+    )
+
+
 def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
     runner = str(getattr(settings, "VPN_REAL_PROBE_RUNNER", "auto") or "auto").strip().lower() or "auto"
     if runner not in {"xray", "sing-box", "singbox", "auto"}:
@@ -1711,6 +1748,7 @@ def refresh_black_locations() -> Dict[str, Any]:
 @app.on_event("startup")
 def on_startup() -> None:
     bootstrap()
+    _log_probe_binary_status()
     if settings.RU_LTE_REFRESH_ON_STARTUP:
         try:
             _run_ru_lte_refresh_safe(source="startup")
