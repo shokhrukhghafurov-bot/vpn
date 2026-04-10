@@ -2924,55 +2924,69 @@ def _row_live_probe_state(row: Dict[str, Any]) -> Dict[str, Any]:
             'age_minutes': None,
             'fix': 'Bring the node back online and rerun the live tunnel probe.',
         }
+    payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get('vpn_payload') or {})
+    last_probe = payload.get('_last_live_probe') if isinstance(payload, dict) else {}
+    if not isinstance(last_probe, dict):
+        last_probe = {}
+    probe_method = str(last_probe.get('method') or '').strip().lower()
+    used_tcp_fallback = probe_method == 'tcp_fallback'
     ping_ms = _normalize_optional_int(row.get('ping_ms'))
     checked_at = _normalize_optional_timestamp(row.get('speed_checked_at'))
     if checked_at is None:
         return {
             'status': 'warning',
-            'label': 'no live check',
-            'text': 'no live tunnel check has been recorded yet',
+            'label': 'no connectivity check',
+            'text': 'no connectivity check has been recorded yet',
             'reason': 'never_checked',
             'publishable': False,
             'fresh': False,
             'ping_ms': ping_ms,
             'checked_at': None,
             'age_minutes': None,
-            'fix': 'Run Speed-test / live validation so the backend can verify the tunnel through YouTube, Instagram and Telegram targets.',
+            'fix': 'Run Speed-test / live validation so the backend can verify the node. If the real tunnel runner is unavailable, the backend will fall back to a TCP reachability check.',
         }
     age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
     age_minutes = int(max(0, age.total_seconds()) // 60)
     max_age_minutes = _live_probe_max_age_minutes()
+    failed_label = 'tcp check failed' if used_tcp_fallback else 'live check failed'
+    failed_text = 'the last tcp reachability check failed' if used_tcp_fallback else 'the last live tunnel check failed'
+    stale_text = f"tcp reachability check is stale ({age_minutes} min old)" if used_tcp_fallback else f"live tunnel check is stale ({age_minutes} min old)"
+    ok_label = 'tcp reachable' if used_tcp_fallback else 'live ok'
+    ok_text = f'tcp reachability check passed ({ping_ms} ms)' if used_tcp_fallback else f'real tunnel check passed ({ping_ms} ms)'
+    ok_reason = 'tcp_ok' if used_tcp_fallback else 'live_ok'
+    failed_fix = 'Replace the node or payload and rerun the connectivity check.' if used_tcp_fallback else 'Replace the node or payload and rerun the live tunnel probe.'
+    stale_fix = 'Refresh the location and rerun the connectivity check before publishing it to clients.' if used_tcp_fallback else 'Refresh the location and rerun the live tunnel probe before publishing it to clients.'
     if ping_ms is None or ping_ms <= 0:
         return {
             'status': 'error',
-            'label': 'live check failed',
-            'text': 'the last live tunnel check failed',
+            'label': failed_label,
+            'text': failed_text,
             'reason': 'last_probe_failed',
             'publishable': False,
             'fresh': False,
             'ping_ms': ping_ms,
             'checked_at': checked_at,
             'age_minutes': age_minutes,
-            'fix': 'Replace the node or payload and rerun the live tunnel probe.',
+            'fix': failed_fix,
         }
     if age > timedelta(minutes=max_age_minutes):
         return {
             'status': 'warning',
-            'label': 'live check stale',
-            'text': f'live tunnel check is stale ({age_minutes} min old)',
+            'label': 'connectivity check stale' if used_tcp_fallback else 'live check stale',
+            'text': stale_text,
             'reason': 'stale_probe',
             'publishable': False,
             'fresh': False,
             'ping_ms': ping_ms,
             'checked_at': checked_at,
             'age_minutes': age_minutes,
-            'fix': 'Refresh the location and rerun the live tunnel probe before publishing it to clients.',
+            'fix': stale_fix,
         }
     return {
         'status': 'ready',
-        'label': 'live ok',
-        'text': f'real tunnel check passed ({ping_ms} ms)',
-        'reason': 'live_ok',
+        'label': ok_label,
+        'text': ok_text,
+        'reason': ok_reason,
         'publishable': True,
         'fresh': True,
         'ping_ms': ping_ms,
