@@ -587,9 +587,9 @@ def _probe_candidate_with_timeout(payload: Dict[str, Any], timeout_seconds: floa
 
 
 def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
-    runner = str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray").strip().lower() or "xray"
+    runner = str(getattr(settings, "VPN_REAL_PROBE_RUNNER", "auto") or "auto").strip().lower() or "auto"
     if runner not in {"xray", "sing-box", "singbox", "auto"}:
-        runner = "xray"
+        runner = "auto"
 
     def _resolve_path(raw_value: str, default_name: str) -> Optional[str]:
         raw = str(raw_value or default_name).strip() or default_name
@@ -598,8 +598,8 @@ def _resolve_probe_runner() -> Tuple[str, Optional[str]]:
             return str(probe_path) if probe_path.is_file() else None
         return shutil.which(raw)
 
-    xray_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray"), "xray")
-    singbox_bin = _resolve_path(getattr(settings, "RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"), "sing-box")
+    xray_bin = _resolve_path(getattr(settings, "VPN_REAL_PROBE_XRAY_BIN", "xray"), "xray")
+    singbox_bin = _resolve_path(getattr(settings, "VPN_REAL_PROBE_SINGBOX_BIN", "sing-box"), "sing-box")
 
     if runner == "auto":
         if xray_bin:
@@ -642,10 +642,11 @@ def _wait_for_local_socks_port(port: int, timeout_sec: float) -> bool:
 
 def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
     transport = _payload_transport(payload)
+    security = _payload_security(payload)
     server_name = str(payload.get("server_name") or payload.get("sni") or payload.get("host") or "").strip()
     user: Dict[str, Any] = {
         "id": str(payload.get("uuid") or "").strip(),
-        "encryption": "none",
+        "encryption": str(payload.get("encryption") or "none").strip() or "none",
     }
     flow = str(payload.get("flow") or "").strip()
     if flow:
@@ -653,19 +654,33 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
 
     stream_settings: Dict[str, Any] = {
         "network": transport if transport not in {"websocket"} else "ws",
-        "security": "reality",
-        "realitySettings": {
+    }
+    if security == "reality":
+        stream_settings["security"] = "reality"
+        stream_settings["realitySettings"] = {
             "show": False,
             "serverName": server_name,
             "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
             "publicKey": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
             "shortId": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
             "spiderX": str(payload.get("path") or "/").strip() or "/",
-        },
-    }
+        }
+    elif security == "tls":
+        stream_settings["security"] = "tls"
+        tls_settings: Dict[str, Any] = {
+            "serverName": server_name,
+            "allowInsecure": bool(payload.get("allow_insecure") or payload.get("allowInsecure") or False),
+        }
+        alpn = [str(item or "").strip() for item in (payload.get("alpn") or []) if str(item or "").strip()]
+        if alpn:
+            tls_settings["alpn"] = alpn
+        stream_settings["tlsSettings"] = tls_settings
+    else:
+        stream_settings["security"] = "none"
+
     if transport == "grpc":
         stream_settings["grpcSettings"] = {
-            "serviceName": str(payload.get("service_name") or "").strip(),
+            "serviceName": str(payload.get("service_name") or payload.get("serviceName") or "").strip(),
             "multiMode": False,
         }
     elif transport in {"ws", "websocket"}:
@@ -718,7 +733,7 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
         "outbounds": [
             {
                 "tag": "proxy",
-                "protocol": "vless",
+                "protocol": str(payload.get("protocol") or "vless").strip() or "vless",
                 "settings": {
                     "vnext": [
                         {
@@ -739,35 +754,43 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
 
 def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
     transport = _payload_transport(payload)
+    security = _payload_security(payload)
     server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
     outbound: Dict[str, Any] = {
-        "type": "vless",
+        "type": str(payload.get("protocol") or "vless").strip() or "vless",
         "tag": "proxy",
         "server": str(payload.get("server") or "").strip(),
         "server_port": int(payload.get("port") or 0),
         "uuid": str(payload.get("uuid") or "").strip(),
-        "packet_encoding": str(payload.get("packet_encoding") or "xudp").strip() or "xudp",
-        "tls": {
+        "packet_encoding": str(payload.get("packet_encoding") or payload.get("packetEncoding") or "xudp").strip() or "xudp",
+    }
+    if security in {"tls", "reality"}:
+        outbound["tls"] = {
             "enabled": True,
             "server_name": server_name,
             "utls": {
                 "enabled": True,
                 "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
             },
-            "reality": {
+        }
+        if security == "reality":
+            outbound["tls"]["reality"] = {
                 "enabled": True,
                 "public_key": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
                 "short_id": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
-            },
-        },
-    }
+            }
+        alpn = [str(item or "").strip() for item in (payload.get("alpn") or []) if str(item or "").strip()]
+        if alpn:
+            outbound["tls"]["alpn"] = alpn
+        if security == "tls":
+            outbound["tls"]["insecure"] = bool(payload.get("allow_insecure") or payload.get("allowInsecure") or False)
     flow = str(payload.get("flow") or "").strip()
     if flow:
         outbound["flow"] = flow
     if transport == "grpc":
         outbound["transport"] = {
             "type": "grpc",
-            "service_name": str(payload.get("service_name") or "").strip(),
+            "service_name": str(payload.get("service_name") or payload.get("serviceName") or "").strip(),
         }
     elif transport in {"ws", "websocket"}:
         transport_payload: Dict[str, Any] = {
@@ -777,6 +800,13 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
         host = str(payload.get("host") or "").strip()
         if host:
             transport_payload["headers"] = {"Host": host}
+        outbound["transport"] = transport_payload
+    elif transport == "xhttp":
+        transport_payload = {
+            "type": "httpupgrade",
+            "path": str(payload.get("path") or "/").strip() or "/",
+            "host": [str(payload.get("host") or server_name or "").strip()] if str(payload.get("host") or server_name or "").strip() else [],
+        }
         outbound["transport"] = transport_payload
 
     dns_remote_addr = str((payload.get("dns_servers") or ["1.1.1.1"])[0] or "1.1.1.1").strip() or "1.1.1.1"
@@ -815,8 +845,8 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
 
 
 def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
-    connect_timeout = max(2, int(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
-    max_time = max(connect_timeout + 1, int(getattr(settings, "RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12) or 12))
+    connect_timeout = max(2, int(getattr(settings, "VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
+    max_time = max(connect_timeout + 1, int(getattr(settings, "VPN_REAL_PROBE_MAX_TIME_SEC", 12) or 12))
     command = [
         "curl",
         "--silent",
@@ -850,49 +880,85 @@ def _run_curl_through_socks(url: str, socks_port: int) -> Dict[str, Any]:
     return {"ok": True, "latency_ms": latency_ms, "http_code": http_code}
 
 
-def _ru_lte_candidate_probe_urls(payload: Dict[str, Any]) -> List[str]:
-    candidates: List[str] = []
+def _probe_target_label(value: str) -> str:
+    raw = str(value or "").strip().lower()
+    if not raw:
+        return "probe"
+    try:
+        host = urlsplit(raw).hostname or raw
+    except Exception:
+        host = raw
+    if "youtube" in host:
+        return "youtube"
+    if "instagram" in host:
+        return "instagram"
+    if "telegram" in host:
+        return "telegram"
+    if host.endswith("vk.com") or host == "vk.com":
+        return "vk"
+    if host.endswith("ya.ru") or host == "ya.ru" or host.endswith("yandex.ru"):
+        return "ya"
+    return host
 
-    def _append(value: Any) -> None:
-        text = str(value or "").strip()
-        if not text:
+
+def _append_probe_url(targets: List[Tuple[str, str]], seen: set[str], value: Any) -> None:
+    text = str(value or "").strip()
+    if not text:
+        return
+    if text.startswith(("http://", "https://")):
+        url = text
+    else:
+        host = text.split("/")[0].strip()
+        if not host or ":" in host or " " in host:
             return
-        if text.startswith(("http://", "https://")):
-            url = text
-        else:
-            host = text.split("/")[0].strip()
-            if not host or ":" in host or " " in host:
-                return
-            url = f"https://{host}/"
-        if url not in candidates:
-            candidates.append(url)
-
-    _append(payload.get("host"))
-    _append(payload.get("server_name") or payload.get("sni"))
-    for item in (getattr(settings, "RU_LTE_REAL_PROBE_URLS", []) or []):
-        _append(item)
-    return candidates
+        url = f"https://{host}/"
+    if url in seen:
+        return
+    seen.add(url)
+    targets.append((_probe_target_label(url), url))
 
 
-def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _candidate_probe_targets(payload: Dict[str, Any], *, pool: str = "generic") -> List[Tuple[str, str]]:
+    targets: List[Tuple[str, str]] = []
+    seen: set[str] = set()
+    for value in (
+        payload.get("host"),
+        payload.get("server_name") or payload.get("sni"),
+        payload.get("server"),
+    ):
+        _append_probe_url(targets, seen, value)
+    for item in (getattr(settings, "VPN_REAL_PROBE_URLS", []) or []):
+        _append_probe_url(targets, seen, item)
+    if pool == "ru_lte":
+        for item in (getattr(settings, "VPN_REAL_PROBE_RU_EXTRA_URLS", []) or []):
+            _append_probe_url(targets, seen, item)
+    return targets
+
+
+def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "generic") -> Dict[str, Any]:
     runner_name, runner_bin = _resolve_probe_runner()
     transport = _payload_transport(payload)
     if transport == "xhttp" and runner_name == "singbox":
-        xray_bin = shutil.which(str(getattr(settings, "RU_LTE_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray")
+        xray_bin = shutil.which(str(getattr(settings, "VPN_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray")
         if xray_bin:
             runner_name, runner_bin = "xray", xray_bin
     if not runner_bin:
         return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
 
-    urls = _ru_lte_candidate_probe_urls(payload)
-    if not urls:
+    targets = _candidate_probe_targets(payload, pool=pool)
+    if not targets:
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
+    required_successes = max(1, int(getattr(settings, "VPN_REAL_PROBE_MIN_SUCCESS", 2) or 2))
+    required_successes = min(required_successes, len(targets))
     socks_port = _pick_free_local_port()
-    warmup_ms = max(0, int(getattr(settings, "RU_LTE_REAL_PROBE_WARMUP_MS", 1200) or 1200))
+    warmup_ms = max(0, int(getattr(settings, "VPN_REAL_PROBE_WARMUP_MS", 1200) or 1200))
+    startup_timeout = max(2.0, float(getattr(settings, "VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
     process: Optional[subprocess.Popen[str]] = None
     stdout_tail = ""
-    with tempfile.TemporaryDirectory(prefix="inet_ru_lte_probe_") as temp_dir:
+    successes: List[Tuple[str, str, Optional[int]]] = []
+    failures: List[str] = []
+    with tempfile.TemporaryDirectory(prefix=f"inet_{pool}_probe_") as temp_dir:
         config_path = Path(temp_dir) / "config.json"
         if runner_name == "singbox":
             config_payload = _build_singbox_ru_lte_probe_config(payload, socks_port)
@@ -902,28 +968,41 @@ def _probe_ru_lte_candidate_via_real_tunnel(payload: Dict[str, Any]) -> Dict[str
             command = [runner_bin, "-config", str(config_path)]
         config_path.write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
-            process = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
-            if not _wait_for_local_socks_port(socks_port, max(2.0, float(getattr(settings, "RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))):
+            process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+            if not _wait_for_local_socks_port(socks_port, startup_timeout):
                 if process.poll() is not None:
                     stdout_tail = (process.stdout.read() if process.stdout else "").strip()[-700:]
                     return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real"}
                 return {"ok": False, "latency_ms": None, "error": "socks_not_ready", "method": f"{runner_name}_real"}
             if warmup_ms > 0:
                 time.sleep(warmup_ms / 1000.0)
-            last_error = "probe_failed"
-            for url in urls:
+            for label, url in targets:
                 result = _run_curl_through_socks(url, socks_port)
                 if result.get("ok"):
-                    result["method"] = f"{runner_name}_real"
-                    result["probe_url"] = url
-                    return result
-                last_error = str(result.get("error") or last_error)
-            return {"ok": False, "latency_ms": None, "error": last_error, "method": f"{runner_name}_real"}
+                    successes.append((label, url, result.get("latency_ms")))
+                    if len({item[0] for item in successes}) >= required_successes:
+                        latencies = [int(item[2]) for item in successes if item[2] is not None]
+                        latency_ms = int(sum(latencies) / len(latencies)) if latencies else None
+                        primary_url = successes[0][1] if successes else None
+                        return {
+                            "ok": True,
+                            "latency_ms": latency_ms,
+                            "method": f"{runner_name}_real",
+                            "probe_url": primary_url,
+                            "probe_labels_ok": [item[0] for item in successes],
+                            "probe_urls_ok": [item[1] for item in successes],
+                        }
+                else:
+                    failures.append(f"{label}:{result.get('error') or 'probe_failed'}")
+            return {
+                "ok": False,
+                "latency_ms": None,
+                "error": f"real_probe_not_enough_success:{len({item[0] for item in successes})}/{required_successes}"
+                         + (f"; {' | '.join(failures[:4])}" if failures else ""),
+                "method": f"{runner_name}_real",
+                "probe_labels_ok": [item[0] for item in successes],
+                "probe_urls_ok": [item[1] for item in successes],
+            }
         except subprocess.TimeoutExpired:
             return {"ok": False, "latency_ms": None, "error": "real_probe_timeout", "method": f"{runner_name}_real"}
         except Exception as exc:
@@ -995,22 +1074,24 @@ def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
     return transport in allowed if allowed else True
 
 
-def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _probe_candidate_with_timeout(payload, float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
-
-
-def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
-    if bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)):
-        real_probe = _probe_ru_lte_candidate_via_real_tunnel(payload)
+def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout: float) -> Dict[str, Any]:
+    if bool(getattr(settings, "VPN_REAL_PROBE_ENABLED", True)):
+        real_probe = _probe_candidate_via_real_tunnel(payload, pool=pool)
         if real_probe.get("ok"):
             return real_probe
-        if bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)):
+        if bool(getattr(settings, "VPN_REAL_PROBE_REQUIRED", True)):
             return real_probe
-
-    fallback_probe = _probe_candidate_with_timeout(payload, float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
+    fallback_probe = _probe_candidate_with_timeout(payload, float(tcp_timeout or 4))
     fallback_probe["method"] = "tcp_fallback"
     return fallback_probe
 
+
+def _black_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _generic_probe_candidate(payload, pool="black", tcp_timeout=float(settings.BLACK_CONNECT_TIMEOUT_SEC or 4))
+
+
+def _ru_lte_probe_candidate(payload: Dict[str, Any]) -> Dict[str, Any]:
+    return _generic_probe_candidate(payload, pool="ru_lte", tcp_timeout=float(settings.RU_LTE_CONNECT_TIMEOUT_SEC or 4))
 
 def _ru_lte_payload_score(payload: Dict[str, Any]) -> int:
     score = 0
@@ -1787,11 +1868,7 @@ def _public_concrete_location_allowed(row: Dict[str, Any]) -> bool:
     code = str(row.get("code") or "").strip()
     if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
         return False
-    if not _location_status_is_online(row):
-        return False
-    if not _row_has_ready_payload(row):
-        return False
-    return True
+    return _subscription_row_has_fresh_live_signal(row)
 
 
 def _public_location_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
@@ -2218,6 +2295,16 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
     windows = _build_tun_platform_diagnostics(payload, "Windows")
     macos = _build_tun_platform_diagnostics(payload, "macOS")
 
+    live_state = _row_live_probe_state(preview_row)
+    for platform_item, platform_label in ((android, "Android"), (ios, "iOS"), (windows, "Windows"), (macos, "macOS")):
+        if live_state.get("status") != "ready" and platform_item.get("status") == "ready":
+            platform_item["status"] = live_state.get("status") or "warning"
+            platform_item["label"] = f"{platform_label}: {live_state.get('label') or 'check required'}"
+            platform_item["issues"] = list(dict.fromkeys([live_state.get("text")] + platform_item.get("issues", [])))
+            platform_item["fixes"] = list(dict.fromkeys(platform_item.get("fixes", []) + ([live_state.get("fix")] if live_state.get("fix") else [])))
+        elif live_state.get("status") == "ready" and platform_item.get("status") == "ready":
+            platform_item["label"] = f"{platform_label}: live ok"
+
     platform_items = (android, ios, windows, macos)
 
     summary_status = "ready"
@@ -2238,13 +2325,15 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         + windows.get("fixes", [])
         + macos.get("fixes", [])
     ))
+    checked_at = live_state.get("checked_at")
+    checked_text = checked_at.astimezone(timezone.utc).isoformat() if isinstance(checked_at, datetime) else None
     if summary_status == "ready":
         if is_virtual and preview_target_name and preview_target_code and preview_target_code != code:
-            summary_text = f"Virtual auto route is ready. Admin preview resolves to {preview_target_name}."
+            summary_text = f"Virtual auto route is live. Admin preview resolves to {preview_target_name}."
         else:
-            summary_text = "TUN payload is ready for Android, iOS, Windows, and macOS."
+            summary_text = live_state.get("text") or "Real tunnel check passed."
     else:
-        summary_text = "; ".join(issues[:4]) or "TUN payload needs attention."
+        summary_text = live_state.get("text") or "; ".join(issues[:4]) or "TUN payload needs attention."
 
     return {
         "summary_status": summary_status,
@@ -2255,6 +2344,12 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
         "ios": ios,
         "windows": windows,
         "macos": macos,
+        "live_status": live_state.get("status"),
+        "live_text": live_state.get("text"),
+        "live_reason": live_state.get("reason"),
+        "live_publishable": bool(live_state.get("publishable")),
+        "live_ping_ms": live_state.get("ping_ms"),
+        "live_checked_at": checked_text,
         "preview_payload": payload if isinstance(payload, dict) else {},
         "preview_target_code": preview_target_code,
         "preview_target_name": preview_target_name,
@@ -2327,6 +2422,12 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
         item["upload_mbps"] = diagnostics.get("preview_upload_mbps")
         item["ping_ms"] = diagnostics.get("preview_ping_ms")
         item["speed_checked_at"] = diagnostics.get("preview_speed_checked_at")
+    item["live_status"] = diagnostics.get("live_status")
+    item["live_text"] = diagnostics.get("live_text")
+    item["live_reason"] = diagnostics.get("live_reason")
+    item["live_publishable"] = bool(diagnostics.get("live_publishable"))
+    item["live_checked_at"] = diagnostics.get("live_checked_at")
+    item["live_ping_ms"] = diagnostics.get("live_ping_ms")
     if include_payload:
         item["vpn_payload"] = normalized_payload
         item["resolved_vpn_payload"] = resolved_payload
@@ -2760,6 +2861,95 @@ def _normalize_optional_timestamp(value: Any) -> Optional[datetime]:
     except ValueError:
         return None
     return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def _live_probe_max_age_minutes() -> int:
+    return max(1, int(getattr(settings, 'SUBSCRIPTION_STRICT_FRESH_PING_MINUTES', 20) or 20))
+
+
+def _row_live_probe_state(row: Dict[str, Any]) -> Dict[str, Any]:
+    if not _row_has_ready_payload(row):
+        return {
+            'status': 'error',
+            'label': 'payload incomplete',
+            'text': 'vpn payload is incomplete',
+            'reason': 'payload_incomplete',
+            'publishable': False,
+            'fresh': False,
+            'ping_ms': None,
+            'checked_at': None,
+            'age_minutes': None,
+            'fix': 'Fill server, port, uuid and transport-specific fields, then run a live tunnel probe again.',
+        }
+    if not _location_status_is_online(row):
+        return {
+            'status': 'error',
+            'label': 'offline',
+            'text': 'location is marked offline',
+            'reason': 'offline',
+            'publishable': False,
+            'fresh': False,
+            'ping_ms': _normalize_optional_int(row.get('ping_ms')),
+            'checked_at': _normalize_optional_timestamp(row.get('speed_checked_at')),
+            'age_minutes': None,
+            'fix': 'Bring the node back online and rerun the live tunnel probe.',
+        }
+    ping_ms = _normalize_optional_int(row.get('ping_ms'))
+    checked_at = _normalize_optional_timestamp(row.get('speed_checked_at'))
+    if checked_at is None:
+        return {
+            'status': 'warning',
+            'label': 'no live check',
+            'text': 'no live tunnel check has been recorded yet',
+            'reason': 'never_checked',
+            'publishable': False,
+            'fresh': False,
+            'ping_ms': ping_ms,
+            'checked_at': None,
+            'age_minutes': None,
+            'fix': 'Run Speed-test / live validation so the backend can verify the tunnel through YouTube, Instagram and Telegram targets.',
+        }
+    age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
+    age_minutes = int(max(0, age.total_seconds()) // 60)
+    max_age_minutes = _live_probe_max_age_minutes()
+    if ping_ms is None or ping_ms <= 0:
+        return {
+            'status': 'error',
+            'label': 'live check failed',
+            'text': 'the last live tunnel check failed',
+            'reason': 'last_probe_failed',
+            'publishable': False,
+            'fresh': False,
+            'ping_ms': ping_ms,
+            'checked_at': checked_at,
+            'age_minutes': age_minutes,
+            'fix': 'Replace the node or payload and rerun the live tunnel probe.',
+        }
+    if age > timedelta(minutes=max_age_minutes):
+        return {
+            'status': 'warning',
+            'label': 'live check stale',
+            'text': f'live tunnel check is stale ({age_minutes} min old)',
+            'reason': 'stale_probe',
+            'publishable': False,
+            'fresh': False,
+            'ping_ms': ping_ms,
+            'checked_at': checked_at,
+            'age_minutes': age_minutes,
+            'fix': 'Refresh the location and rerun the live tunnel probe before publishing it to clients.',
+        }
+    return {
+        'status': 'ready',
+        'label': 'live ok',
+        'text': f'real tunnel check passed ({ping_ms} ms)',
+        'reason': 'live_ok',
+        'publishable': True,
+        'fresh': True,
+        'ping_ms': ping_ms,
+        'checked_at': checked_at,
+        'age_minutes': age_minutes,
+        'fix': '',
+    }
 
 
 def _subscription_browser_preview_request(request: Request) -> bool:
@@ -4243,9 +4433,41 @@ def _extract_speed_metrics(data: Any) -> Dict[str, Any]:
     }
 
 
+def _probe_pool_for_location_code(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("ru-lte"):
+        return "ru_lte"
+    if normalized.startswith("intl-fast"):
+        return "black"
+    return "generic"
+
+
+def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> Dict[str, Any]:
+    checked_iso = datetime.now(timezone.utc).isoformat()
+    payload = dict(row.get("vpn_payload") or {})
+    payload["_last_live_probe"] = {
+        "ok": bool(probe.get("ok")),
+        "at": checked_iso,
+        "method": str(probe.get("method") or ""),
+        "probe_url": str(probe.get("probe_url") or ""),
+        "probe_urls_ok": list(probe.get("probe_urls_ok") or []),
+        "probe_labels_ok": list(probe.get("probe_labels_ok") or []),
+        "error": str(probe.get("error") or ""),
+    }
+    patch: Dict[str, Any] = {
+        "status": "online" if probe.get("ok") else "offline",
+        "ping_ms": int(probe.get("latency_ms") or 0) or None,
+        "speed_checked_at": checked_iso,
+        "vpn_payload": payload,
+    }
+    if probe.get("ok"):
+        patch["is_active"] = True
+    item = patch_location(int(row.get("id")), patch)
+    return item
+
+
 def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
     code = str(row.get("code") or "")
-    status = str(row.get("status") or "").lower()
     is_active = bool(row.get("is_active"))
     result: Dict[str, Any] = {
         "id": row.get("id"),
@@ -4260,47 +4482,31 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
     if not is_active:
         result["reason"] = "inactive"
         return result
-    if status != "online":
-        result["reason"] = "not_online"
-        return result
 
     payload = _compose_vpn_payload_for_location(dict(row))
     if not payload or not _config_is_complete(payload):
         result["reason"] = "payload_incomplete"
         return result
 
-    url = _location_speed_test_url(row)
-    if not url:
-        result["reason"] = "speed_test_url_missing"
-        result["hint"] = "Set vpn_payload.speed_test_url or speed_test_host/scheme/path."
-        return result
-
-    try:
-        response = requests.get(url, timeout=12, headers={"Accept": "application/json"})
-        response.raise_for_status()
-        metrics = _extract_speed_metrics(response.json())
-        item = patch_location(int(row.get("id")), metrics)
-        result.update({
-            "status": "ok",
-            "url": url,
-            "metrics": {
-                "download_mbps": item.get("download_mbps"),
-                "upload_mbps": item.get("upload_mbps"),
-                "ping_ms": item.get("ping_ms"),
-                "speed_checked_at": (
-                    item.get("speed_checked_at").astimezone(timezone.utc).isoformat()
-                    if isinstance(item.get("speed_checked_at"), datetime)
-                    else item.get("speed_checked_at")
-                ),
-            },
-        })
-        return result
-    except requests.RequestException as exc:
-        result.update({"status": "error", "url": url, "reason": str(exc)})
-        return result
-    except ValueError as exc:
-        result.update({"status": "error", "url": url, "reason": str(exc)})
-        return result
+    probe = _probe_candidate_via_real_tunnel(payload, pool=_probe_pool_for_location_code(code))
+    item = _store_location_probe_result(row, probe)
+    result.update({
+        "status": "ok" if probe.get("ok") else "error",
+        "method": probe.get("method"),
+        "probe_url": probe.get("probe_url"),
+        "probe_urls_ok": probe.get("probe_urls_ok") or [],
+        "probe_labels_ok": probe.get("probe_labels_ok") or [],
+        "reason": probe.get("error"),
+        "metrics": {
+            "ping_ms": item.get("ping_ms"),
+            "speed_checked_at": (
+                item.get("speed_checked_at").astimezone(timezone.utc).isoformat()
+                if isinstance(item.get("speed_checked_at"), datetime)
+                else item.get("speed_checked_at")
+            ),
+        },
+    })
+    return result
 
 
 @app.post("/api/infra/admin/vpn/locations/speed-test")
