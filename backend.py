@@ -163,6 +163,9 @@ class LocationIn(BaseModel):
     is_active: bool = True
     is_recommended: bool = False
     is_reserve: bool = False
+    active: Optional[bool] = None
+    recommended: Optional[bool] = None
+    reserve: Optional[bool] = None
     status: str = "online"
     sort_order: int = 100
     download_mbps: Optional[float] = None
@@ -179,6 +182,9 @@ class LocationPatchIn(BaseModel):
     is_active: Optional[bool] = None
     is_recommended: Optional[bool] = None
     is_reserve: Optional[bool] = None
+    active: Optional[bool] = None
+    recommended: Optional[bool] = None
+    reserve: Optional[bool] = None
     status: Optional[str] = None
     sort_order: Optional[int] = None
     download_mbps: Optional[float] = None
@@ -2324,6 +2330,19 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
 
 
 
+def _normalize_admin_location_input(data: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(data or {})
+    alias_pairs = (
+        ("active", "is_active"),
+        ("recommended", "is_recommended"),
+        ("reserve", "is_reserve"),
+    )
+    for alias_key, canonical_key in alias_pairs:
+        if canonical_key not in normalized and alias_key in normalized:
+            normalized[canonical_key] = normalized.get(alias_key)
+    return normalized
+
+
 def _bot_public_url() -> str:
     bot_username = (settings.BOT_USERNAME or "").strip().lstrip("@")
     if bot_username:
@@ -2976,8 +2995,12 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
             or payload_for_subscription.get("resolved_location_code")
             or "VLESS"
         ).strip() or "VLESS"
-        payload_for_subscription["remark"] = f"{virtual_name} → {resolved_name}"
-        payload_for_subscription["display_name"] = payload_for_subscription["remark"]
+        virtual_remark = f"{virtual_name} → {resolved_name}"
+        payload_for_subscription["remark"] = virtual_remark
+        payload_for_subscription["display_name"] = virtual_remark
+        decorated_virtual_remark = _subscription_remark_for_row(row, payload_for_subscription)
+        payload_for_subscription["remark"] = decorated_virtual_remark
+        payload_for_subscription["display_name"] = decorated_virtual_remark
     else:
         payload_for_subscription["remark"] = _subscription_remark_for_row(row, payload_for_subscription)
         payload_for_subscription["display_name"] = payload_for_subscription["remark"]
@@ -4229,7 +4252,7 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
     try:
-        item = create_location(payload.model_dump())
+        item = create_location(_normalize_admin_location_input(payload.model_dump(exclude_none=True)))
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -4241,7 +4264,7 @@ def admin_locations_create(payload: LocationIn, admin_name: str = Depends(requir
 @app.patch("/api/infra/admin/vpn/locations/{location_id}")
 def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    data = {key: value for key, value in payload.model_dump().items() if value is not None}
+    data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
     try:
         item = patch_location(location_id, data)
         return {"ok": True, "item": serialize_location(item, include_payload=True)}
