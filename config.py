@@ -277,6 +277,17 @@ class Settings:
     RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6)
     RU_LTE_REAL_PROBE_MAX_TIME_SEC: int = _env_int("RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12)
     RU_LTE_REAL_PROBE_WARMUP_MS: int = _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200)
+    VPN_REAL_PROBE_ENABLED: bool = _env_bool("VPN_REAL_PROBE_ENABLED", True)
+    VPN_REAL_PROBE_REQUIRED: bool = _env_bool("VPN_REAL_PROBE_REQUIRED", True)
+    VPN_REAL_PROBE_RUNNER: str = os.getenv("VPN_REAL_PROBE_RUNNER", os.getenv("RU_LTE_REAL_PROBE_RUNNER", "auto"))
+    VPN_REAL_PROBE_XRAY_BIN: str = os.getenv("VPN_REAL_PROBE_XRAY_BIN", os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray"))
+    VPN_REAL_PROBE_SINGBOX_BIN: str = os.getenv("VPN_REAL_PROBE_SINGBOX_BIN", os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"))
+    VPN_REAL_PROBE_URLS: List[str] = None
+    VPN_REAL_PROBE_RU_EXTRA_URLS: List[str] = None
+    VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC: int = _env_int("VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC", _env_int("RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6))
+    VPN_REAL_PROBE_MAX_TIME_SEC: int = _env_int("VPN_REAL_PROBE_MAX_TIME_SEC", _env_int("RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12))
+    VPN_REAL_PROBE_WARMUP_MS: int = _env_int("VPN_REAL_PROBE_WARMUP_MS", _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200))
+    VPN_REAL_PROBE_MIN_SUCCESS: int = _env_int("VPN_REAL_PROBE_MIN_SUCCESS", 2)
     HIDDIFY_SUBSCRIPTION_ALLOWED_TRANSPORTS: List[str] = None
     HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS: float = _env_float("HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)  # normalized to whole hours for Hiddify headers
     SUBSCRIPTION_STRICT_FRESH_PING_MINUTES: int = _env_int("SUBSCRIPTION_STRICT_FRESH_PING_MINUTES", 20)
@@ -319,6 +330,16 @@ class Settings:
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
+                "https://www.vk.com/,https://ya.ru/",
+            )
+        if self.VPN_REAL_PROBE_URLS is None:
+            self.VPN_REAL_PROBE_URLS = _env_list(
+                "VPN_REAL_PROBE_URLS",
+                "https://www.youtube.com/generate_204,https://www.instagram.com/,https://web.telegram.org/,https://www.google.com/generate_204",
+            )
+        if self.VPN_REAL_PROBE_RU_EXTRA_URLS is None:
+            self.VPN_REAL_PROBE_RU_EXTRA_URLS = _env_list(
+                "VPN_REAL_PROBE_RU_EXTRA_URLS",
                 "https://www.vk.com/,https://ya.ru/",
             )
         if self.BLACK_ALLOWED_TRANSPORTS is None:
