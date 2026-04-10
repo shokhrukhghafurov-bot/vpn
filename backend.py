@@ -15,6 +15,7 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
+import logging
 
 
 import jwt
@@ -83,6 +84,8 @@ from db_store import (
 
 
 app = FastAPI(title=f"{settings.APP_NAME} VPN API")
+logger = logging.getLogger("inet.vpn")
+
 security = HTTPBearer(auto_error=False)
 basic_security = HTTPBasic()
 
@@ -1866,7 +1869,7 @@ def _start_black_auto_refresh_loop() -> None:
 
 
 def _location_status_is_online(row: Dict[str, Any]) -> bool:
-    return str(row.get("status") or "").strip().lower() == "online"
+    return str(row.get("status") or "").strip().lower() in {"online", "reserve"}
 
 
 def _public_location_code_allowed(code: str) -> bool:
@@ -1883,7 +1886,9 @@ def _public_concrete_location_allowed(row: Dict[str, Any]) -> bool:
     code = str(row.get("code") or "").strip()
     if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
         return False
-    return _subscription_row_has_fresh_live_signal(row)
+    if not _location_status_is_online(row):
+        return False
+    return _row_has_ready_payload(row)
 
 
 def _public_location_sort_key(row: Dict[str, Any]) -> Tuple[int, int, int, int, int, str]:
@@ -2279,13 +2284,13 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
                 preview_payload["remark"] = f"{virtual_name} → {resolved_name}"
                 preview_payload["display_name"] = preview_payload["remark"]
         else:
-            issue = "no live auto candidate available"
-            fix = "Bring at least one online concrete location with a complete payload so virtual auto routing can resolve."
+            issue = "no auto candidate available"
+            fix = "Bring at least one online concrete location with a complete payload. A fresh live check is preferred, but virtual auto routing can also fall back to payload-ready online nodes."
             platform_items = {}
             for platform_label in ("Android", "iOS", "Windows", "macOS"):
                 platform_items[platform_label.lower()] = {
                     "status": "error",
-                    "label": f"{platform_label}: no live candidate",
+                    "label": f"{platform_label}: no candidate",
                     "issues": [issue],
                     "fixes": [fix],
                 }
@@ -4457,11 +4462,35 @@ def _probe_pool_for_location_code(code: str) -> str:
     return "generic"
 
 
+def _log_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> None:
+    code = str(row.get("code") or "").strip() or "unknown"
+    method = str(probe.get("method") or "")
+    reason = str(probe.get("error") or "")
+    latency_ms = probe.get("latency_ms")
+    labels = ",".join(str(item) for item in (probe.get("probe_labels_ok") or []))
+    urls = ",".join(str(item) for item in (probe.get("probe_urls_ok") or []))
+    payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get("vpn_payload") or {})
+    transport = _payload_transport(payload)
+    server = str(payload.get("server") or "")
+    probe_url = str(probe.get("probe_url") or "")
+    if probe.get("ok"):
+        logger.info(
+            "[vpn][probe] code=%s result=ok method=%s transport=%s server=%s latency_ms=%s labels=%s probe_url=%s urls=%s",
+            code, method, transport, server, latency_ms, labels or "-", probe_url or "-", urls or "-",
+        )
+    else:
+        logger.warning(
+            "[vpn][probe] code=%s result=error method=%s transport=%s server=%s reason=%s labels=%s probe_url=%s urls=%s",
+            code, method, transport, server, reason or "unknown", labels or "-", probe_url or "-", urls or "-",
+        )
+
+
 def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> Dict[str, Any]:
     checked_iso = datetime.now(timezone.utc).isoformat()
     payload = dict(row.get("vpn_payload") or {})
+    probe_ok = bool(probe.get("ok"))
     payload["_last_live_probe"] = {
-        "ok": bool(probe.get("ok")),
+        "ok": probe_ok,
         "at": checked_iso,
         "method": str(probe.get("method") or ""),
         "probe_url": str(probe.get("probe_url") or ""),
@@ -4470,13 +4499,13 @@ def _store_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any]) -> 
         "error": str(probe.get("error") or ""),
     }
     patch: Dict[str, Any] = {
-        "status": "online" if probe.get("ok") else "offline",
-        "ping_ms": int(probe.get("latency_ms") or 0) or None,
+        "ping_ms": int(probe.get("latency_ms") or 0) or None if probe_ok else None,
         "speed_checked_at": checked_iso,
         "vpn_payload": payload,
     }
-    if probe.get("ok"):
-        patch["is_active"] = True
+    status = str(row.get("status") or "").strip().lower()
+    if probe_ok and status not in {"online", "reserve", "offline"}:
+        patch["status"] = "online"
     item = patch_location(int(row.get("id")), patch)
     return item
 
@@ -4504,6 +4533,9 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
         return result
 
     probe = _probe_candidate_via_real_tunnel(payload, pool=_probe_pool_for_location_code(code))
+    _log_location_probe_result(row, probe)
+    previous_status = str(row.get("status") or "")
+    previous_ping_ms = _normalize_optional_int(row.get("ping_ms"))
     item = _store_location_probe_result(row, probe)
     result.update({
         "status": "ok" if probe.get("ok") else "error",
@@ -4512,6 +4544,16 @@ def _run_location_speed_test(row: Dict[str, Any]) -> Dict[str, Any]:
         "probe_urls_ok": probe.get("probe_urls_ok") or [],
         "probe_labels_ok": probe.get("probe_labels_ok") or [],
         "reason": probe.get("error"),
+        "before": {
+            "status": previous_status,
+            "ping_ms": previous_ping_ms,
+        },
+        "after": {
+            "status": item.get("status"),
+            "ping_ms": item.get("ping_ms"),
+            "live_publishable": bool(_row_live_probe_state(item).get("publishable")),
+            "live_reason": _row_live_probe_state(item).get("reason"),
+        },
         "metrics": {
             "ping_ms": item.get("ping_ms"),
             "speed_checked_at": (
