@@ -1245,6 +1245,17 @@ def _virtual_location_candidates(code: str, rows: List[Dict[str, Any]]) -> List[
     return []
 
 
+def _virtual_strict_candidate_pool(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    tiers = _virtual_selection_tiers(rows)
+    for tier in tiers:
+        if tier:
+            # Hard rule: as soon as we have a stronger tier, do not mix in weaker
+            # rows. This prevents Auto | Fastest from sticking to stale / n-a
+            # configs when fresh live ping rows already exist.
+            return list(tier[: max(1, VIRTUAL_LOCATION_POOL_SIZE)])
+    return []
+
+
 def _virtual_sibling_code(code: str) -> Optional[str]:
     if code == "auto-fastest":
         return "auto-reserve"
@@ -1333,6 +1344,43 @@ def _pick_balanced_virtual_candidate(pool: List[Dict[str, Any]], loads: Dict[str
     )[1]
 
 
+def _virtual_assignment_reusable(assigned_row: Dict[str, Any], best_row: Optional[Dict[str, Any]], loads: Dict[str, int]) -> bool:
+    if best_row is None:
+        return False
+    if not _virtual_row_not_overloaded(assigned_row, loads):
+        return False
+
+    assigned_band = _virtual_row_health_band(assigned_row)
+    best_band = _virtual_row_health_band(best_row)
+    if assigned_band != best_band:
+        return False
+
+    assigned_code = str(assigned_row.get("code") or "").strip()
+    best_code = str(best_row.get("code") or "").strip()
+    if assigned_code == best_code:
+        return True
+
+    assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
+    best_ping = _normalize_optional_int(best_row.get("ping_ms"))
+    assigned_has_fresh_ping = _speed_ping_fresh(assigned_row)
+    best_has_fresh_ping = _speed_ping_fresh(best_row)
+    if best_has_fresh_ping:
+        if not assigned_has_fresh_ping:
+            return False
+        if assigned_ping is None or best_ping is None:
+            return False
+        return assigned_ping <= best_ping + max(1, int(VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS or 1))
+
+    if _speed_ping_present(best_row):
+        if not _speed_ping_present(assigned_row):
+            return False
+        if assigned_ping is None or best_ping is None:
+            return False
+        return assigned_ping <= best_ping + max(20, int(VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS or 180))
+
+    return False
+
+
 def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     rows = list_locations(active_only=True)
     if not rows:
@@ -1342,29 +1390,27 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    tiers = _virtual_selection_tiers(rows)
-    pool: List[Dict[str, Any]] = []
-    for tier in tiers:
-        if tier:
-            pool = tier[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
-            break
+    pool = _virtual_strict_candidate_pool(rows)
     if not pool:
         pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
+    pool = _virtual_pool_best_quality(pool)
+    if not pool:
+        return None
     if not user_id:
         return pool[0]
 
     sibling_code = _virtual_sibling_code(code)
     sibling_assigned_code = get_user_virtual_location_assignment(user_id, sibling_code) if sibling_code else None
 
-    pool = _virtual_pool_best_quality(pool)
     if sibling_assigned_code:
         sibling_filtered_pool = [
             row for row in pool
             if str(row.get("code") or "").strip() != sibling_assigned_code
         ]
         if sibling_filtered_pool:
-            pool = sibling_filtered_pool
-            pool = _virtual_pool_best_quality(pool)
+            pool = _virtual_pool_best_quality(sibling_filtered_pool)
+            if not pool:
+                return None
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
 
@@ -1374,25 +1420,14 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
         if not sibling_collision:
             best_row = pool[0] if pool else None
             assigned_row = next((row for row in pool if str(row.get("code") or "").strip() == assigned_code), None)
-            if assigned_row is not None and _virtual_row_not_overloaded(assigned_row, loads):
-                assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
-                best_ping = _normalize_optional_int(best_row.get("ping_ms")) if best_row is not None else None
-                best_has_fresh_ping = bool(best_row and _speed_ping_fresh(best_row))
-                assigned_has_fresh_ping = _speed_ping_fresh(assigned_row)
-                if best_has_fresh_ping:
-                    if (
-                        assigned_has_fresh_ping
-                        and assigned_ping is not None
-                        and best_ping is not None
-                        and assigned_ping <= best_ping + max(1, int(VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS or 1))
-                    ):
-                        return assigned_row
-                elif best_row is not None and str(best_row.get("code") or "").strip() == assigned_code:
-                    return assigned_row
+            if assigned_row is not None and _virtual_assignment_reusable(assigned_row, best_row, loads):
+                return assigned_row
 
     effective_pool = _virtual_pool_best_quality(_prefer_primary_virtual_pool(pool, loads))
     if not effective_pool:
         effective_pool = _virtual_pool_best_quality(pool)
+    if not effective_pool:
+        return None
     selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
