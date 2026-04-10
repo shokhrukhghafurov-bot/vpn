@@ -74,6 +74,7 @@ VIRTUAL_LOCATION_CODES = {"auto-fastest", "auto-reserve"}
 VIRTUAL_LOCATION_POOL_SIZE = 5
 VIRTUAL_LOCATION_FRESH_CHECK_MINUTES = 15
 VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS = 120
+VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD = 1
 
 SCHEMA_TABLES_SQL = """
 CREATE TABLE IF NOT EXISTS users (
@@ -1035,7 +1036,7 @@ def _config_is_complete(payload: Dict[str, Any]) -> bool:
     if not isinstance(dns_servers, list) or not [str(item).strip() for item in dns_servers if str(item).strip() and not _placeholder_like_value(item)]:
         return False
     if security == "reality":
-        if _placeholder_like_value(public_key) or _placeholder_like_value(short_id) or _placeholder_like_value(sni):
+        if _placeholder_like_value(public_key) or _placeholder_like_value(sni):
             return False
     if transport == "grpc" and _placeholder_like_value(service_name):
         return False
@@ -1270,6 +1271,31 @@ def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, in
     return primary
 
 
+def _virtual_row_load(row: Dict[str, Any], loads: Dict[str, int]) -> int:
+    return int(loads.get(str(row.get("code") or "").strip(), 0))
+
+
+def _virtual_row_not_overloaded(row: Dict[str, Any], loads: Dict[str, int], *, threshold: int = VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD) -> bool:
+    if not loads:
+        return True
+    min_load = min(int(value or 0) for value in loads.values()) if loads else 0
+    return _virtual_row_load(row, loads) <= min_load + max(0, int(threshold or 0))
+
+
+def _pick_balanced_virtual_candidate(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> Optional[Dict[str, Any]]:
+    if not pool:
+        return None
+    threshold = max(0, int(VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD or 0))
+    min_load = min(_virtual_row_load(row, loads) for row in pool) if pool else 0
+    for row in pool:
+        if _virtual_row_load(row, loads) <= min_load + threshold:
+            return row
+    return min(
+        enumerate(pool),
+        key=lambda item: (_virtual_row_load(item[1], loads), item[0]),
+    )[1]
+
+
 def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
     rows = list_locations(active_only=True)
     if not rows:
@@ -1301,13 +1327,15 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
         if sibling_filtered_pool:
             pool = sibling_filtered_pool
 
+    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
+
     assigned_code = get_user_virtual_location_assignment(user_id, code)
     if assigned_code:
         sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
         if not sibling_collision:
             best_row = pool[0] if pool else None
             assigned_row = next((row for row in pool if str(row.get("code") or "").strip() == assigned_code), None)
-            if assigned_row is not None:
+            if assigned_row is not None and _virtual_row_not_overloaded(assigned_row, loads):
                 assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
                 best_ping = _normalize_optional_int(best_row.get("ping_ms")) if best_row is not None else None
                 best_has_fresh_ping = bool(best_row and _speed_ping_fresh(best_row))
@@ -1323,12 +1351,8 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
                 elif best_row is not None and str(best_row.get("code") or "").strip() == assigned_code:
                     return assigned_row
 
-    loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
     effective_pool = _prefer_primary_virtual_pool(pool, loads)
-    selected = min(
-        enumerate(effective_pool),
-        key=lambda item: (int(loads.get(str(item[1].get("code") or "").strip(), 0)), item[0]),
-    )[1]
+    selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
