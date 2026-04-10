@@ -278,7 +278,7 @@ class Settings:
     RU_LTE_REAL_PROBE_MAX_TIME_SEC: int = _env_int("RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12)
     RU_LTE_REAL_PROBE_WARMUP_MS: int = _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200)
     VPN_REAL_PROBE_ENABLED: bool = _env_bool("VPN_REAL_PROBE_ENABLED", True)
-    VPN_REAL_PROBE_REQUIRED: bool = _env_bool("VPN_REAL_PROBE_REQUIRED", True)
+    VPN_REAL_PROBE_REQUIRED: bool = _env_bool("VPN_REAL_PROBE_REQUIRED", False)
     VPN_REAL_PROBE_RUNNER: str = os.getenv("VPN_REAL_PROBE_RUNNER", os.getenv("RU_LTE_REAL_PROBE_RUNNER", "auto"))
     VPN_REAL_PROBE_XRAY_BIN: str = os.getenv("VPN_REAL_PROBE_XRAY_BIN", os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray"))
     VPN_REAL_PROBE_SINGBOX_BIN: str = os.getenv("VPN_REAL_PROBE_SINGBOX_BIN", os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"))
