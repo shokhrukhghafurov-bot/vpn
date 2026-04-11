@@ -1,13 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote, urljoin
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
 import base64
 import hashlib
 import ipaddress
 import html
 import json
 import secrets
-import re
 from uuid import uuid4
 import time
 import threading
@@ -39,7 +38,6 @@ from db_store import (
     create_payment_record,
     delete_device,
     delete_location,
-    due_vpn_import_sources,
     export_payments_csv,
     _compose_vpn_payload_for_location,
     _normalize_vpn_payload_keys,
@@ -64,7 +62,6 @@ from db_store import (
     list_bot_errors,
     list_broadcast_targets,
     list_locations,
-    list_vpn_import_sources,
     list_payments,
     patch_location,
     record_bot_error,
@@ -78,8 +75,6 @@ from db_store import (
     settings_snapshot,
     save_runtime_settings_payload,
     sync_plans_from_env,
-    mark_vpn_import_source_result,
-    upsert_vpn_import_source,
     upsert_telegram_user,
     update_payment,
     extend_user_subscription_by_telegram,
@@ -200,31 +195,6 @@ class LocationPatchIn(BaseModel):
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
     vpn_payload: Optional[Dict[str, Any]] = None
-
-
-class AdminLocationImportIn(BaseModel):
-    source: str
-    is_active: bool = True
-    is_recommended: bool = False
-    is_reserve: bool = False
-    status: str = "online"
-    sort_order_start: int = 100
-    sort_order_step: int = 10
-    save_source: bool = True
-    auto_refresh_minutes: Optional[int] = None
-    is_enabled: bool = True
-
-
-class AdminImportSourceIn(BaseModel):
-    source: str
-    is_enabled: bool = True
-    auto_refresh_minutes: Optional[int] = None
-    is_active: bool = True
-    is_recommended: bool = False
-    is_reserve: bool = False
-    status: str = "online"
-    sort_order_start: int = 100
-    sort_order_step: int = 10
 
 
 class BroadcastIn(BaseModel):
@@ -436,447 +406,6 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
     if query.get("alpn"):
         payload["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
     return _normalize_vpn_payload_keys(payload)
-
-
-_SUBSCRIPTION_IMPORT_HEADERS = {
-    "Accept": "text/plain, text/html;q=0.9, */*;q=0.8",
-    "Cache-Control": "no-cache, no-store, max-age=0",
-    "Pragma": "no-cache",
-    "User-Agent": "inet-vpn-import/1.0",
-}
-
-_IMPORT_COUNTRY_PRESETS: Dict[str, Dict[str, Any]] = {
-    "AT": {"ru": "Австрия", "en": "Austria", "aliases": ["австрия", "austria"]},
-    "DE": {"ru": "Германия", "en": "Germany", "aliases": ["германия", "germany", "deutschland"]},
-    "FI": {"ru": "Финляндия", "en": "Finland", "aliases": ["финляндия", "finland"]},
-    "NL": {"ru": "Нидерланды", "en": "Netherlands", "aliases": ["нидерланды", "netherlands", "holland"]},
-    "FR": {"ru": "Франция", "en": "France", "aliases": ["франция", "france"]},
-    "SE": {"ru": "Швеция", "en": "Sweden", "aliases": ["швеция", "sweden"]},
-    "RU": {"ru": "Россия", "en": "Russia", "aliases": ["россия", "russia"]},
-    "PL": {"ru": "Польша", "en": "Poland", "aliases": ["польша", "poland"]},
-    "GB": {"ru": "Великобритания", "en": "United Kingdom", "aliases": ["великобритания", "uk", "united kingdom", "britain", "england"]},
-    "US": {"ru": "США", "en": "USA", "aliases": ["сша", "usa", "united states", "america"]},
-}
-
-
-def _extract_plain_import_url(source: str) -> str:
-    raw = str(source or "").strip()
-    if not raw:
-        return ""
-    for prefix in ("happ://add/", "v2raytun://import/", "hiddify://import/"):
-        if raw.lower().startswith(prefix):
-            clean = unquote(raw[len(prefix):])
-            if prefix == "hiddify://import/" and "#" in clean:
-                clean = clean.split("#", 1)[0]
-            return clean.strip()
-    return raw if raw.startswith(("http://", "https://")) else ""
-
-
-def _is_persistable_import_source(source: str) -> bool:
-    raw = str(source or "").strip()
-    if not raw:
-        return False
-    if raw.lower().startswith(("happ://add/", "v2raytun://import/", "hiddify://import/")):
-        return True
-    return raw.startswith(("http://", "https://"))
-
-
-def _extract_subscription_url_from_html(text: str) -> str:
-    raw = str(text or "")
-    if not raw:
-        return ""
-    patterns = [
-        r'id=["\']subscription-link-value["\'][^>]*>(https?://[^<\s]+)</code>',
-        r'(?:happ|v2raytun|hiddify)://(?:add|import)/https?://[^"\'<>\s]+',
-        r'https?://[^"\'<>\s]+/sub/[^"\'<>\s]+',
-        r'https?://[^"\'<>\s]+/open-app\?[^"\'<>\s]+',
-        r'["\'](?:subscriptionUrl|subscriptionURL|subscription_link|subscriptionLink|configUrl|configURL|source|url)["\']\s*:\s*["\']([^"\']+)["\']',
-        r'href=["\']((?:happ|v2raytun|hiddify)://(?:add|import)/[^"\']+)["\']',
-        r'href=["\'](https?://[^"\']+)["\']',
-    ]
-    for pattern in patterns:
-        match = re.search(pattern, raw, flags=re.IGNORECASE)
-        if match:
-            candidate = match.group(1) if match.groups() else match.group(0)
-            candidate = html.unescape(candidate).strip()
-            plain = _extract_plain_import_url(candidate)
-            return plain or candidate
-    return ""
-
-
-def _try_decode_base64_subscription_text(text: str) -> str:
-    raw = str(text or "").strip()
-    if not raw:
-        return ""
-    compact = re.sub(r'\s+', '', raw)
-    if len(compact) < 64:
-        return ""
-    if not re.fullmatch(r'[A-Za-z0-9+/=_-]+', compact):
-        return ""
-    padded = compact + ('=' * ((4 - len(compact) % 4) % 4))
-    for altchars in (None, b'-_'):
-        try:
-            if altchars is None:
-                decoded = base64.b64decode(padded, validate=False)
-            else:
-                decoded = base64.b64decode(padded, altchars=altchars, validate=False)
-            decoded_text = decoded.decode('utf-8', errors='ignore').strip()
-        except Exception:
-            continue
-        if decoded_text and ('vless://' in decoded_text or '"outbounds"' in decoded_text or '"protocol"' in decoded_text):
-            return decoded_text
-    return ""
-
-
-def _extract_vless_candidates(text: str) -> List[str]:
-    raw = html.unescape(str(text or ''))
-    if not raw:
-        return []
-    pattern = r'vless://[^\s"\'<>)]+'
-    items: List[str] = []
-    seen: set[str] = set()
-    for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
-        candidate = match.group(0).rstrip('\\').rstrip(',;')
-        if candidate not in seen:
-            seen.add(candidate)
-            items.append(candidate)
-    return items
-
-
-def _extract_candidate_import_urls(text: str, base_url: str = "") -> List[str]:
-    raw = html.unescape(str(text or ''))
-    if not raw:
-        return []
-    patterns = [
-        r'(?:happ|v2raytun|hiddify)://(?:add|import)/https?://[^"\'<>\s]+',
-        r'https?://[^"\'<>\s]+',
-        r'[?&](?:url|source|subscription|subscription_url)=([^&"\'<>\s]+)',
-    ]
-    items: List[str] = []
-    seen: set[str] = set()
-    for pattern in patterns:
-        for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
-            candidate = match.group(1) if match.groups() else match.group(0)
-            candidate = html.unescape(unquote(candidate)).strip()
-            plain = _extract_plain_import_url(candidate)
-            candidate = plain or candidate
-            if candidate.startswith('/') and base_url:
-                candidate = urljoin(base_url, candidate)
-            if not candidate.startswith(('http://', 'https://')):
-                continue
-            if candidate not in seen:
-                seen.add(candidate)
-                items.append(candidate)
-    return items
-
-
-def _read_subscription_import_source(source: str, _depth: int = 0, _visited: Optional[set[str]] = None) -> str:
-    raw = str(source or "").strip()
-    if not raw:
-        raise ValueError("source is required")
-    if _visited is None:
-        _visited = set()
-    max_depth = max(1, int(getattr(settings, "VPN_IMPORT_DISCOVERY_DEPTH", 3) or 3))
-    if _depth > max_depth:
-        return raw
-
-    if raw.startswith("{") and '"outbounds"' in raw:
-        return raw
-    if raw.startswith("[") and ('"outbounds"' in raw or '"protocol"' in raw):
-        return raw
-    extracted_direct = _extract_vless_candidates(raw)
-    if extracted_direct:
-        return "\n".join(extracted_direct)
-    decoded_raw = _try_decode_base64_subscription_text(raw)
-    if decoded_raw:
-        return _read_subscription_import_source(decoded_raw, _depth=_depth + 1, _visited=_visited)
-
-    plain_url = _extract_plain_import_url(raw)
-    if plain_url:
-        if plain_url in _visited:
-            return ""
-        _visited.add(plain_url)
-        response = requests.get(
-            _fresh_source_url(plain_url),
-            timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)),
-            headers=_SUBSCRIPTION_IMPORT_HEADERS,
-        )
-        response.raise_for_status()
-        text = response.text or ""
-
-        extracted = _extract_vless_candidates(text)
-        if extracted:
-            return "\n".join(extracted)
-        decoded_text = _try_decode_base64_subscription_text(text)
-        if decoded_text:
-            return _read_subscription_import_source(decoded_text, _depth=_depth + 1, _visited=_visited)
-        if _parse_raw_xray_json_to_payload(text):
-            return text
-
-        candidates: List[str] = []
-        nested_url = _extract_subscription_url_from_html(text)
-        if nested_url:
-            plain_nested = _extract_plain_import_url(nested_url)
-            candidates.append(plain_nested or nested_url)
-        candidates.extend(_extract_candidate_import_urls(text, base_url=plain_url))
-
-        seen_nested: set[str] = set()
-        for candidate in candidates:
-            clean = str(candidate or '').strip()
-            if not clean or clean in seen_nested or clean == plain_url:
-                continue
-            seen_nested.add(clean)
-            try:
-                nested_text = _read_subscription_import_source(clean, _depth=_depth + 1, _visited=_visited)
-            except Exception:
-                continue
-            if not nested_text:
-                continue
-            nested_vless = _extract_vless_candidates(nested_text)
-            if nested_vless:
-                return "\n".join(nested_vless)
-            if _parse_raw_xray_json_to_payload(nested_text):
-                return nested_text
-            decoded_nested = _try_decode_base64_subscription_text(nested_text)
-            if decoded_nested:
-                return decoded_nested
-        return text
-    return raw
-
-
-def _parse_raw_xray_json_to_payload(text: str) -> Optional[Dict[str, Any]]:
-    raw = str(text or "").strip()
-    if not raw.startswith("{"):
-        return None
-    try:
-        data = json.loads(raw)
-    except Exception:
-        return None
-    if not isinstance(data, dict):
-        return None
-    outbounds = data.get("outbounds") or []
-    proxy = None
-    for item in outbounds:
-        if isinstance(item, dict) and str(item.get("protocol") or "").strip().lower() == "vless":
-            proxy = item
-            break
-    if not isinstance(proxy, dict):
-        return None
-    vnext = (((proxy.get("settings") or {}).get("vnext") or [None])[0] or {})
-    user = (((vnext.get("users") or [None])[0]) or {})
-    stream = proxy.get("streamSettings") or {}
-    reality = stream.get("realitySettings") or {}
-    grpc = stream.get("grpcSettings") or {}
-    dns = data.get("dns") or {}
-    dns_servers = [str(item).strip() for item in (dns.get("servers") or []) if str(item).strip()]
-    payload = {
-        "engine": "xray",
-        "protocol": "vless",
-        "server": str(vnext.get("address") or "").strip(),
-        "port": int(vnext.get("port") or 0),
-        "uuid": str(user.get("id") or "").strip(),
-        "transport": str(stream.get("network") or "tcp").strip() or "tcp",
-        "network": str(stream.get("network") or "tcp").strip() or "tcp",
-        "security": str(stream.get("security") or "reality").strip() or "reality",
-        "flow": str(user.get("flow") or "").strip(),
-        "server_name": str(reality.get("serverName") or "").strip(),
-        "sni": str(reality.get("serverName") or "").strip(),
-        "public_key": str(reality.get("publicKey") or "").strip(),
-        "short_id": str(reality.get("shortId") or "").strip(),
-        "fingerprint": str(reality.get("fingerprint") or "chrome").strip() or "chrome",
-        "service_name": str(grpc.get("serviceName") or "").strip(),
-        "path": str(grpc.get("serviceName") or stream.get("path") or "").strip(),
-        "remark": str(data.get("remarks") or data.get("remark") or "").strip(),
-        "dns_servers": dns_servers or ["1.1.1.1", "8.8.8.8"],
-        "connect_mode": "tun",
-        "full_tunnel": True,
-    }
-    if payload["server"] and payload["port"] > 0 and payload["uuid"]:
-        return _normalize_vpn_payload_keys(payload)
-    return None
-
-
-def _country_code_from_flag_emoji(text: str) -> Optional[str]:
-    chars = list(str(text or ""))
-    for idx in range(len(chars) - 1):
-        codepoints = [ord(chars[idx]), ord(chars[idx + 1])]
-        if all(0x1F1E6 <= item <= 0x1F1FF for item in codepoints):
-            return "".join(chr(item - 127397) for item in codepoints)
-    return None
-
-
-def _clean_import_location_name(text: str) -> str:
-    raw = html.unescape(unquote(str(text or "").strip()))
-    raw = re.sub(r'[🇦-🇿]{2}', ' ', raw)
-    for marker in ("⚡️", "⚡", "🔥", "💎", "📶", "⭐", "★", "✨"):
-        raw = raw.replace(marker, " ")
-    raw = raw.replace("| JSON", " ").replace("VLESS", " ").replace("JSON", " ")
-    raw = re.sub(r'\s+', ' ', raw).strip(' -|')
-    return raw.strip()
-
-
-def _infer_location_names_from_payload(payload: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
-    remark = str(payload.get("remark") or payload.get("display_name") or payload.get("name_en") or "").strip()
-    clean = _clean_import_location_name(remark)
-    country_code = str(payload.get("location_code") or payload.get("country_code") or "").strip().upper() or None
-    if country_code and len(country_code) != 2:
-        country_code = None
-    if not country_code:
-        country_code = _country_code_from_flag_emoji(remark)
-    if country_code and country_code in _IMPORT_COUNTRY_PRESETS:
-        preset = _IMPORT_COUNTRY_PRESETS[country_code]
-        return preset["ru"], preset["en"], country_code
-    lower_clean = clean.lower()
-    for code, preset in _IMPORT_COUNTRY_PRESETS.items():
-        for alias in preset.get("aliases") or []:
-            if alias in lower_clean:
-                return preset["ru"], preset["en"], code
-    fallback = clean or str(payload.get("server") or "Location").strip()
-    return fallback, fallback, country_code
-
-
-def _slugify_location_code(text: str) -> str:
-    value = re.sub(r'[^a-z0-9]+', '-', str(text or '').strip().lower())
-    value = value.strip('-')
-    return value or 'loc'
-
-
-def _next_location_identity(base_code: str, base_name_ru: str, base_name_en: str, existing_codes: set[str]) -> Tuple[str, str, str]:
-    clean_code = _slugify_location_code(base_code)
-    if clean_code not in existing_codes:
-        return clean_code, base_name_ru, base_name_en
-    suffix = 2
-    while True:
-        candidate = f"{clean_code}-{suffix}"
-        if candidate not in existing_codes:
-            return candidate, f"{base_name_ru} {suffix}", f"{base_name_en} {suffix}"
-        suffix += 1
-
-
-def _extract_raw_json_payloads(text: str) -> List[Dict[str, Any]]:
-    raw = str(text or '').strip()
-    if not raw:
-        return []
-    items: List[Dict[str, Any]] = []
-    decoder = json.JSONDecoder()
-    idx = 0
-    length = len(raw)
-    while idx < length:
-        while idx < length and raw[idx] not in '{[':
-            idx += 1
-        if idx >= length:
-            break
-        try:
-            obj, next_idx = decoder.raw_decode(raw, idx)
-        except Exception:
-            idx += 1
-            continue
-        candidates = obj if isinstance(obj, list) else [obj]
-        for candidate in candidates:
-            if isinstance(candidate, dict):
-                payload = _parse_raw_xray_json_to_payload(json.dumps(candidate, ensure_ascii=False))
-                if payload and _config_is_complete(payload):
-                    items.append(_normalize_vpn_payload_keys(payload))
-        idx = max(next_idx, idx + 1)
-    return items
-
-
-def _parse_import_source_payloads(source: str) -> List[Dict[str, Any]]:
-    text = _read_subscription_import_source(source)
-    parsed: List[Dict[str, Any]] = []
-
-    one_payload = _parse_raw_xray_json_to_payload(text)
-    if one_payload:
-        parsed.append(one_payload)
-        return parsed
-
-    json_payloads = _extract_raw_json_payloads(text)
-    if json_payloads:
-        return json_payloads
-
-    candidates = _extract_vless_candidates(text)
-    if not candidates:
-        candidates = [line.strip() for line in text.splitlines() if line.strip()]
-    for line in candidates:
-        payload = _parse_vless_subscription_line(line)
-        if payload and _config_is_complete(payload):
-            parsed.append(_normalize_vpn_payload_keys(payload))
-    return parsed
-
-
-def _import_locations_from_source(source: str, *, is_active: bool, is_recommended: bool, is_reserve: bool, status: str, sort_order_start: int, sort_order_step: int) -> Dict[str, Any]:
-    parsed_payloads = _parse_import_source_payloads(source)
-    if not parsed_payloads:
-        raise ValueError("No VLESS locations found in source")
-
-    existing_rows = list_locations(active_only=False)
-    existing_codes = {str(row.get('code') or '').strip().lower() for row in existing_rows if str(row.get('code') or '').strip()}
-    existing_by_identity: Dict[str, Dict[str, Any]] = {}
-    for row in existing_rows:
-        row_payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get('vpn_payload') or {})
-        row_payload = _normalize_vpn_payload_keys(row_payload) if isinstance(row_payload, dict) else {}
-        identity = _candidate_identity_key(row_payload)
-        if identity:
-            existing_by_identity[identity] = row
-
-    imported: List[Dict[str, Any]] = []
-    seen_identities: set[str] = set()
-    current_sort = int(sort_order_start or 100)
-    step = max(1, int(sort_order_step or 10))
-
-    for payload in parsed_payloads:
-        normalized = _normalize_vpn_payload_keys(payload)
-        identity = _candidate_identity_key(normalized)
-        if identity and identity in seen_identities:
-            continue
-        if identity:
-            seen_identities.add(identity)
-        name_ru, name_en, country_code = _infer_location_names_from_payload(normalized)
-        desired_code_base = (country_code or normalized.get('location_code') or name_en or name_ru or 'loc')
-        existing = existing_by_identity.get(identity) if identity else None
-        if existing:
-            code = str(existing.get('code') or '').strip()
-            normalized['location_code'] = code or normalized.get('location_code')
-            if not normalized.get('remark'):
-                normalized['remark'] = name_en
-            item = patch_location(int(existing['id']), {
-                'name_ru': name_ru,
-                'name_en': name_en,
-                'country_code': country_code,
-                'is_active': is_active,
-                'is_recommended': is_recommended,
-                'is_reserve': is_reserve,
-                'status': status,
-                'sort_order': current_sort,
-                'vpn_payload': normalized,
-            })
-        else:
-            code, final_name_ru, final_name_en = _next_location_identity(str(desired_code_base).lower(), name_ru, name_en, existing_codes)
-            existing_codes.add(code)
-            normalized['location_code'] = code
-            if not normalized.get('remark'):
-                normalized['remark'] = final_name_en
-            item = create_location({
-                'code': code,
-                'name_ru': final_name_ru,
-                'name_en': final_name_en,
-                'country_code': country_code,
-                'is_active': is_active,
-                'is_recommended': is_recommended,
-                'is_reserve': is_reserve,
-                'status': status,
-                'sort_order': current_sort,
-                'vpn_payload': normalized,
-            })
-        imported.append(serialize_location(item, include_payload=True))
-        current_sort += step
-
-    _invalidate_locations_cache()
-    return {
-        'ok': True,
-        'count': len(imported),
-        'items': imported,
-    }
 
 
 def _transport_allowed(payload: Dict[str, Any], allowed_values: List[str]) -> bool:
@@ -2300,12 +1829,6 @@ def _run_startup_background_tasks() -> None:
         except Exception as exc:
             logger.exception("[vpn][startup] black_refresh_failed: %s", exc)
             _set_black_refresh_error(exc)
-    if bool(getattr(settings, "VPN_IMPORT_ON_STARTUP", True)):
-        try:
-            _run_due_vpn_import_sources_safe(source="startup")
-        except Exception as exc:
-            logger.exception("[vpn][startup] vpn_import_failed: %s", exc)
-            _set_vpn_import_error(exc)
     if bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)):
         try:
             _run_vpn_live_check_safe(source="startup", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
@@ -2321,7 +1844,6 @@ def on_startup() -> None:
     _log_probe_binary_status()
     _start_ru_lte_auto_refresh_loop()
     _start_black_auto_refresh_loop()
-    _start_vpn_import_auto_loop()
     _start_vpn_live_check_auto_loop()
     thread = threading.Thread(target=_run_startup_background_tasks, name="vpn-startup-tasks", daemon=True)
     thread.start()
@@ -2396,105 +1918,6 @@ def _config_version_payload() -> Dict[str, Any]:
 def _invalidate_locations_cache() -> None:
     _locations_cache["items"] = None
     _locations_cache["expires_at"] = 0.0
-
-
-_vpn_import_state: Dict[str, Any] = {
-    "last_success_at": None,
-    "last_error": None,
-    "last_error_at": None,
-    "last_started_at": None,
-    "last_finished_at": None,
-    "last_source": None,
-    "last_summary": None,
-}
-
-
-def _set_vpn_import_success(summary: Dict[str, Any], *, source: str) -> None:
-    _vpn_import_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
-    _vpn_import_state["last_error"] = None
-    _vpn_import_state["last_error_at"] = None
-    _vpn_import_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
-    _vpn_import_state["last_source"] = source
-    _vpn_import_state["last_summary"] = dict(summary)
-
-
-def _set_vpn_import_error(exc: Exception) -> None:
-    _vpn_import_state["last_error"] = str(exc)
-    _vpn_import_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
-    _vpn_import_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
-
-
-def _run_vpn_import_source_safe(source_row: Dict[str, Any], *, source: str = "auto") -> Dict[str, Any]:
-    source_id = int(source_row.get("id") or 0)
-    source_url = str(source_row.get("source_url") or "").strip()
-    if source_id <= 0 or not source_url:
-        raise ValueError("Invalid import source")
-    _vpn_import_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
-    _vpn_import_state["last_source"] = source_url
-    try:
-        result = _import_locations_from_source(
-            source_url,
-            is_active=bool(source_row.get("is_active", True)),
-            is_recommended=bool(source_row.get("is_recommended", False)),
-            is_reserve=bool(source_row.get("is_reserve", False)),
-            status=str(source_row.get("status") or "online").strip().lower() or "online",
-            sort_order_start=int(source_row.get("sort_order_start") or 100),
-            sort_order_step=int(source_row.get("sort_order_step") or 10),
-        )
-        try:
-            mark_vpn_import_source_result(source_id, ok=True, error=None)
-        except Exception:
-            logger.exception("[vpn][import] failed to mark source success id=%s", source_id)
-        result["refresh_source"] = source
-        result["source_id"] = source_id
-        _invalidate_locations_cache()
-        _set_vpn_import_success(result, source=source_url)
-        logger.info("[vpn][import] source=%s id=%s imported=%s updated=%s", source, source_id, len(result.get("imported") or []), len(result.get("updated") or []))
-        return result
-    except Exception as exc:
-        try:
-            mark_vpn_import_source_result(source_id, ok=False, error=str(exc))
-        except Exception:
-            logger.exception("[vpn][import] failed to mark source error id=%s", source_id)
-        _set_vpn_import_error(exc)
-        logger.exception("[vpn][import] source=%s id=%s failed: %s", source, source_id, exc)
-        raise
-
-
-def _run_due_vpn_import_sources_safe(*, source: str = "auto") -> Dict[str, Any]:
-    due_rows = due_vpn_import_sources()
-    summary = {"ok": True, "due_total": len(due_rows), "refreshed_total": 0, "errors": []}
-    for row in due_rows:
-        try:
-            _run_vpn_import_source_safe(row, source=source)
-            summary["refreshed_total"] += 1
-        except Exception as exc:
-            summary["errors"].append({"id": row.get("id"), "source_url": row.get("source_url"), "error": str(exc)})
-    if summary["errors"]:
-        summary["ok"] = False
-    return summary
-
-
-def _start_vpn_import_auto_loop() -> None:
-    if not bool(getattr(settings, "VPN_IMPORT_AUTO_ENABLED", True)):
-        return
-    poll_seconds = max(15, int(getattr(settings, "VPN_IMPORT_WORKER_POLL_SECONDS", 60) or 60))
-
-    def worker() -> None:
-        initial_delay = poll_seconds if bool(getattr(settings, "VPN_IMPORT_ON_STARTUP", True)) else 0
-        if initial_delay > 0:
-            time.sleep(initial_delay)
-        while True:
-            started = time.monotonic()
-            try:
-                _run_due_vpn_import_sources_safe(source="auto")
-            except Exception as exc:
-                _set_vpn_import_error(exc)
-            elapsed = time.monotonic() - started
-            time.sleep(max(5.0, poll_seconds - elapsed))
-
-    thread = threading.Thread(target=worker, name="vpn-import-auto-refresh", daemon=True)
-    thread.start()
 
 
 def _set_ru_lte_refresh_success() -> None:
@@ -2888,6 +2311,32 @@ def _flag_emoji(country_code: Optional[str]) -> str:
     if not code.isalpha():
         return ""
     return "".join(chr(127397 + ord(char)) for char in code)
+
+
+def _subscription_country_flag(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    country_code = (
+        normalized.get("country_code")
+        or row.get("country_code")
+        or normalized.get("resolved_country_code")
+    )
+    return _flag_emoji(str(country_code).strip().upper()) if country_code else ""
+
+
+def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    base_name = str(
+        normalized.get("remark")
+        or normalized.get("display_name")
+        or row.get("name_en")
+        or row.get("name_ru")
+        or row.get("code")
+        or "VLESS"
+    ).strip() or "VLESS"
+    flag = _subscription_country_flag(row, normalized)
+    if flag and not base_name.startswith((f"{flag} ", flag)):
+        base_name = f"{flag} {base_name}"
+    return base_name
 
 
 
@@ -3288,6 +2737,16 @@ def _bot_public_url() -> str:
     if bot_username:
         return f"https://t.me/{bot_username}"
     return settings.SUPPORT_TELEGRAM_URL
+
+
+def _bot_profile_title_label() -> str:
+    bot_username = (settings.BOT_USERNAME or "").strip().lstrip("@")
+    if bot_username:
+        return f"t.me/{bot_username}"
+    bot_url = str(_bot_public_url() or "").strip()
+    if bot_url:
+        return bot_url.replace("https://", "").replace("http://", "")
+    return "bot"
 
 
 def _selected_client_mode() -> str:
@@ -4040,14 +3499,7 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
 
 def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
-    base_name = str(
-        normalized.get("remark")
-        or normalized.get("display_name")
-        or row.get("name_en")
-        or row.get("name_ru")
-        or row.get("code")
-        or "VLESS"
-    ).strip() or "VLESS"
+    base_name = _subscription_target_name_for_row(row, normalized)
     if bool(row.get("is_recommended")) and not base_name.startswith(("★ ", "⭐ ")):
         return f"★ {base_name}"
     return base_name
@@ -4113,13 +3565,7 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
     payload_for_subscription = dict(payload)
     if code in PUBLIC_VIRTUAL_LOCATION_CODES:
         virtual_name = str(row.get("name_en") or row.get("name_ru") or code or "VLESS").strip() or "VLESS"
-        resolved_name = str(
-            resolved_row.get("name_en")
-            or resolved_row.get("name_ru")
-            or resolved_row.get("code")
-            or payload_for_subscription.get("resolved_location_code")
-            or "VLESS"
-        ).strip() or "VLESS"
+        resolved_name = _subscription_target_name_for_row(resolved_row, payload_for_subscription)
         virtual_remark = f"{virtual_name} → {resolved_name}"
         payload_for_subscription["remark"] = virtual_remark
         payload_for_subscription["display_name"] = virtual_remark
@@ -4225,7 +3671,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         raise HTTPException(status_code=404, detail="Subscription not found")
 
     expires_ts = int(time.time()) + 86400 * 3650
-    profile_title = f"{settings.APP_NAME} Subscription"
+    profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
     subscription_user_id: Optional[int] = None
     if access["kind"] == "user":
         user = access["user"]
@@ -4243,7 +3689,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 expires_ts = int(datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp())
             except Exception:
                 pass
-        profile_title = f"{settings.APP_NAME} · {user.get('telegram_id')}"
+        profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
         subscription_user_id = int(user["id"])
 
         is_browser_preview = _subscription_browser_preview_request(request)
@@ -4293,8 +3739,9 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 last_modified_dt = parsed
     if last_modified_dt is None:
         last_modified_dt = datetime.now(timezone.utc)
-    profile_web_page_url = str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
-    support_url = str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+    bot_public_url = str(_bot_public_url() or "").strip()
+    profile_web_page_url = bot_public_url or str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
+    support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
     update_interval_hours = _hiddify_profile_update_interval_header_value()
     subscription_userinfo = f"upload=0; download=0; total=0; expire={expires_ts}"
     moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
@@ -5490,84 +4937,7 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
         "vpn_live_check_auto_enabled": bool(getattr(settings, "VPN_LIVE_CHECK_AUTO_ENABLED", True)),
         "vpn_live_check_auto_minutes": max(1, int(getattr(settings, "VPN_LIVE_CHECK_AUTO_MINUTES", 3) or 3)),
         "vpn_live_check_active_only": bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)),
-        "vpn_import": dict(_vpn_import_state),
-        "vpn_import_auto_enabled": bool(getattr(settings, "VPN_IMPORT_AUTO_ENABLED", True)),
-        "vpn_import_default_refresh_minutes": max(1, int(getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10)),
-        "import_sources": list_vpn_import_sources(enabled_only=False),
     }
-
-
-@app.get("/api/infra/admin/vpn/import-sources")
-def admin_import_sources_list(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
-    _ = admin_name
-    return {"ok": True, "items": list_vpn_import_sources(enabled_only=False), "state": dict(_vpn_import_state)}
-
-
-@app.post("/api/infra/admin/vpn/import-sources")
-def admin_import_sources_create(payload: AdminImportSourceIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
-    _ = admin_name
-    source = str(payload.source or "").strip()
-    if not _is_persistable_import_source(source):
-        raise HTTPException(status_code=400, detail="A happ://add/... or http(s) source is required")
-    try:
-        item = upsert_vpn_import_source({
-            "source_url": source,
-            "is_enabled": bool(payload.is_enabled),
-            "auto_refresh_minutes": int(payload.auto_refresh_minutes or getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10),
-            "is_active": bool(payload.is_active),
-            "is_recommended": bool(payload.is_recommended),
-            "is_reserve": bool(payload.is_reserve),
-            "status": str(payload.status or "online").strip().lower() or "online",
-            "sort_order_start": int(payload.sort_order_start or 100),
-            "sort_order_step": int(payload.sort_order_step or 10),
-        })
-        return {"ok": True, "item": item}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-
-
-@app.post("/api/infra/admin/vpn/import-sources/refresh")
-def admin_import_sources_refresh(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
-    _ = admin_name
-    try:
-        return _run_due_vpn_import_sources_safe(source="manual")
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc)) from exc
-
-
-@app.post("/api/infra/admin/vpn/locations/import")
-def admin_locations_import(payload: AdminLocationImportIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
-    _ = admin_name
-    source = str(payload.source or "").strip()
-    try:
-        result = _import_locations_from_source(
-            source,
-            is_active=bool(payload.is_active),
-            is_recommended=bool(payload.is_recommended),
-            is_reserve=bool(payload.is_reserve),
-            status=str(payload.status or "online").strip().lower() or "online",
-            sort_order_start=int(payload.sort_order_start or 100),
-            sort_order_step=int(payload.sort_order_step or 10),
-        )
-        saved_source = None
-        if bool(payload.save_source) and _is_persistable_import_source(source):
-            saved_source = upsert_vpn_import_source({
-                "source_url": source,
-                "is_enabled": bool(payload.is_enabled),
-                "auto_refresh_minutes": int(payload.auto_refresh_minutes or getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10),
-                "is_active": bool(payload.is_active),
-                "is_recommended": bool(payload.is_recommended),
-                "is_reserve": bool(payload.is_reserve),
-                "status": str(payload.status or "online").strip().lower() or "online",
-                "sort_order_start": int(payload.sort_order_start or 100),
-                "sort_order_step": int(payload.sort_order_step or 10),
-            })
-        return {**result, "saved_source": saved_source}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except requests.RequestException as exc:
-        detail = str(exc).strip() or "Failed to fetch source"
-        raise HTTPException(status_code=502, detail=detail) from exc
 
 
 @app.post("/api/infra/admin/vpn/locations")
