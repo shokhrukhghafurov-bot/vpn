@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import html
 import json
+import re
 import secrets
 from uuid import uuid4
 import time
@@ -392,7 +393,8 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
         "short_id": (query.get("sid") or query.get("short_id") or query.get("shortId") or "").strip(),
         "fingerprint": (query.get("fp") or query.get("fingerprint") or "chrome").strip() or "chrome",
         "service_name": (query.get("serviceName") or query.get("service_name") or "").strip(),
-        "path": (query.get("path") or query.get("spx") or "").strip(),
+        "path": (query.get("path") or "").strip(),
+        "spider_x": (query.get("spx") or query.get("spiderX") or query.get("spider_x") or "").strip(),
         "packet_encoding": (query.get("packetEncoding") or query.get("packet_encoding") or query.get("packet-encoding") or "xudp").strip() or "xudp",
         "remark": _decode_vless_name(fragment),
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
@@ -420,6 +422,17 @@ def _payload_transport(payload: Dict[str, Any]) -> str:
 
 def _payload_security(payload: Dict[str, Any]) -> str:
     return str(payload.get("security") or "").strip().lower()
+
+
+def _xray_reality_spider_x(payload: Dict[str, Any], transport: str) -> Optional[str]:
+    explicit = str(payload.get("spider_x") or payload.get("spiderX") or payload.get("spx") or "").strip()
+    if explicit:
+        return explicit if explicit.startswith("/") else f"/{explicit.lstrip('/')}"
+    # For grpc/http transports, path/serviceName metadata must not be copied into spiderX.
+    if transport in {"grpc", "xhttp", "httpupgrade", "ws", "websocket"}:
+        return "/"
+    fallback = str(payload.get("path") or "/").strip() or "/"
+    return fallback if fallback.startswith("/") else f"/{fallback.lstrip('/')}"
 
 
 def _candidate_identity_key(payload: Dict[str, Any]) -> str:
@@ -710,7 +723,7 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
             "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
             "publicKey": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
             "shortId": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
-            "spiderX": str(payload.get("path") or "/").strip() or "/",
+            "spiderX": _xray_reality_spider_x(payload, transport) or "/",
         }
     elif security == "tls":
         stream_settings["security"] = "tls"
@@ -995,6 +1008,10 @@ def _pool_probe_min_success(pool: str, total_targets: int) -> int:
         raw = int(getattr(settings, "BLACK_REAL_PROBE_MIN_SUCCESS", getattr(settings, "VPN_REAL_PROBE_MIN_SUCCESS", 2)) or 1)
     else:
         raw = int(getattr(settings, "VPN_REAL_PROBE_MIN_SUCCESS", 2) or 1)
+        # Generic internet checks often include 3 public targets (YouTube/Telegram/Instagram).
+        # Keep them resilient to one flaky endpoint instead of requiring a perfect 3/3 pass.
+        if total >= 3:
+            raw = min(raw, 2)
     return min(max(1, raw), total)
 
 
