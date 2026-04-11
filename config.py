@@ -224,12 +224,24 @@ class Settings:
     PLAN_MONTHLY_3_DURATION_DAYS: int = 30
     PLAN_MONTHLY_3_DEVICE_LIMIT: int = 3
 
-    PAYMENTS_PROVIDER: str = os.getenv("PAYMENTS_PROVIDER", "yookassa")
+    PAYMENTS_PROVIDER: str = os.getenv("PAYMENTS_PROVIDER", "robokassa")
     PAYMENTS_ENABLED: bool = _env_bool("PAYMENTS_ENABLED", False)
+    PAYMENTS_COMMISSION_PERCENT: float = _env_float("PAYMENTS_COMMISSION_PERCENT", 0.0)
     YOOKASSA_SHOP_ID: str = os.getenv("YOOKASSA_SHOP_ID", "")
     YOOKASSA_SECRET_KEY: str = os.getenv("YOOKASSA_SECRET_KEY", "")
     YOOKASSA_RETURN_URL: str = os.getenv("YOOKASSA_RETURN_URL", "https://your-domain.com/payment/return")
     YOOKASSA_WEBHOOK_URL: str = os.getenv("YOOKASSA_WEBHOOK_URL", "https://your-domain.com/payments/webhook/yookassa")
+    ROBOKASSA_MERCHANT_LOGIN: str = os.getenv("ROBOKASSA_MERCHANT_LOGIN", "")
+    ROBOKASSA_PASSWORD1: str = os.getenv("ROBOKASSA_PASSWORD1", "")
+    ROBOKASSA_PASSWORD2: str = os.getenv("ROBOKASSA_PASSWORD2", "")
+    ROBOKASSA_PAYMENT_URL: str = os.getenv("ROBOKASSA_PAYMENT_URL", "https://auth.robokassa.ru/Merchant/Index.aspx")
+    ROBOKASSA_RESULT_URL: str = os.getenv("ROBOKASSA_RESULT_URL", "")
+    ROBOKASSA_SUCCESS_URL: str = os.getenv("ROBOKASSA_SUCCESS_URL", "")
+    ROBOKASSA_FAIL_URL: str = os.getenv("ROBOKASSA_FAIL_URL", "")
+    ROBOKASSA_CULTURE: str = os.getenv("ROBOKASSA_CULTURE", "ru")
+    ROBOKASSA_HASH_ALGORITHM: str = os.getenv("ROBOKASSA_HASH_ALGORITHM", "md5")
+    ROBOKASSA_IS_TEST: bool = _env_bool("ROBOKASSA_IS_TEST", False)
+    ROBOKASSA_INCCURRLABEL: str = os.getenv("ROBOKASSA_INCCURRLABEL", "")
 
     DEFAULT_LOCATIONS_JSON: str = BUILTIN_MVP_LOCATIONS_JSON
     DEFAULT_LOCATIONS_ENV_JSON: str = os.getenv("DEFAULT_LOCATIONS_JSON", "")
