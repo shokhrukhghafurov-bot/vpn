@@ -349,7 +349,7 @@ class Settings:
         if self.VPN_REAL_PROBE_URLS is None:
             self.VPN_REAL_PROBE_URLS = _env_list(
                 "VPN_REAL_PROBE_URLS",
-                "https://www.youtube.com/generate_204,https://www.instagram.com/,https://web.telegram.org/,https://www.google.com/generate_204",
+                "https://www.youtube.com/generate_204,https://web.telegram.org/,https://www.instagram.com/",
             )
         if self.VPN_REAL_PROBE_RU_EXTRA_URLS is None:
             self.VPN_REAL_PROBE_RU_EXTRA_URLS = _env_list(
