@@ -1160,20 +1160,28 @@ def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
 
 
 def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout: float) -> Dict[str, Any]:
+    require_real_probe = _pool_real_probe_required(pool)
+    allow_tcp_fallback_on_runner_error = bool(getattr(settings, "VPN_REAL_PROBE_ALLOW_TCP_FALLBACK_ON_RUNNER_ERROR", False))
     real_probe_error = ""
     if bool(getattr(settings, "VPN_REAL_PROBE_ENABLED", True)):
         real_probe = _probe_candidate_via_real_tunnel(payload, pool=pool)
         if real_probe.get("ok"):
             return real_probe
         real_probe_error = str(real_probe.get("error") or "").strip().lower()
-        hard_fallback_errors = (
-            "xray_binary_missing",
-            "singbox_binary_missing",
-            "socks_not_ready",
-            "real_probe_timeout",
-        )
-        if _pool_real_probe_required(pool) and not real_probe_error.startswith(hard_fallback_errors):
-            return real_probe
+        if require_real_probe:
+            runner_error_prefixes = (
+                "xray_binary_missing",
+                "singbox_binary_missing",
+                "socks_not_ready",
+                "real_probe_timeout",
+            )
+            if allow_tcp_fallback_on_runner_error and real_probe_error.startswith(runner_error_prefixes):
+                logger.warning("[vpn][probe] pool=%s strict_real_probe=1 runner_error=%s tcp_fallback_allowed=1", pool, real_probe_error or "-")
+            else:
+                return real_probe
+    elif require_real_probe:
+        return {"ok": False, "latency_ms": None, "error": "real_probe_disabled", "method": "real_probe_disabled"}
+
     fallback_probe = _probe_candidate_with_timeout(payload, float(tcp_timeout or 4))
     fallback_probe["method"] = "tcp_fallback"
     if real_probe_error:
@@ -3153,7 +3161,7 @@ def _row_live_probe_state(row: Dict[str, Any]) -> Dict[str, Any]:
             'ping_ms': ping_ms,
             'checked_at': None,
             'age_minutes': None,
-            'fix': 'Run Speed-test / live validation so the backend can verify the node. If the real tunnel runner is unavailable, the backend will fall back to a TCP reachability check.',
+            'fix': 'Run Speed-test / live validation so the backend can verify the node. By default the backend now requires a real tunnel probe and will not publish nodes that only passed a TCP reachability check.',
         }
     age = datetime.now(timezone.utc) - checked_at.astimezone(timezone.utc)
     age_minutes = int(max(0, age.total_seconds()) // 60)
@@ -3557,7 +3565,10 @@ def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str,
     strict_rows = collect(strict_health=True)
     if strict_rows:
         return strict_rows
-    return collect(strict_health=False)
+    if bool(getattr(settings, "SUBSCRIPTION_ALLOW_READY_FALLBACK", False)):
+        return collect(strict_health=False)
+    logger.warning("[sub][publish] strict_live_only=1 fallback_ready_disabled=1 published=0 user_id=%s", user_id if user_id is not None else "-")
+    return []
 
 
 def _hiddify_profile_update_interval_header_value() -> str:
