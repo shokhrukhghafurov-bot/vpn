@@ -1169,19 +1169,23 @@ def _virtual_selection_tiers(rows: List[Dict[str, Any]]) -> List[List[Dict[str, 
         reverse=True,
     )
     all_live = sorted(usable_live, key=_location_speed_rank, reverse=True)
-    ready_with_ping = sorted(
-        [row for row in usable_ready if _speed_ping_present(row)],
-        key=_virtual_ping_sort_key,
-    )
-    ready_any = sorted(usable_ready, key=_location_speed_rank, reverse=True)
-    return [
+    tiers: List[List[Dict[str, Any]]] = [
         _dedupe_location_rows(fresh_ping),
         _dedupe_location_rows(measured_ping),
         _dedupe_location_rows(fresh_measured),
         _dedupe_location_rows(all_live),
-        _dedupe_location_rows(ready_with_ping),
-        _dedupe_location_rows(ready_any),
     ]
+    if bool(getattr(settings, "AUTO_VIRTUAL_ALLOW_READY_FALLBACK", False)):
+        ready_with_ping = sorted(
+            [row for row in usable_ready if _speed_ping_present(row)],
+            key=_virtual_ping_sort_key,
+        )
+        ready_any = sorted(usable_ready, key=_location_speed_rank, reverse=True)
+        tiers.extend([
+            _dedupe_location_rows(ready_with_ping),
+            _dedupe_location_rows(ready_any),
+        ])
+    return tiers
 
 
 def _dedupe_location_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -2409,8 +2413,12 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         raise ValueError("Location not found")
     if location_code not in {"auto-fastest", "auto-reserve"}:
         current_row = dict(row)
-        if not _location_has_fresh_live_signal(current_row) and not _location_payload_ready_for_publish(current_row):
-            raise ValueError("Location is offline or its VLESS config is incomplete")
+        allow_ready_fallback = bool(getattr(settings, "USER_CONFIG_ALLOW_READY_FALLBACK", False))
+        if allow_ready_fallback:
+            if not _location_has_fresh_live_signal(current_row) and not _location_payload_ready_for_publish(current_row):
+                raise ValueError("Location is offline or its VLESS config is incomplete")
+        elif not _location_has_fresh_live_signal(current_row):
+            raise ValueError("Location is offline or has not passed a fresh live tunnel check")
 
     payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
     if not payload:
