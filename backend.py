@@ -2316,9 +2316,9 @@ def _flag_emoji(country_code: Optional[str]) -> str:
 def _subscription_country_flag(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
     country_code = (
-        row.get("country_code")
-        or normalized.get("resolved_country_code")
+        normalized.get("resolved_country_code")
         or normalized.get("country_code")
+        or row.get("country_code")
     )
     return _flag_emoji(str(country_code).strip().upper()) if country_code else ""
 
@@ -2336,11 +2336,12 @@ def _subscription_icon_for_row(row: Dict[str, Any], payload: Optional[Dict[str, 
         )
         if str(part or "").strip()
     )
+    country_flag = _subscription_country_flag(row, normalized)
     if "lte" in row_code or " lte" in row_name or row_name.endswith("lte"):
-        return "📶"
+        return " ".join(part for part in ("📶", country_flag) if part).strip()
     if row_code.startswith("intl-fast") or "fast / international" in row_name:
-        return "⚡"
-    return _subscription_country_flag(row, normalized)
+        return "🏁"
+    return country_flag
 
 
 def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
@@ -2373,12 +2374,13 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
             "icon": "💎",
         }
     if "lte" in lowered:
+        country_flag = _flag_emoji(country_code)
         return {
             "type": "mobile",
             "section_key": "mobile",
             "section_name_ru": "Мобильные",
             "section_name_en": "Mobile",
-            "icon": "📶",
+            "icon": " ".join(part for part in ("📶", country_flag) if part).strip(),
         }
     if lowered.startswith("intl-fast"):
         return {
@@ -2386,7 +2388,7 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
             "section_key": "countries",
             "section_name_ru": "Основные страны",
             "section_name_en": "Main countries",
-            "icon": "⚡",
+            "icon": "🏁",
         }
     return {
         "type": "node",
