@@ -1058,6 +1058,8 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
 
     payload.setdefault("location_code", requested_location_code or row.get("code"))
     payload.setdefault("resolved_location_code", row.get("code"))
+    payload.setdefault("country_code", row.get("country_code"))
+    payload.setdefault("resolved_country_code", row.get("country_code"))
     payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
     payload.setdefault("display_name", row.get("name_en") or row.get("name_ru") or row.get("code"))
     return payload
