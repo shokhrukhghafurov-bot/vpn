@@ -7,6 +7,7 @@ import ipaddress
 import html
 import json
 import secrets
+import re
 from uuid import uuid4
 import time
 import threading
@@ -195,6 +196,16 @@ class LocationPatchIn(BaseModel):
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
     vpn_payload: Optional[Dict[str, Any]] = None
+
+
+class AdminLocationImportIn(BaseModel):
+    source: str
+    is_active: bool = True
+    is_recommended: bool = False
+    is_reserve: bool = False
+    status: str = "online"
+    sort_order_start: int = 100
+    sort_order_step: int = 10
 
 
 class BroadcastIn(BaseModel):
@@ -406,6 +417,279 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
     if query.get("alpn"):
         payload["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
     return _normalize_vpn_payload_keys(payload)
+
+
+_SUBSCRIPTION_IMPORT_HEADERS = {
+    "Accept": "text/plain, text/html;q=0.9, */*;q=0.8",
+    "Cache-Control": "no-cache, no-store, max-age=0",
+    "Pragma": "no-cache",
+    "User-Agent": "inet-vpn-import/1.0",
+}
+
+_IMPORT_COUNTRY_PRESETS: Dict[str, Dict[str, Any]] = {
+    "AT": {"ru": "Австрия", "en": "Austria", "aliases": ["австрия", "austria"]},
+    "DE": {"ru": "Германия", "en": "Germany", "aliases": ["германия", "germany", "deutschland"]},
+    "FI": {"ru": "Финляндия", "en": "Finland", "aliases": ["финляндия", "finland"]},
+    "NL": {"ru": "Нидерланды", "en": "Netherlands", "aliases": ["нидерланды", "netherlands", "holland"]},
+    "FR": {"ru": "Франция", "en": "France", "aliases": ["франция", "france"]},
+    "SE": {"ru": "Швеция", "en": "Sweden", "aliases": ["швеция", "sweden"]},
+    "RU": {"ru": "Россия", "en": "Russia", "aliases": ["россия", "russia"]},
+    "PL": {"ru": "Польша", "en": "Poland", "aliases": ["польша", "poland"]},
+    "GB": {"ru": "Великобритания", "en": "United Kingdom", "aliases": ["великобритания", "uk", "united kingdom", "britain", "england"]},
+    "US": {"ru": "США", "en": "USA", "aliases": ["сша", "usa", "united states", "america"]},
+}
+
+
+def _extract_plain_import_url(source: str) -> str:
+    raw = str(source or "").strip()
+    if not raw:
+        return ""
+    for prefix in ("happ://add/", "v2raytun://import/", "hiddify://import/"):
+        if raw.lower().startswith(prefix):
+            clean = unquote(raw[len(prefix):])
+            if prefix == "hiddify://import/" and "#" in clean:
+                clean = clean.split("#", 1)[0]
+            return clean.strip()
+    return raw if raw.startswith(("http://", "https://")) else ""
+
+
+def _extract_subscription_url_from_html(text: str) -> str:
+    raw = str(text or "")
+    if not raw:
+        return ""
+    patterns = [
+        r'id=["\']subscription-link-value["\'][^>]*>(https?://[^<\s]+)</code>',
+        r'https?://[^"\'<>\s]+/sub/[^"\'<>\s]+',
+        r'https?://[^"\'<>\s]+/open-app\?[^"\'<>\s]+',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, raw, flags=re.IGNORECASE)
+        if match:
+            candidate = match.group(1) if match.groups() else match.group(0)
+            return html.unescape(candidate).strip()
+    return ""
+
+
+def _read_subscription_import_source(source: str) -> str:
+    raw = str(source or "").strip()
+    if not raw:
+        raise ValueError("source is required")
+    if raw.startswith("{") and '"outbounds"' in raw:
+        return raw
+    if "vless://" in raw and "\n" in raw:
+        return raw
+    plain_url = _extract_plain_import_url(raw)
+    if plain_url:
+        response = requests.get(_fresh_source_url(plain_url), timeout=20, headers=_SUBSCRIPTION_IMPORT_HEADERS)
+        response.raise_for_status()
+        text = response.text
+        if "vless://" in text:
+            return text
+        nested_url = _extract_subscription_url_from_html(text)
+        if nested_url and nested_url != plain_url:
+            nested_response = requests.get(_fresh_source_url(nested_url), timeout=20, headers=_SUBSCRIPTION_IMPORT_HEADERS)
+            nested_response.raise_for_status()
+            return nested_response.text
+        return text
+    return raw
+
+
+def _parse_raw_xray_json_to_payload(text: str) -> Optional[Dict[str, Any]]:
+    raw = str(text or "").strip()
+    if not raw.startswith("{"):
+        return None
+    try:
+        data = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    outbounds = data.get("outbounds") or []
+    proxy = None
+    for item in outbounds:
+        if isinstance(item, dict) and str(item.get("protocol") or "").strip().lower() == "vless":
+            proxy = item
+            break
+    if not isinstance(proxy, dict):
+        return None
+    vnext = (((proxy.get("settings") or {}).get("vnext") or [None])[0] or {})
+    user = (((vnext.get("users") or [None])[0]) or {})
+    stream = proxy.get("streamSettings") or {}
+    reality = stream.get("realitySettings") or {}
+    grpc = stream.get("grpcSettings") or {}
+    dns = data.get("dns") or {}
+    dns_servers = [str(item).strip() for item in (dns.get("servers") or []) if str(item).strip()]
+    payload = {
+        "engine": "xray",
+        "protocol": "vless",
+        "server": str(vnext.get("address") or "").strip(),
+        "port": int(vnext.get("port") or 0),
+        "uuid": str(user.get("id") or "").strip(),
+        "transport": str(stream.get("network") or "tcp").strip() or "tcp",
+        "network": str(stream.get("network") or "tcp").strip() or "tcp",
+        "security": str(stream.get("security") or "reality").strip() or "reality",
+        "flow": str(user.get("flow") or "").strip(),
+        "server_name": str(reality.get("serverName") or "").strip(),
+        "sni": str(reality.get("serverName") or "").strip(),
+        "public_key": str(reality.get("publicKey") or "").strip(),
+        "short_id": str(reality.get("shortId") or "").strip(),
+        "fingerprint": str(reality.get("fingerprint") or "chrome").strip() or "chrome",
+        "service_name": str(grpc.get("serviceName") or "").strip(),
+        "path": str(grpc.get("serviceName") or stream.get("path") or "").strip(),
+        "remark": str(data.get("remarks") or data.get("remark") or "").strip(),
+        "dns_servers": dns_servers or ["1.1.1.1", "8.8.8.8"],
+        "connect_mode": "tun",
+        "full_tunnel": True,
+    }
+    if payload["server"] and payload["port"] > 0 and payload["uuid"]:
+        return _normalize_vpn_payload_keys(payload)
+    return None
+
+
+def _country_code_from_flag_emoji(text: str) -> Optional[str]:
+    chars = list(str(text or ""))
+    for idx in range(len(chars) - 1):
+        codepoints = [ord(chars[idx]), ord(chars[idx + 1])]
+        if all(0x1F1E6 <= item <= 0x1F1FF for item in codepoints):
+            return "".join(chr(item - 127397) for item in codepoints)
+    return None
+
+
+def _clean_import_location_name(text: str) -> str:
+    raw = html.unescape(unquote(str(text or "").strip()))
+    raw = re.sub(r'[🇦-🇿]{2}', ' ', raw)
+    for marker in ("⚡️", "⚡", "🔥", "💎", "📶", "⭐", "★", "✨"):
+        raw = raw.replace(marker, " ")
+    raw = raw.replace("| JSON", " ").replace("VLESS", " ").replace("JSON", " ")
+    raw = re.sub(r'\s+', ' ', raw).strip(' -|')
+    return raw.strip()
+
+
+def _infer_location_names_from_payload(payload: Dict[str, Any]) -> Tuple[str, str, Optional[str]]:
+    remark = str(payload.get("remark") or payload.get("display_name") or payload.get("name_en") or "").strip()
+    clean = _clean_import_location_name(remark)
+    country_code = str(payload.get("location_code") or payload.get("country_code") or "").strip().upper() or None
+    if country_code and len(country_code) != 2:
+        country_code = None
+    if not country_code:
+        country_code = _country_code_from_flag_emoji(remark)
+    if country_code and country_code in _IMPORT_COUNTRY_PRESETS:
+        preset = _IMPORT_COUNTRY_PRESETS[country_code]
+        return preset["ru"], preset["en"], country_code
+    lower_clean = clean.lower()
+    for code, preset in _IMPORT_COUNTRY_PRESETS.items():
+        for alias in preset.get("aliases") or []:
+            if alias in lower_clean:
+                return preset["ru"], preset["en"], code
+    fallback = clean or str(payload.get("server") or "Location").strip()
+    return fallback, fallback, country_code
+
+
+def _slugify_location_code(text: str) -> str:
+    value = re.sub(r'[^a-z0-9]+', '-', str(text or '').strip().lower())
+    value = value.strip('-')
+    return value or 'loc'
+
+
+def _next_location_identity(base_code: str, base_name_ru: str, base_name_en: str, existing_codes: set[str]) -> Tuple[str, str, str]:
+    clean_code = _slugify_location_code(base_code)
+    if clean_code not in existing_codes:
+        return clean_code, base_name_ru, base_name_en
+    suffix = 2
+    while True:
+        candidate = f"{clean_code}-{suffix}"
+        if candidate not in existing_codes:
+            return candidate, f"{base_name_ru} {suffix}", f"{base_name_en} {suffix}"
+        suffix += 1
+
+
+def _parse_import_source_payloads(source: str) -> List[Dict[str, Any]]:
+    text = _read_subscription_import_source(source)
+    one_payload = _parse_raw_xray_json_to_payload(text)
+    parsed: List[Dict[str, Any]] = []
+    if one_payload:
+        parsed.append(one_payload)
+        return parsed
+    for line in text.splitlines():
+        payload = _parse_vless_subscription_line(line)
+        if payload and _config_is_complete(payload):
+            parsed.append(_normalize_vpn_payload_keys(payload))
+    return parsed
+
+
+def _import_locations_from_source(source: str, *, is_active: bool, is_recommended: bool, is_reserve: bool, status: str, sort_order_start: int, sort_order_step: int) -> Dict[str, Any]:
+    parsed_payloads = _parse_import_source_payloads(source)
+    if not parsed_payloads:
+        raise ValueError("No VLESS locations found in source")
+
+    existing_rows = list_locations(active_only=False)
+    existing_codes = {str(row.get('code') or '').strip().lower() for row in existing_rows if str(row.get('code') or '').strip()}
+    existing_by_identity: Dict[str, Dict[str, Any]] = {}
+    for row in existing_rows:
+        row_payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get('vpn_payload') or {})
+        row_payload = _normalize_vpn_payload_keys(row_payload) if isinstance(row_payload, dict) else {}
+        identity = _candidate_identity_key(row_payload)
+        if identity:
+            existing_by_identity[identity] = row
+
+    imported: List[Dict[str, Any]] = []
+    seen_identities: set[str] = set()
+    current_sort = int(sort_order_start or 100)
+    step = max(1, int(sort_order_step or 10))
+
+    for payload in parsed_payloads:
+        normalized = _normalize_vpn_payload_keys(payload)
+        identity = _candidate_identity_key(normalized)
+        if identity and identity in seen_identities:
+            continue
+        if identity:
+            seen_identities.add(identity)
+        name_ru, name_en, country_code = _infer_location_names_from_payload(normalized)
+        desired_code_base = (country_code or normalized.get('location_code') or name_en or name_ru or 'loc')
+        existing = existing_by_identity.get(identity) if identity else None
+        if existing:
+            code = str(existing.get('code') or '').strip()
+            normalized['location_code'] = code or normalized.get('location_code')
+            if not normalized.get('remark'):
+                normalized['remark'] = name_en
+            item = patch_location(int(existing['id']), {
+                'name_ru': name_ru,
+                'name_en': name_en,
+                'country_code': country_code,
+                'is_active': is_active,
+                'is_recommended': is_recommended,
+                'is_reserve': is_reserve,
+                'status': status,
+                'sort_order': current_sort,
+                'vpn_payload': normalized,
+            })
+        else:
+            code, final_name_ru, final_name_en = _next_location_identity(str(desired_code_base).lower(), name_ru, name_en, existing_codes)
+            existing_codes.add(code)
+            normalized['location_code'] = code
+            if not normalized.get('remark'):
+                normalized['remark'] = final_name_en
+            item = create_location({
+                'code': code,
+                'name_ru': final_name_ru,
+                'name_en': final_name_en,
+                'country_code': country_code,
+                'is_active': is_active,
+                'is_recommended': is_recommended,
+                'is_reserve': is_reserve,
+                'status': status,
+                'sort_order': current_sort,
+                'vpn_payload': normalized,
+            })
+        imported.append(serialize_location(item, include_payload=True))
+        current_sort += step
+
+    _invalidate_locations_cache()
+    return {
+        'ok': True,
+        'count': len(imported),
+        'items': imported,
+    }
 
 
 def _transport_allowed(payload: Dict[str, Any], allowed_values: List[str]) -> bool:
@@ -4914,6 +5198,26 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
         "vpn_live_check_auto_minutes": max(1, int(getattr(settings, "VPN_LIVE_CHECK_AUTO_MINUTES", 3) or 3)),
         "vpn_live_check_active_only": bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)),
     }
+
+
+@app.post("/api/infra/admin/vpn/locations/import")
+def admin_locations_import(payload: AdminLocationImportIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        return _import_locations_from_source(
+            payload.source,
+            is_active=bool(payload.is_active),
+            is_recommended=bool(payload.is_recommended),
+            is_reserve=bool(payload.is_reserve),
+            status=str(payload.status or "online").strip().lower() or "online",
+            sort_order_start=int(payload.sort_order_start or 100),
+            sort_order_step=int(payload.sort_order_step or 10),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except requests.RequestException as exc:
+        detail = str(exc).strip() or "Failed to fetch source"
+        raise HTTPException(status_code=502, detail=detail) from exc
 
 
 @app.post("/api/infra/admin/vpn/locations")
