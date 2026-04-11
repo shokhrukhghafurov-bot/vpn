@@ -1,6 +1,6 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote, quote, urljoin
 import base64
 import hashlib
 import ipaddress
@@ -487,37 +487,159 @@ def _extract_subscription_url_from_html(text: str) -> str:
         return ""
     patterns = [
         r'id=["\']subscription-link-value["\'][^>]*>(https?://[^<\s]+)</code>',
+        r'(?:happ|v2raytun|hiddify)://(?:add|import)/https?://[^"\'<>\s]+',
         r'https?://[^"\'<>\s]+/sub/[^"\'<>\s]+',
         r'https?://[^"\'<>\s]+/open-app\?[^"\'<>\s]+',
+        r'["\'](?:subscriptionUrl|subscriptionURL|subscription_link|subscriptionLink|configUrl|configURL|source|url)["\']\s*:\s*["\']([^"\']+)["\']',
+        r'href=["\']((?:happ|v2raytun|hiddify)://(?:add|import)/[^"\']+)["\']',
+        r'href=["\'](https?://[^"\']+)["\']',
     ]
     for pattern in patterns:
         match = re.search(pattern, raw, flags=re.IGNORECASE)
         if match:
             candidate = match.group(1) if match.groups() else match.group(0)
-            return html.unescape(candidate).strip()
+            candidate = html.unescape(candidate).strip()
+            plain = _extract_plain_import_url(candidate)
+            return plain or candidate
     return ""
 
 
-def _read_subscription_import_source(source: str) -> str:
+def _try_decode_base64_subscription_text(text: str) -> str:
+    raw = str(text or "").strip()
+    if not raw:
+        return ""
+    compact = re.sub(r'\s+', '', raw)
+    if len(compact) < 64:
+        return ""
+    if not re.fullmatch(r'[A-Za-z0-9+/=_-]+', compact):
+        return ""
+    padded = compact + ('=' * ((4 - len(compact) % 4) % 4))
+    for altchars in (None, b'-_'):
+        try:
+            if altchars is None:
+                decoded = base64.b64decode(padded, validate=False)
+            else:
+                decoded = base64.b64decode(padded, altchars=altchars, validate=False)
+            decoded_text = decoded.decode('utf-8', errors='ignore').strip()
+        except Exception:
+            continue
+        if decoded_text and ('vless://' in decoded_text or '"outbounds"' in decoded_text or '"protocol"' in decoded_text):
+            return decoded_text
+    return ""
+
+
+def _extract_vless_candidates(text: str) -> List[str]:
+    raw = html.unescape(str(text or ''))
+    if not raw:
+        return []
+    pattern = r'vless://[^\s"\'<>)]+'
+    items: List[str] = []
+    seen: set[str] = set()
+    for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
+        candidate = match.group(0).rstrip('\\').rstrip(',;')
+        if candidate not in seen:
+            seen.add(candidate)
+            items.append(candidate)
+    return items
+
+
+def _extract_candidate_import_urls(text: str, base_url: str = "") -> List[str]:
+    raw = html.unescape(str(text or ''))
+    if not raw:
+        return []
+    patterns = [
+        r'(?:happ|v2raytun|hiddify)://(?:add|import)/https?://[^"\'<>\s]+',
+        r'https?://[^"\'<>\s]+',
+        r'[?&](?:url|source|subscription|subscription_url)=([^&"\'<>\s]+)',
+    ]
+    items: List[str] = []
+    seen: set[str] = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, raw, flags=re.IGNORECASE):
+            candidate = match.group(1) if match.groups() else match.group(0)
+            candidate = html.unescape(unquote(candidate)).strip()
+            plain = _extract_plain_import_url(candidate)
+            candidate = plain or candidate
+            if candidate.startswith('/') and base_url:
+                candidate = urljoin(base_url, candidate)
+            if not candidate.startswith(('http://', 'https://')):
+                continue
+            if candidate not in seen:
+                seen.add(candidate)
+                items.append(candidate)
+    return items
+
+
+def _read_subscription_import_source(source: str, _depth: int = 0, _visited: Optional[set[str]] = None) -> str:
     raw = str(source or "").strip()
     if not raw:
         raise ValueError("source is required")
+    if _visited is None:
+        _visited = set()
+    max_depth = max(1, int(getattr(settings, "VPN_IMPORT_DISCOVERY_DEPTH", 3) or 3))
+    if _depth > max_depth:
+        return raw
+
     if raw.startswith("{") and '"outbounds"' in raw:
         return raw
-    if "vless://" in raw and "\n" in raw:
+    if raw.startswith("[") and ('"outbounds"' in raw or '"protocol"' in raw):
         return raw
+    extracted_direct = _extract_vless_candidates(raw)
+    if extracted_direct:
+        return "\n".join(extracted_direct)
+    decoded_raw = _try_decode_base64_subscription_text(raw)
+    if decoded_raw:
+        return _read_subscription_import_source(decoded_raw, _depth=_depth + 1, _visited=_visited)
+
     plain_url = _extract_plain_import_url(raw)
     if plain_url:
-        response = requests.get(_fresh_source_url(plain_url), timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)), headers=_SUBSCRIPTION_IMPORT_HEADERS)
+        if plain_url in _visited:
+            return ""
+        _visited.add(plain_url)
+        response = requests.get(
+            _fresh_source_url(plain_url),
+            timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)),
+            headers=_SUBSCRIPTION_IMPORT_HEADERS,
+        )
         response.raise_for_status()
-        text = response.text
-        if "vless://" in text:
+        text = response.text or ""
+
+        extracted = _extract_vless_candidates(text)
+        if extracted:
+            return "\n".join(extracted)
+        decoded_text = _try_decode_base64_subscription_text(text)
+        if decoded_text:
+            return _read_subscription_import_source(decoded_text, _depth=_depth + 1, _visited=_visited)
+        if _parse_raw_xray_json_to_payload(text):
             return text
+
+        candidates: List[str] = []
         nested_url = _extract_subscription_url_from_html(text)
-        if nested_url and nested_url != plain_url:
-            nested_response = requests.get(_fresh_source_url(nested_url), timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)), headers=_SUBSCRIPTION_IMPORT_HEADERS)
-            nested_response.raise_for_status()
-            return nested_response.text
+        if nested_url:
+            plain_nested = _extract_plain_import_url(nested_url)
+            candidates.append(plain_nested or nested_url)
+        candidates.extend(_extract_candidate_import_urls(text, base_url=plain_url))
+
+        seen_nested: set[str] = set()
+        for candidate in candidates:
+            clean = str(candidate or '').strip()
+            if not clean or clean in seen_nested or clean == plain_url:
+                continue
+            seen_nested.add(clean)
+            try:
+                nested_text = _read_subscription_import_source(clean, _depth=_depth + 1, _visited=_visited)
+            except Exception:
+                continue
+            if not nested_text:
+                continue
+            nested_vless = _extract_vless_candidates(nested_text)
+            if nested_vless:
+                return "\n".join(nested_vless)
+            if _parse_raw_xray_json_to_payload(nested_text):
+                return nested_text
+            decoded_nested = _try_decode_base64_subscription_text(nested_text)
+            if decoded_nested:
+                return decoded_nested
         return text
     return raw
 
@@ -631,14 +753,51 @@ def _next_location_identity(base_code: str, base_name_ru: str, base_name_en: str
         suffix += 1
 
 
+def _extract_raw_json_payloads(text: str) -> List[Dict[str, Any]]:
+    raw = str(text or '').strip()
+    if not raw:
+        return []
+    items: List[Dict[str, Any]] = []
+    decoder = json.JSONDecoder()
+    idx = 0
+    length = len(raw)
+    while idx < length:
+        while idx < length and raw[idx] not in '{[':
+            idx += 1
+        if idx >= length:
+            break
+        try:
+            obj, next_idx = decoder.raw_decode(raw, idx)
+        except Exception:
+            idx += 1
+            continue
+        candidates = obj if isinstance(obj, list) else [obj]
+        for candidate in candidates:
+            if isinstance(candidate, dict):
+                payload = _parse_raw_xray_json_to_payload(json.dumps(candidate, ensure_ascii=False))
+                if payload and _config_is_complete(payload):
+                    items.append(_normalize_vpn_payload_keys(payload))
+        idx = max(next_idx, idx + 1)
+    return items
+
+
 def _parse_import_source_payloads(source: str) -> List[Dict[str, Any]]:
     text = _read_subscription_import_source(source)
-    one_payload = _parse_raw_xray_json_to_payload(text)
     parsed: List[Dict[str, Any]] = []
+
+    one_payload = _parse_raw_xray_json_to_payload(text)
     if one_payload:
         parsed.append(one_payload)
         return parsed
-    for line in text.splitlines():
+
+    json_payloads = _extract_raw_json_payloads(text)
+    if json_payloads:
+        return json_payloads
+
+    candidates = _extract_vless_candidates(text)
+    if not candidates:
+        candidates = [line.strip() for line in text.splitlines() if line.strip()]
+    for line in candidates:
         payload = _parse_vless_subscription_line(line)
         if payload and _config_is_complete(payload):
             parsed.append(_normalize_vpn_payload_keys(payload))
