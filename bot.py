@@ -209,22 +209,19 @@ def tx(lang: str, key: str) -> str:
 
 def payment_created_text(lang: str) -> str:
     commission = max(float(getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0) or 0.0), 0.0)
+    percent = int(commission) if float(commission).is_integer() else commission
     if lang == "ru":
         lines = [
-            "Подписка активируется автоматически после успешной оплаты ✅",
+            "✅ Подписка активируется автоматически после успешной оплаты.",
+            f"💰 Обратите внимание: к сумме добавляется комиссия платёжной системы — {percent}%.",
+            "После оплаты может потребоваться подождать до 10 минут из-за обработки платежа банком 🕒.",
         ]
-        if commission > 0:
-            percent = int(commission) if float(commission).is_integer() else commission
-            lines.append(f"💰 Обратите внимание: к сумме добавляется комиссия платёжной системы — {percent}%.")
-        lines.append("После оплаты может потребоваться подождать до 10 минут из-за обработки платежа банком 🕒.")
         return "\n".join(lines)
     lines = [
-        "Your subscription activates automatically after successful payment ✅",
+        "✅ Your subscription activates automatically after successful payment.",
+        f"💰 Please note: a payment system fee of {percent}% is added to the amount.",
+        "After payment, it may take up to 10 minutes because of bank processing 🕒.",
     ]
-    if commission > 0:
-        percent = int(commission) if float(commission).is_integer() else commission
-        lines.append(f"💰 Please note: a payment system fee of {percent}% is added to the amount.")
-    lines.append("After payment, it may take up to 10 minutes because of bank processing 🕒.")
     return "\n".join(lines)
 
 
