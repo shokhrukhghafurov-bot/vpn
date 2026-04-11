@@ -110,6 +110,7 @@ def _default_ru_lte_source_urls() -> str:
         f"{base}/Vless-Reality-White-Lists-Rus-Mobile.txt",
         f"{base}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
         f"{base}/WHITE-CIDR-RU-checked.txt",
+        f"{base}/WHITE-CIDR-RU-all.txt",
     ])
 
 
@@ -268,7 +269,7 @@ class Settings:
     RU_LTE_DEAD_COOLDOWN_MINUTES: int = _env_int("RU_LTE_DEAD_COOLDOWN_MINUTES", 45)
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
     RU_LTE_REAL_PROBE_ENABLED: bool = _env_bool("RU_LTE_REAL_PROBE_ENABLED", True)
-    RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", True)
+    RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", False)
     RU_LTE_REAL_PROBE_RUNNER: str = os.getenv("RU_LTE_REAL_PROBE_RUNNER", "xray")
     RU_LTE_REAL_PROBE_XRAY_BIN: str = os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray")
     RU_LTE_REAL_PROBE_SINGBOX_BIN: str = os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box")
@@ -278,7 +279,6 @@ class Settings:
     RU_LTE_REAL_PROBE_WARMUP_MS: int = _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200)
     VPN_REAL_PROBE_ENABLED: bool = _env_bool("VPN_REAL_PROBE_ENABLED", True)
     VPN_REAL_PROBE_REQUIRED: bool = _env_bool("VPN_REAL_PROBE_REQUIRED", False)
-    BLACK_REAL_PROBE_REQUIRED: bool = _env_bool("BLACK_REAL_PROBE_REQUIRED", True)
     VPN_REAL_PROBE_RUNNER: str = os.getenv("VPN_REAL_PROBE_RUNNER", os.getenv("RU_LTE_REAL_PROBE_RUNNER", "auto"))
     VPN_REAL_PROBE_XRAY_BIN: str = os.getenv("VPN_REAL_PROBE_XRAY_BIN", os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray"))
     VPN_REAL_PROBE_SINGBOX_BIN: str = os.getenv("VPN_REAL_PROBE_SINGBOX_BIN", os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box"))
