@@ -1038,6 +1038,8 @@ async def cb_plan_view(callback: CallbackQuery) -> None:
                 f"{TEXT[lang]['price']}: {plan['price_rub']} ₽",
                 f"{TEXT[lang]['devices_up_to']}: {plan['device_limit']}",
                 f"{TEXT[lang]['payment_method']}: {TEXT[lang]['pay_card']}",
+                "",
+                payment_created_text(lang),
             ]
         )
         await safe_edit(callback, text, plan_actions_inline(lang, plan_code))
