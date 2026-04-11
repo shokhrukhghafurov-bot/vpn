@@ -207,6 +207,27 @@ def tx(lang: str, key: str) -> str:
     return raw
 
 
+def payment_created_text(lang: str) -> str:
+    commission = max(float(getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0) or 0.0), 0.0)
+    if lang == "ru":
+        lines = [
+            "Подписка активируется автоматически после успешной оплаты ✅",
+        ]
+        if commission > 0:
+            percent = int(commission) if float(commission).is_integer() else commission
+            lines.append(f"💰 Обратите внимание: к сумме добавляется комиссия платёжной системы — {percent}%.")
+        lines.append("После оплаты может потребоваться подождать до 10 минут из-за обработки платежа банком 🕒.")
+        return "\n".join(lines)
+    lines = [
+        "Your subscription activates automatically after successful payment ✅",
+    ]
+    if commission > 0:
+        percent = int(commission) if float(commission).is_integer() else commission
+        lines.append(f"💰 Please note: a payment system fee of {percent}% is added to the amount.")
+    lines.append("After payment, it may take up to 10 minutes because of bank processing 🕒.")
+    return "\n".join(lines)
+
+
 def platform_download_button_text(lang: str, platform: str) -> str:
     key = (platform or "").strip().lower()
     if lang == "ru":
@@ -1036,7 +1057,7 @@ async def cb_plan_pay(callback: CallbackQuery) -> None:
             await callback.answer()
             return
         checkout_url = payment.get("checkout_url") or settings.SUPPORT_TELEGRAM_URL
-        await safe_edit(callback, TEXT[lang]["payment_created"], payment_inline(lang, checkout_url, payment["id"]))
+        await safe_edit(callback, payment_created_text(lang), payment_inline(lang, checkout_url, payment["id"]))
         await callback.answer()
 
     await with_user_guard(callback, _handler)
