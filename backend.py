@@ -2316,11 +2316,31 @@ def _flag_emoji(country_code: Optional[str]) -> str:
 def _subscription_country_flag(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
     country_code = (
-        normalized.get("country_code")
-        or row.get("country_code")
+        row.get("country_code")
         or normalized.get("resolved_country_code")
+        or normalized.get("country_code")
     )
     return _flag_emoji(str(country_code).strip().upper()) if country_code else ""
+
+
+def _subscription_icon_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    row_code = str(row.get("code") or normalized.get("resolved_location_code") or normalized.get("location_code") or "").strip().lower()
+    row_name = " ".join(
+        str(part or "").strip().lower()
+        for part in (
+            row.get("name_en"),
+            row.get("name_ru"),
+            normalized.get("remark"),
+            normalized.get("display_name"),
+        )
+        if str(part or "").strip()
+    )
+    if "lte" in row_code or " lte" in row_name or row_name.endswith("lte"):
+        return "📶"
+    if row_code.startswith("intl-fast") or "fast / international" in row_name:
+        return "⚡"
+    return _subscription_country_flag(row, normalized)
 
 
 def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
@@ -2333,9 +2353,9 @@ def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dic
         or row.get("code")
         or "VLESS"
     ).strip() or "VLESS"
-    flag = _subscription_country_flag(row, normalized)
-    if flag and not base_name.startswith((f"{flag} ", flag)):
-        base_name = f"{flag} {base_name}"
+    icon = _subscription_icon_for_row(row, normalized)
+    if icon and not base_name.startswith((f"{icon} ", icon)):
+        base_name = f"{icon} {base_name}"
     return base_name
 
 
@@ -2343,6 +2363,7 @@ def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dic
 def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
     code = str(row.get("code") or "")
     country_code = row.get("country_code")
+    lowered = code.lower()
     if code.startswith("auto-"):
         return {
             "type": "virtual",
@@ -2351,13 +2372,21 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
             "section_name_en": "System",
             "icon": "💎",
         }
-    if "lte" in code.lower():
+    if "lte" in lowered:
         return {
             "type": "mobile",
             "section_key": "mobile",
             "section_name_ru": "Мобильные",
             "section_name_en": "Mobile",
             "icon": "📶",
+        }
+    if lowered.startswith("intl-fast"):
+        return {
+            "type": "node",
+            "section_key": "countries",
+            "section_name_ru": "Основные страны",
+            "section_name_en": "Main countries",
+            "icon": "⚡",
         }
     return {
         "type": "node",
