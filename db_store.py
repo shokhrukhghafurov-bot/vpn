@@ -226,24 +226,6 @@ CREATE TABLE IF NOT EXISTS virtual_location_assignments (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(user_id, virtual_code)
 );
-
-CREATE TABLE IF NOT EXISTS vpn_import_sources (
-    id SERIAL PRIMARY KEY,
-    source_url TEXT NOT NULL UNIQUE,
-    is_enabled BOOLEAN NOT NULL DEFAULT TRUE,
-    auto_refresh_minutes INTEGER NOT NULL DEFAULT 10,
-    is_active BOOLEAN NOT NULL DEFAULT TRUE,
-    is_recommended BOOLEAN NOT NULL DEFAULT FALSE,
-    is_reserve BOOLEAN NOT NULL DEFAULT FALSE,
-    status TEXT NOT NULL DEFAULT 'online',
-    sort_order_start INTEGER NOT NULL DEFAULT 100,
-    sort_order_step INTEGER NOT NULL DEFAULT 10,
-    last_import_at TIMESTAMPTZ,
-    last_import_ok BOOLEAN,
-    last_import_error TEXT,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
 """
 
 MIGRATION_SQL = [
@@ -324,22 +306,6 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
-    "CREATE TABLE IF NOT EXISTS vpn_import_sources (id SERIAL PRIMARY KEY, source_url TEXT NOT NULL UNIQUE, is_enabled BOOLEAN NOT NULL DEFAULT TRUE, auto_refresh_minutes INTEGER NOT NULL DEFAULT 10, is_active BOOLEAN NOT NULL DEFAULT TRUE, is_recommended BOOLEAN NOT NULL DEFAULT FALSE, is_reserve BOOLEAN NOT NULL DEFAULT FALSE, status TEXT NOT NULL DEFAULT 'online', sort_order_start INTEGER NOT NULL DEFAULT 100, sort_order_step INTEGER NOT NULL DEFAULT 10, last_import_at TIMESTAMPTZ, last_import_ok BOOLEAN, last_import_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS source_url TEXT",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS is_enabled BOOLEAN DEFAULT TRUE",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS auto_refresh_minutes INTEGER DEFAULT 10",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS is_recommended BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS is_reserve BOOLEAN DEFAULT FALSE",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS status TEXT DEFAULT 'online'",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS sort_order_start INTEGER DEFAULT 100",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS sort_order_step INTEGER DEFAULT 10",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS last_import_at TIMESTAMPTZ",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS last_import_ok BOOLEAN",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS last_import_error TEXT",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
-    "ALTER TABLE vpn_import_sources ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_vpn_import_sources_source_url ON vpn_import_sources(source_url)",
 ]
 
 POST_MIGRATION_SQL = [
@@ -362,7 +328,6 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
-    "CREATE TABLE IF NOT EXISTS vpn_import_sources (id SERIAL PRIMARY KEY, source_url TEXT NOT NULL UNIQUE, is_enabled BOOLEAN NOT NULL DEFAULT TRUE, auto_refresh_minutes INTEGER NOT NULL DEFAULT 10, is_active BOOLEAN NOT NULL DEFAULT TRUE, is_recommended BOOLEAN NOT NULL DEFAULT FALSE, is_reserve BOOLEAN NOT NULL DEFAULT FALSE, status TEXT NOT NULL DEFAULT 'online', sort_order_start INTEGER NOT NULL DEFAULT 100, sort_order_step INTEGER NOT NULL DEFAULT 10, last_import_at TIMESTAMPTZ, last_import_ok BOOLEAN, last_import_error TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
     "UPDATE locations SET name_en = 'Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en IN ('Auto | Fastest', '★ Auto | Fastest'))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
@@ -2254,128 +2219,6 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
         with conn.cursor() as cur:
             cur.execute(query)
             return [dict(row) for row in cur.fetchall()]
-
-
-def list_vpn_import_sources(enabled_only: bool = False) -> List[Dict[str, Any]]:
-    query = "SELECT * FROM vpn_import_sources"
-    if enabled_only:
-        query += " WHERE is_enabled = TRUE"
-    query += " ORDER BY id ASC"
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(query)
-            return [dict(row) for row in cur.fetchall()]
-
-
-def upsert_vpn_import_source(payload: Dict[str, Any]) -> Dict[str, Any]:
-    source_url = str(payload.get("source_url") or payload.get("source") or "").strip()
-    if not source_url:
-        raise ValueError("source_url is required")
-    data = {
-        "source_url": source_url,
-        "is_enabled": bool(payload.get("is_enabled", True)),
-        "auto_refresh_minutes": max(1, int(payload.get("auto_refresh_minutes") or 10)),
-        "is_active": bool(payload.get("is_active", True)),
-        "is_recommended": bool(payload.get("is_recommended", False)),
-        "is_reserve": bool(payload.get("is_reserve", False)),
-        "status": str(payload.get("status") or "online").strip().lower() or "online",
-        "sort_order_start": int(payload.get("sort_order_start") or 100),
-        "sort_order_step": max(1, int(payload.get("sort_order_step") or 10)),
-    }
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO vpn_import_sources (source_url, is_enabled, auto_refresh_minutes, is_active, is_recommended, is_reserve, status, sort_order_start, sort_order_step)
-                VALUES (%(source_url)s, %(is_enabled)s, %(auto_refresh_minutes)s, %(is_active)s, %(is_recommended)s, %(is_reserve)s, %(status)s, %(sort_order_start)s, %(sort_order_step)s)
-                ON CONFLICT (source_url) DO UPDATE SET
-                    is_enabled = EXCLUDED.is_enabled,
-                    auto_refresh_minutes = EXCLUDED.auto_refresh_minutes,
-                    is_active = EXCLUDED.is_active,
-                    is_recommended = EXCLUDED.is_recommended,
-                    is_reserve = EXCLUDED.is_reserve,
-                    status = EXCLUDED.status,
-                    sort_order_start = EXCLUDED.sort_order_start,
-                    sort_order_step = EXCLUDED.sort_order_step,
-                    updated_at = NOW()
-                RETURNING *
-                """,
-                data,
-            )
-            row = cur.fetchone()
-        conn.commit()
-    return dict(row) if row else {}
-
-
-def update_vpn_import_source(source_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-    updates = []
-    values: List[Any] = []
-    allowed = {"source_url", "is_enabled", "auto_refresh_minutes", "is_active", "is_recommended", "is_reserve", "status", "sort_order_start", "sort_order_step", "last_import_at", "last_import_ok", "last_import_error"}
-    for key, value in payload.items():
-        if key not in allowed:
-            continue
-        if key == "source_url":
-            value = str(value or "").strip()
-        elif key in {"is_enabled", "is_active", "is_recommended", "is_reserve"}:
-            value = bool(value)
-        elif key == "last_import_ok":
-            value = None if value is None else bool(value)
-        elif key in {"auto_refresh_minutes", "sort_order_start", "sort_order_step"}:
-            value = max(1, int(value or 1))
-        elif key == "status":
-            value = str(value or "online").strip().lower() or "online"
-        elif key == "last_import_at":
-            value = _normalize_optional_timestamp(value)
-        elif key == "last_import_error":
-            value = str(value or "").strip() or None
-        updates.append(f"{key} = %s")
-        values.append(value)
-    if not updates:
-        raise ValueError("No valid fields to update")
-    values.append(source_id)
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(f"UPDATE vpn_import_sources SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s RETURNING *", tuple(values))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Import source not found")
-        conn.commit()
-    return dict(row)
-
-
-def mark_vpn_import_source_result(source_id: int, *, ok: bool, error: Optional[str] = None) -> Dict[str, Any]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE vpn_import_sources
-                SET last_import_at = NOW(),
-                    last_import_ok = %s,
-                    last_import_error = %s,
-                    updated_at = NOW()
-                WHERE id = %s
-                RETURNING *
-                """,
-                (bool(ok), str(error or "").strip() or None, source_id),
-            )
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("Import source not found")
-        conn.commit()
-    return dict(row)
-
-
-def due_vpn_import_sources(now: Optional[datetime] = None) -> List[Dict[str, Any]]:
-    reference = now or datetime.now(timezone.utc)
-    due: List[Dict[str, Any]] = []
-    for row in list_vpn_import_sources(enabled_only=True):
-        minutes = max(1, int(row.get("auto_refresh_minutes") or 10))
-        last = row.get("last_import_at")
-        if isinstance(last, str):
-            last = _normalize_optional_timestamp(last)
-        if last is None or (reference - last).total_seconds() >= minutes * 60:
-            due.append(dict(row))
-    return due
 
 
 def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_status: str = "offline") -> Dict[str, Any]:
