@@ -2510,6 +2510,8 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
     payment = get_payment_by_internal_or_external(payment_id)
     if not payment:
         raise ValueError("Payment not found")
+    if payment.get("status") == "paid":
+        return payment
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM plans WHERE id = %s", (payment["plan_id"],))
@@ -2520,12 +2522,11 @@ def activate_payment_and_extend_subscription(payment_id: str) -> Dict[str, Any]:
                 raise ValueError("Plan or user not found")
             if user["status"] == "blocked":
                 raise PermissionError("Blocked user cannot be activated")
-            if payment["status"] != "paid":
-                cur.execute(
-                    "UPDATE payments SET status = 'paid', paid_at = COALESCE(paid_at, NOW()) WHERE id = %s RETURNING *",
-                    (payment["id"],),
-                )
-                payment = dict(cur.fetchone())
+            cur.execute(
+                "UPDATE payments SET status = 'paid', paid_at = COALESCE(paid_at, NOW()) WHERE id = %s RETURNING *",
+                (payment["id"],),
+            )
+            payment = dict(cur.fetchone())
             cur.execute(
                 "SELECT * FROM subscriptions WHERE user_id = %s ORDER BY expires_at DESC LIMIT 1",
                 (payment["user_id"],),
