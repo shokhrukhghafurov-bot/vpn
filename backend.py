@@ -2340,7 +2340,7 @@ def _subscription_icon_for_row(row: Dict[str, Any], payload: Optional[Dict[str, 
     if "lte" in row_code or " lte" in row_name or row_name.endswith("lte"):
         return " ".join(part for part in ("📶", country_flag) if part).strip()
     if row_code.startswith("intl-fast") or "fast / international" in row_name:
-        return "🏁"
+        return "🌍"
     return country_flag
 
 
@@ -2388,7 +2388,7 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
             "section_key": "countries",
             "section_name_ru": "Основные страны",
             "section_name_en": "Main countries",
-            "icon": "🏁",
+            "icon": "🌍",
         }
     return {
         "type": "node",
