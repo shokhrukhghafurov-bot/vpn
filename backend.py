@@ -2313,35 +2313,86 @@ def _flag_emoji(country_code: Optional[str]) -> str:
     return "".join(chr(127397 + ord(char)) for char in code)
 
 
-def _subscription_country_flag(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+
+def _location_row_by_code(code: str) -> Optional[Dict[str, Any]]:
+    normalized_code = str(code or "").strip().lower()
+    if not normalized_code:
+        return None
+    for item in list_locations(active_only=False):
+        item_code = str(item.get("code") or "").strip().lower()
+        if item_code == normalized_code:
+            return dict(item)
+    return None
+
+
+def _resolved_location_code_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
-    country_code = (
+    row_code = str(row.get("code") or "").strip()
+    if row_code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        return str(normalized.get("resolved_location_code") or normalized.get("location_code") or row_code).strip()
+    return str(normalized.get("resolved_location_code") or normalized.get("location_code") or row_code).strip()
+
+
+def _resolved_country_code_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    country_code = str(
         normalized.get("resolved_country_code")
         or normalized.get("country_code")
         or row.get("country_code")
-    )
-    return _flag_emoji(str(country_code).strip().upper()) if country_code else ""
+        or ""
+    ).strip()
+    if country_code:
+        return country_code.upper()
+    effective_code = _resolved_location_code_for_row(row, normalized)
+    if effective_code:
+        matched_row = _location_row_by_code(effective_code)
+        matched_country_code = str((matched_row or {}).get("country_code") or "").strip()
+        if matched_country_code:
+            return matched_country_code.upper()
+    return ""
+
+
+def _subscription_country_flag(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    country_code = _resolved_country_code_for_row(row, payload)
+    return _flag_emoji(country_code) if country_code else ""
+
+
+def _strip_leading_location_tokens(value: str) -> str:
+    cleaned = str(value or "").strip()
+    while True:
+        updated = cleaned
+        updated = re.sub(r"^(?:★|⭐)\s+", "", updated).strip()
+        updated = re.sub(r"^[\U0001F1E6-\U0001F1FF]{2}\s*", "", updated).strip()
+        updated = re.sub(r"^(?:📶|🌍|🌎|🌏|🌐|🏁|⚡)\s*", "", updated).strip()
+        if updated == cleaned:
+            return updated
+        cleaned = updated
 
 
 def _subscription_icon_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
-    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
-    row_code = str(row.get("code") or normalized.get("resolved_location_code") or normalized.get("location_code") or "").strip().lower()
-    row_name = " ".join(
-        str(part or "").strip().lower()
-        for part in (
-            row.get("name_en"),
-            row.get("name_ru"),
-            normalized.get("remark"),
-            normalized.get("display_name"),
-        )
-        if str(part or "").strip()
-    )
-    country_flag = _subscription_country_flag(row, normalized)
-    if "lte" in row_code or " lte" in row_name or row_name.endswith("lte"):
-        return " ".join(part for part in ("📶", country_flag) if part).strip()
-    if row_code.startswith("intl-fast") or "fast / international" in row_name:
+    effective_code = _resolved_location_code_for_row(row, payload).lower()
+    country_flag = _subscription_country_flag(row, payload)
+    if effective_code.startswith("ru-lte"):
+        return country_flag or "🇷🇺"
+    if effective_code.startswith("intl-fast"):
         return "🌍"
     return country_flag
+
+
+def _decorate_location_text(base_name: str, effective_code: str) -> str:
+    text_value = str(base_name or "").strip()
+    if not text_value:
+        return "VLESS"
+    if "→" in text_value and effective_code.lower().startswith("ru-lte"):
+        left, right = text_value.split("→", 1)
+        right_clean = _strip_leading_location_tokens(right)
+        if not right_clean.startswith("📶"):
+            right_clean = f"📶 {right_clean}".strip()
+        return f"{left.strip()} → {right_clean}".strip()
+    text_value = _strip_leading_location_tokens(text_value)
+    if effective_code.lower().startswith("ru-lte") and not text_value.startswith("📶"):
+        return f"📶 {text_value}".strip()
+    return text_value
 
 
 def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
@@ -2354,16 +2405,18 @@ def _subscription_target_name_for_row(row: Dict[str, Any], payload: Optional[Dic
         or row.get("code")
         or "VLESS"
     ).strip() or "VLESS"
+    effective_code = _resolved_location_code_for_row(row, normalized)
+    display_text = _decorate_location_text(base_name, effective_code)
     icon = _subscription_icon_for_row(row, normalized)
-    if icon and not base_name.startswith((f"{icon} ", icon)):
-        base_name = f"{icon} {base_name}"
-    return base_name
+    if icon:
+        return f"{icon} {display_text}".strip()
+    return display_text
+
 
 
 
 def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
-    code = str(row.get("code") or "")
-    country_code = row.get("country_code")
+    code = str(row.get("code") or "").strip()
     lowered = code.lower()
     if code.startswith("auto-"):
         return {
@@ -2373,14 +2426,13 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
             "section_name_en": "System",
             "icon": "💎",
         }
-    if "lte" in lowered:
-        country_flag = _flag_emoji(country_code)
+    if lowered.startswith("ru-lte"):
         return {
             "type": "mobile",
             "section_key": "mobile",
             "section_name_ru": "Мобильные",
             "section_name_en": "Mobile",
-            "icon": " ".join(part for part in ("📶", country_flag) if part).strip(),
+            "icon": _subscription_icon_for_row(row),
         }
     if lowered.startswith("intl-fast"):
         return {
@@ -2395,7 +2447,7 @@ def _location_meta(row: Dict[str, Any]) -> Dict[str, Any]:
         "section_key": "countries",
         "section_name_ru": "Основные страны",
         "section_name_en": "Main countries",
-        "icon": _flag_emoji(country_code),
+        "icon": _subscription_icon_for_row(row),
     }
 
 
@@ -2717,8 +2769,16 @@ def serialize_location(row: Dict[str, Any], *, include_payload: bool = False) ->
     normalized_payload = dict(raw_vpn_payload) if isinstance(raw_vpn_payload, dict) else {}
     meta = _location_meta(item)
     item.update(meta)
-    item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
-    item["display_name_en"] = f'{meta["icon"]} {item.get("name_en")}'.strip() if meta.get("icon") else item.get("name_en")
+    effective_code = _resolved_location_code_for_row(item, normalized_payload)
+    if str(effective_code or "").lower().startswith("ru-lte"):
+        item["display_name_ru"] = _decorate_location_text(str(item.get("name_ru") or item.get("name_en") or ""), effective_code)
+        item["display_name_en"] = _decorate_location_text(str(item.get("name_en") or item.get("name_ru") or ""), effective_code)
+    elif str(effective_code or "").lower().startswith("intl-fast"):
+        item["display_name_ru"] = _strip_leading_location_tokens(str(item.get("name_ru") or item.get("name_en") or ""))
+        item["display_name_en"] = _strip_leading_location_tokens(str(item.get("name_en") or item.get("name_ru") or ""))
+    else:
+        item["display_name_ru"] = f'{meta["icon"]} {item.get("name_ru")}'.strip() if meta.get("icon") else item.get("name_ru")
+        item["display_name_en"] = f'{meta["icon"]} {item.get("name_en")}'.strip() if meta.get("icon") else item.get("name_en")
     item["name"] = item.get("display_name_ru") or item.get("name_ru") or item.get("name_en")
     item["recommended"] = bool(item.get("is_recommended"))
     item["reserve"] = bool(item.get("is_reserve"))
@@ -3531,7 +3591,10 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
 def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
     base_name = _subscription_target_name_for_row(row, normalized)
-    if bool(row.get("is_recommended")) and not base_name.startswith(("★ ", "⭐ ")):
+    if bool(row.get("is_recommended")) and " ★ " not in base_name and not base_name.startswith(("★ ", "⭐ ")):
+        icon = _subscription_icon_for_row(row, normalized)
+        if icon and base_name.startswith(f"{icon} "):
+            return f"{icon} ★ {base_name[len(icon):].strip()}"
         return f"★ {base_name}"
     return base_name
 
