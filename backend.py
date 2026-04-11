@@ -699,29 +699,19 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
     if flow:
         user["flow"] = flow
 
-    dns_servers = [
-        str(item or "").strip()
-        for item in (payload.get("dns_servers") or payload.get("dnsServers") or ["1.1.1.1", "8.8.8.8"])
-        if str(item or "").strip()
-    ]
-    if not dns_servers:
-        dns_servers = ["1.1.1.1", "8.8.8.8"]
-
     stream_settings: Dict[str, Any] = {
         "network": transport if transport not in {"websocket"} else "ws",
     }
     if security == "reality":
-        reality_settings: Dict[str, Any] = {
+        stream_settings["security"] = "reality"
+        stream_settings["realitySettings"] = {
             "show": False,
             "serverName": server_name,
             "fingerprint": str(payload.get("fingerprint") or "chrome").strip() or "chrome",
             "publicKey": str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
             "shortId": str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+            "spiderX": str(payload.get("path") or "/").strip() or "/",
         }
-        if transport not in {"grpc", "ws", "websocket", "xhttp"}:
-            reality_settings["spiderX"] = str(payload.get("spiderX") or "/").strip() or "/"
-        stream_settings["security"] = "reality"
-        stream_settings["realitySettings"] = reality_settings
     elif security == "tls":
         stream_settings["security"] = "tls"
         tls_settings: Dict[str, Any] = {
@@ -762,6 +752,10 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
                 if key not in xhttp_settings and value not in (None, "", [], {}):
                     xhttp_settings[key] = value
         stream_settings["xhttpSettings"] = xhttp_settings
+
+    dns_servers = [str(item or "").strip() for item in (payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()]
+    if not dns_servers:
+        dns_servers = ["1.1.1.1", "8.8.8.8"]
 
     return {
         "log": {"loglevel": "warning"},
@@ -862,15 +856,8 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
         }
         outbound["transport"] = transport_payload
 
-    dns_servers = [
-        str(item or "").strip()
-        for item in (payload.get("dns_servers") or payload.get("dnsServers") or ["1.1.1.1", "8.8.8.8"])
-        if str(item or "").strip()
-    ]
-    if not dns_servers:
-        dns_servers = ["1.1.1.1", "8.8.8.8"]
-    dns_remote_addr = str(dns_servers[0] or "1.1.1.1").strip() or "1.1.1.1"
-    dns_local_addr = str(dns_servers[-1] or "8.8.8.8").strip() or "8.8.8.8"
+    dns_remote_addr = str((payload.get("dns_servers") or ["1.1.1.1"])[0] or "1.1.1.1").strip() or "1.1.1.1"
+    dns_local_addr = str((payload.get("dns_servers") or ["1.1.1.1", "8.8.8.8"])[-1] or "8.8.8.8").strip() or "8.8.8.8"
     return {
         "log": {"level": "error"},
         "dns": {
@@ -1015,22 +1002,31 @@ def _candidate_probe_targets(payload: Dict[str, Any], *, pool: str = "generic") 
     targets: List[Tuple[str, str]] = []
     seen: set[str] = set()
 
+    pool_urls = _pool_probe_urls(pool)
+
     # RU LTE is a special white-list/mobile pool. Probe only explicit RU/mobile
     # targets instead of requiring global services like YouTube/Instagram.
     if pool == "ru_lte":
-        for item in _pool_probe_urls(pool):
+        for item in pool_urls:
             _append_probe_url(targets, seen, item)
-        if targets:
-            return targets
+        return targets
 
+    # For regular VPN live checks prefer only the explicit probe URL pool
+    # (for example YouTube / Telegram / Instagram). Do not probe the node host,
+    # SNI/server_name, or payload host here: for REALITY/gRPC these values are
+    # transport metadata and are not reliable health-check targets.
+    for item in pool_urls:
+        _append_probe_url(targets, seen, item)
+    if targets:
+        return targets
+
+    # Safety fallback only when the explicit pool is empty/misconfigured.
     for value in (
         payload.get("host"),
         payload.get("server_name") or payload.get("sni"),
         payload.get("server"),
     ):
         _append_probe_url(targets, seen, value)
-    for item in _pool_probe_urls(pool):
-        _append_probe_url(targets, seen, item)
     return targets
 
 
