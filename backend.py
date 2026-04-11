@@ -6,6 +6,7 @@ import hashlib
 import ipaddress
 import html
 import json
+from decimal import Decimal, ROUND_HALF_UP
 import re
 import secrets
 from uuid import uuid4
@@ -17,6 +18,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 import logging
+import xml.etree.ElementTree as ET
 
 
 import jwt
@@ -4546,6 +4548,155 @@ def support_faq(lang: str = Query(default="ru")) -> Dict[str, Any]:
 
 
 
+def _decimal_money(value: Any) -> Decimal:
+    if isinstance(value, Decimal):
+        return value.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return Decimal(str(value or 0)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _payment_amount_with_commission(amount_rub: float) -> Decimal:
+    amount = _decimal_money(amount_rub)
+    commission = max(Decimal(str(getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0) or 0.0)), Decimal("0"))
+    if commission <= 0:
+        return amount
+    factor = (Decimal("100") + commission) / Decimal("100")
+    return (amount * factor).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+
+def _money_str(value: Any) -> str:
+    return format(_decimal_money(value), ".2f")
+
+
+def _robokassa_hash_value(*parts: Any) -> str:
+    algorithm = str(getattr(settings, "ROBOKASSA_HASH_ALGORITHM", "md5") or "md5").strip().lower()
+    base = ":".join(str(part) for part in parts)
+    if algorithm in {"md5", "md-5"}:
+        return hashlib.md5(base.encode("utf-8")).hexdigest()
+    if algorithm in {"sha1", "sha-1"}:
+        return hashlib.sha1(base.encode("utf-8")).hexdigest()
+    if algorithm in {"sha256", "sha-256"}:
+        return hashlib.sha256(base.encode("utf-8")).hexdigest()
+    if algorithm in {"sha384", "sha-384"}:
+        return hashlib.sha384(base.encode("utf-8")).hexdigest()
+    if algorithm in {"sha512", "sha-512"}:
+        return hashlib.sha512(base.encode("utf-8")).hexdigest()
+    raise ValueError(f"Unsupported ROBOKASSA_HASH_ALGORITHM: {algorithm}")
+
+
+def _robokassa_invoice_id() -> str:
+    return f"{int(time.time() * 1000)}{secrets.randbelow(900) + 100}"
+
+
+def _robokassa_result_url() -> str:
+    explicit = str(getattr(settings, "ROBOKASSA_RESULT_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    base = str(getattr(settings, "APP_BASE_URL", "") or getattr(settings, "BACKEND_BASE_URL", "") or "").strip().rstrip("/")
+    return f"{base}/payments/webhook/robokassa" if base else ""
+
+
+def _robokassa_success_url() -> str:
+    explicit = str(getattr(settings, "ROBOKASSA_SUCCESS_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    base = str(getattr(settings, "APP_BASE_URL", "") or getattr(settings, "BACKEND_BASE_URL", "") or "").strip().rstrip("/")
+    return f"{base}/payments/success/robokassa" if base else ""
+
+
+def _robokassa_fail_url() -> str:
+    explicit = str(getattr(settings, "ROBOKASSA_FAIL_URL", "") or "").strip()
+    if explicit:
+        return explicit
+    base = str(getattr(settings, "APP_BASE_URL", "") or getattr(settings, "BACKEND_BASE_URL", "") or "").strip().rstrip("/")
+    return f"{base}/payments/fail/robokassa" if base else ""
+
+
+def _create_robokassa_payment(local_payment_id: str, amount_rub: float, description: str) -> Dict[str, Any]:
+    _ = local_payment_id
+    invoice_id = _robokassa_invoice_id()
+    out_sum = _money_str(amount_rub)
+    success_url = _robokassa_success_url()
+    fail_url = _robokassa_fail_url()
+    signature = _robokassa_hash_value(
+        settings.ROBOKASSA_MERCHANT_LOGIN,
+        out_sum,
+        invoice_id,
+        success_url,
+        "GET",
+        fail_url,
+        "GET",
+        settings.ROBOKASSA_PASSWORD1,
+    )
+    params = {
+        "MerchantLogin": settings.ROBOKASSA_MERCHANT_LOGIN,
+        "OutSum": out_sum,
+        "InvId": invoice_id,
+        "Description": str(description or "").strip()[:100],
+        "Culture": "en" if str(settings.ROBOKASSA_CULTURE or "ru").strip().lower() == "en" else "ru",
+        "Encoding": "utf-8",
+        "SignatureValue": signature,
+        "SuccessUrl2": success_url,
+        "SuccessUrl2Method": "GET",
+        "FailUrl2": fail_url,
+        "FailUrl2Method": "GET",
+    }
+    inc_curr_label = str(getattr(settings, "ROBOKASSA_INCCURRLABEL", "") or "").strip()
+    if inc_curr_label:
+        params["IncCurrLabel"] = inc_curr_label
+    if bool(getattr(settings, "ROBOKASSA_IS_TEST", False)):
+        params["IsTest"] = "1"
+    checkout_url = f"{str(settings.ROBOKASSA_PAYMENT_URL or '').strip()}?{urlencode(params)}"
+    return {
+        "id": invoice_id,
+        "checkout_url": checkout_url,
+        "amount": out_sum,
+    }
+
+
+def _robokassa_validate_signature(out_sum: str, inv_id: str, signature_value: str, password: str) -> bool:
+    if not out_sum or not inv_id or not signature_value or not password:
+        return False
+    expected = _robokassa_hash_value(out_sum, inv_id, password)
+    return secrets.compare_digest(expected.lower(), str(signature_value).strip().lower())
+
+
+def _robokassa_sync_payment_status(payment: Dict[str, Any]) -> Dict[str, Any]:
+    if not payment or payment.get("provider") != "robokassa":
+        return payment
+    if payment.get("status") == "paid":
+        return payment
+    if bool(getattr(settings, "ROBOKASSA_IS_TEST", False)):
+        return payment
+    invoice_id = str(payment.get("external_payment_id") or "").strip()
+    if not invoice_id or not settings.ROBOKASSA_MERCHANT_LOGIN or not settings.ROBOKASSA_PASSWORD2:
+        return payment
+    signature = _robokassa_hash_value(settings.ROBOKASSA_MERCHANT_LOGIN, invoice_id, settings.ROBOKASSA_PASSWORD2)
+    try:
+        response = requests.get(
+            "https://auth.robokassa.ru/Merchant/WebService/Service.asmx/OpStateExt",
+            params={
+                "MerchantLogin": settings.ROBOKASSA_MERCHANT_LOGIN,
+                "InvoiceID": invoice_id,
+                "Signature": signature,
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        root = ET.fromstring(response.text)
+        namespace = {"rk": root.tag.split("}")[0].strip("{")} if "}" in root.tag else {}
+        code_node = root.find(".//rk:State/rk:Code", namespace) if namespace else root.find(".//State/Code")
+        state_code = int((code_node.text or "0").strip()) if code_node is not None and (code_node.text or "").strip() else 0
+        if state_code == 100:
+            return activate_payment_and_extend_subscription(payment["id"])
+        if state_code in {10, 60}:
+            return update_payment(payment["id"], status="cancelled")
+        if state_code in {5, 20, 50, 80} and payment.get("status") != "pending":
+            return update_payment(payment["id"], status="pending")
+    except Exception:
+        logger.exception("Robokassa status sync failed for payment %s", payment.get("id"))
+    return get_payment_by_internal_or_external(payment.get("id")) or payment
+
+
 def _create_yookassa_payment(local_payment_id: str, amount_rub: float, description: str) -> Dict[str, Any]:
     response = requests.post(
         "https://api.yookassa.ru/v3/payments",
@@ -4573,12 +4724,13 @@ def payments_create(payload: PaymentCreateIn, user: Dict[str, Any] = Depends(get
     plan = get_plan_by_code(payload.plan_code)
     if not plan or not plan["is_active"]:
         raise HTTPException(status_code=404, detail="Plan not found or inactive")
+    final_amount = _payment_amount_with_commission(float(plan["price_rub"]))
     payment = create_payment_record(
         user_id=user["id"],
         plan_id=plan["id"],
         provider=settings.PAYMENTS_PROVIDER,
         method=payload.method,
-        amount=float(plan["price_rub"]),
+        amount=float(final_amount),
         currency="RUB",
         status="disabled" if not settings.PAYMENTS_ENABLED else "created",
     )
@@ -4594,7 +4746,7 @@ def payments_create(payload: PaymentCreateIn, user: Dict[str, Any] = Depends(get
         if not settings.YOOKASSA_SHOP_ID or not settings.YOOKASSA_SECRET_KEY:
             raise HTTPException(status_code=500, detail="YooKassa credentials are missing")
         try:
-            remote = _create_yookassa_payment(payment["id"], float(plan["price_rub"]), f"{settings.APP_NAME} {plan['name_ru']}")
+            remote = _create_yookassa_payment(payment["id"], float(final_amount), f"{settings.APP_NAME} {plan['name_ru']}")
             payment = update_payment(
                 payment["id"],
                 external_payment_id=remote.get("id"),
@@ -4604,6 +4756,22 @@ def payments_create(payload: PaymentCreateIn, user: Dict[str, Any] = Depends(get
         except requests.RequestException as exc:
             update_payment(payment["id"], status="error")
             raise HTTPException(status_code=502, detail=f"YooKassa create payment failed: {exc}") from exc
+    elif settings.PAYMENTS_PROVIDER == "robokassa":
+        if not settings.ROBOKASSA_MERCHANT_LOGIN or not settings.ROBOKASSA_PASSWORD1 or not settings.ROBOKASSA_PASSWORD2:
+            raise HTTPException(status_code=500, detail="Robokassa credentials are missing")
+        try:
+            remote = _create_robokassa_payment(payment["id"], float(final_amount), f"{settings.APP_NAME} {plan['name_ru']}")
+            payment = update_payment(
+                payment["id"],
+                external_payment_id=remote.get("id"),
+                checkout_url=remote.get("checkout_url"),
+                status="pending",
+            )
+        except Exception as exc:
+            update_payment(payment["id"], status="error")
+            raise HTTPException(status_code=502, detail=f"Robokassa create payment failed: {exc}") from exc
+    else:
+        raise HTTPException(status_code=500, detail=f"Unsupported payments provider: {settings.PAYMENTS_PROVIDER}")
     return {"ok": True, "payments_enabled": True, "payment": payment, "plan": plan}
 
 
@@ -4612,6 +4780,8 @@ def payments_get(payment_id: str, user: Dict[str, Any] = Depends(get_current_use
     payment = get_payment_for_user(payment_id, user["id"])
     if not payment:
         raise HTTPException(status_code=404, detail="Payment not found")
+    payment = _robokassa_sync_payment_status(payment)
+    payment = get_payment_for_user(payment_id, user["id"]) or payment
     return {"ok": True, "payment": payment}
 
 
@@ -4638,6 +4808,65 @@ def payments_webhook(payload: Dict[str, Any]) -> Dict[str, Any]:
     else:
         update_payment(payment["id"], status=status_value)
     return {"ok": True}
+
+
+async def _robokassa_request_params(request: Request) -> Dict[str, str]:
+    data: Dict[str, Any] = dict(request.query_params)
+    if request.method.upper() == "POST":
+        with contextlib.suppress(Exception):
+            form = await request.form()
+            data.update(dict(form))
+    return {str(key): str(value) for key, value in data.items()}
+
+
+@app.api_route("/payments/webhook/robokassa", methods=["GET", "POST"])
+async def payments_webhook_robokassa(request: Request) -> Response:
+    params = await _robokassa_request_params(request)
+    out_sum = str(params.get("OutSum") or "").strip()
+    inv_id = str(params.get("InvId") or params.get("InvoiceID") or "").strip()
+    signature = str(params.get("SignatureValue") or "").strip()
+    if not _robokassa_validate_signature(out_sum, inv_id, signature, settings.ROBOKASSA_PASSWORD2):
+        return Response(content="bad sign", status_code=400, media_type="text/plain")
+    payment = get_payment_by_internal_or_external(inv_id)
+    if not payment:
+        return Response(content=f"OK{inv_id}", media_type="text/plain")
+    expected_amount = _money_str(payment.get("amount") or 0)
+    received_amount = _money_str(out_sum or 0)
+    if expected_amount != received_amount:
+        logger.warning("Robokassa amount mismatch for payment %s: expected=%s got=%s", payment.get("id"), expected_amount, received_amount)
+        return Response(content="bad sum", status_code=400, media_type="text/plain")
+    activate_payment_and_extend_subscription(payment["id"])
+    return Response(content=f"OK{inv_id}", media_type="text/plain")
+
+
+@app.api_route("/payments/success/robokassa", methods=["GET", "POST"])
+async def payments_success_robokassa(request: Request) -> HTMLResponse:
+    params = await _robokassa_request_params(request)
+    out_sum = str(params.get("OutSum") or "").strip()
+    inv_id = str(params.get("InvId") or params.get("InvoiceID") or "").strip()
+    signature = str(params.get("SignatureValue") or "").strip()
+    paid = False
+    if _robokassa_validate_signature(out_sum, inv_id, signature, settings.ROBOKASSA_PASSWORD1):
+        payment = get_payment_by_internal_or_external(inv_id)
+        if payment:
+            expected_amount = _money_str(payment.get("amount") or 0)
+            received_amount = _money_str(out_sum or 0)
+            if expected_amount == received_amount:
+                activate_payment_and_extend_subscription(payment["id"])
+                paid = True
+    title = "Оплата получена" if paid else "Платёж обрабатывается"
+    body = "Подписка активируется автоматически. Вернитесь в Telegram-бот и нажмите «Проверить оплату»." if paid else "Банк или платёжная система ещё обрабатывает платёж. Вернитесь в Telegram-бот и нажмите «Проверить оплату» через несколько минут."
+    return HTMLResponse(f"<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>{title}</title></head><body style='font-family:Arial,sans-serif;padding:24px;max-width:720px;margin:0 auto;'><h2>{title}</h2><p>{body}</p></body></html>")
+
+
+@app.api_route("/payments/fail/robokassa", methods=["GET", "POST"])
+async def payments_fail_robokassa(request: Request) -> HTMLResponse:
+    params = await _robokassa_request_params(request)
+    inv_id = str(params.get("InvId") or params.get("InvoiceID") or "").strip()
+    payment = get_payment_by_internal_or_external(inv_id) if inv_id else None
+    if payment and payment.get("status") not in {"paid", "cancelled"}:
+        update_payment(payment["id"], status="cancelled")
+    return HTMLResponse("<!doctype html><html lang='ru'><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'><title>Оплата не завершена</title></head><body style='font-family:Arial,sans-serif;padding:24px;max-width:720px;margin:0 auto;'><h2>Оплата не завершена</h2><p>Вы можете вернуться в Telegram-бот и попробовать оплатить снова.</p></body></html>")
 
 
 @app.get("/api/infra/admin/vpn/users")
