@@ -1121,18 +1121,8 @@ def _black_transport_allowed(payload: Dict[str, Any]) -> bool:
     return transport in allowed if allowed else True
 
 
-def _real_probe_required_for_pool(pool: str) -> bool:
-    pool_name = str(pool or "").strip().lower()
-    if pool_name == "ru_lte":
-        return bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", True))
-    if pool_name == "black":
-        return bool(getattr(settings, "BLACK_REAL_PROBE_REQUIRED", True))
-    return bool(getattr(settings, "VPN_REAL_PROBE_REQUIRED", False))
-
-
 def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout: float) -> Dict[str, Any]:
     real_probe_error = ""
-    required = _real_probe_required_for_pool(pool)
     if bool(getattr(settings, "VPN_REAL_PROBE_ENABLED", True)):
         real_probe = _probe_candidate_via_real_tunnel(payload, pool=pool)
         if real_probe.get("ok"):
@@ -1144,7 +1134,7 @@ def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout:
             "socks_not_ready",
             "real_probe_timeout",
         )
-        if required and not real_probe_error.startswith(hard_fallback_errors):
+        if bool(getattr(settings, "VPN_REAL_PROBE_REQUIRED", True)) and not real_probe_error.startswith(hard_fallback_errors):
             return real_probe
     fallback_probe = _probe_candidate_with_timeout(payload, float(tcp_timeout or 4))
     fallback_probe["method"] = "tcp_fallback"
@@ -1488,7 +1478,7 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
         "sources_ok_total": sources_ok_total,
         "source_errors": [{"source": item.get("source"), "error": item.get("error")} for item in source_errors],
         "real_probe_enabled": bool(getattr(settings, "RU_LTE_REAL_PROBE_ENABLED", True)),
-        "real_probe_required": bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", True)),
+        "real_probe_required": bool(getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED", False)),
         "real_probe_runner": str(getattr(settings, "RU_LTE_REAL_PROBE_RUNNER", "xray") or "xray"),
         "selected": assigned,
         "selected_live_total": len(selected_live),
@@ -1826,8 +1816,12 @@ _vpn_live_check_state: Dict[str, Any] = {
     "last_finished_at": None,
     "last_source": None,
     "last_summary": None,
+    "running": False,
+    "queued_at": None,
+    "last_requested_at": None,
 }
 _vpn_live_check_lock = threading.Lock()
+_vpn_live_check_trigger_lock = threading.Lock()
 
 
 def _json_no_cache_headers(*, etag_seed: Optional[str] = None) -> Dict[str, str]:
@@ -2025,9 +2019,17 @@ def _run_vpn_live_checks(*, source: str = "manual", active_only: bool = True) ->
 def _run_vpn_live_check_safe(*, source: str = "manual", active_only: bool = True) -> Dict[str, Any]:
     if not _vpn_live_check_lock.acquire(blocking=False):
         snapshot = dict(_vpn_live_check_state.get("last_summary") or {})
-        snapshot.update({"ok": True, "busy": True, "source": source, "active_only": bool(active_only)})
+        snapshot.update({
+            "ok": True,
+            "busy": True,
+            "source": source,
+            "active_only": bool(active_only),
+            "running": bool(_vpn_live_check_state.get("running")),
+        })
         return snapshot
+    _vpn_live_check_state["running"] = True
     _vpn_live_check_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_live_check_state["queued_at"] = None
     try:
         summary = _run_vpn_live_checks(source=source, active_only=active_only)
         _set_vpn_live_check_success({k: v for k, v in summary.items() if k != "items"}, source=source)
@@ -2036,7 +2038,64 @@ def _run_vpn_live_check_safe(*, source: str = "manual", active_only: bool = True
         _set_vpn_live_check_error(exc)
         raise
     finally:
+        _vpn_live_check_state["running"] = False
         _vpn_live_check_lock.release()
+
+
+def _start_vpn_live_check_background(*, source: str = "manual", active_only: bool = True) -> Dict[str, Any]:
+    requested_at = datetime.now(timezone.utc).isoformat()
+    _vpn_live_check_state["last_requested_at"] = requested_at
+    if bool(_vpn_live_check_state.get("running")):
+        snapshot = dict(_vpn_live_check_state.get("last_summary") or {})
+        snapshot.update({
+            "ok": True,
+            "started": False,
+            "busy": True,
+            "source": source,
+            "active_only": bool(active_only),
+            "running": True,
+            "queued_at": _vpn_live_check_state.get("queued_at"),
+            "last_requested_at": requested_at,
+        })
+        return snapshot
+    if not _vpn_live_check_trigger_lock.acquire(blocking=False):
+        snapshot = dict(_vpn_live_check_state.get("last_summary") or {})
+        snapshot.update({
+            "ok": True,
+            "started": False,
+            "busy": True,
+            "source": source,
+            "active_only": bool(active_only),
+            "running": bool(_vpn_live_check_state.get("running")),
+            "queued_at": _vpn_live_check_state.get("queued_at"),
+            "last_requested_at": requested_at,
+        })
+        return snapshot
+
+    _vpn_live_check_state["queued_at"] = requested_at
+
+    def worker() -> None:
+        try:
+            _run_vpn_live_check_safe(source=source, active_only=active_only)
+        except Exception:
+            logger.exception("[vpn][probe][background] source=%s failed", source)
+        finally:
+            _vpn_live_check_state["queued_at"] = None
+            _vpn_live_check_trigger_lock.release()
+
+    thread = threading.Thread(target=worker, name=f"vpn-live-check-{source}", daemon=True)
+    thread.start()
+    return {
+        "ok": True,
+        "started": True,
+        "busy": False,
+        "source": source,
+        "active_only": bool(active_only),
+        "running": bool(_vpn_live_check_state.get("running")),
+        "queued_at": requested_at,
+        "last_requested_at": requested_at,
+        "message": "vpn live check started in background",
+    }
 
 
 def _start_vpn_live_check_auto_loop() -> None:
@@ -4834,7 +4893,7 @@ def _run_location_speed_test(row: Dict[str, Any], *, source: str = "manual") -> 
 @app.post("/api/infra/admin/vpn/locations/speed-test")
 def admin_locations_speed_test(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    return _run_vpn_live_check_safe(source="manual", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
+    return _start_vpn_live_check_background(source="manual", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
 
 @app.post("/api/infra/admin/vpn/locations/refresh-ru-lte")
 def admin_refresh_ru_lte(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
