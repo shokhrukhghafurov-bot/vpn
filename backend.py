@@ -2381,6 +2381,7 @@ def _strip_leading_location_tokens(value: str) -> str:
         updated = re.sub(r"^(?:★|⭐)\s+", "", updated).strip()
         updated = re.sub(r"^[\U0001F1E6-\U0001F1FF]{2}\s*", "", updated).strip()
         updated = re.sub(r"^(?:📶|🌍|🌎|🌏|🌐|🏁|⚡)\s*", "", updated).strip()
+        updated = re.sub(r"^(?:[A-Z]{2}|[A-Z][a-z])\s+(?=[A-Z])", "", updated).strip()
         if updated == cleaned:
             return updated
         cleaned = updated
