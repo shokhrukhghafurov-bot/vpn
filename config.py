@@ -106,11 +106,13 @@ def _vpn_configs_repo_raw_base() -> str:
 
 def _default_ru_lte_source_urls() -> str:
     base = _vpn_configs_repo_raw_base()
+    # Keep RU LTE focused on the stricter mobile / checked white-list pools.
+    # The broader *-all feed is intentionally excluded by default because it is
+    # noisy and produces too many weak candidates that later fail local probes.
     return ",".join([
         f"{base}/Vless-Reality-White-Lists-Rus-Mobile.txt",
         f"{base}/Vless-Reality-White-Lists-Rus-Mobile-2.txt",
         f"{base}/WHITE-CIDR-RU-checked.txt",
-        f"{base}/WHITE-CIDR-RU-all.txt",
     ])
 
 
@@ -269,7 +271,8 @@ class Settings:
     RU_LTE_DEAD_COOLDOWN_MINUTES: int = _env_int("RU_LTE_DEAD_COOLDOWN_MINUTES", 45)
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
     RU_LTE_REAL_PROBE_ENABLED: bool = _env_bool("RU_LTE_REAL_PROBE_ENABLED", True)
-    RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", False)
+    RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", True)
+    RU_LTE_REAL_PROBE_MIN_SUCCESS: int = _env_int("RU_LTE_REAL_PROBE_MIN_SUCCESS", 1)
     RU_LTE_REAL_PROBE_RUNNER: str = os.getenv("RU_LTE_REAL_PROBE_RUNNER", "xray")
     RU_LTE_REAL_PROBE_XRAY_BIN: str = os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray")
     RU_LTE_REAL_PROBE_SINGBOX_BIN: str = os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box")
@@ -308,6 +311,8 @@ class Settings:
     BLACK_CONNECT_TIMEOUT_SEC: int = _env_int("BLACK_CONNECT_TIMEOUT_SEC", 4)
     BLACK_DEAD_COOLDOWN_MINUTES: int = _env_int("BLACK_DEAD_COOLDOWN_MINUTES", 30)
     BLACK_ALLOWED_TRANSPORTS: List[str] = None
+    BLACK_REAL_PROBE_REQUIRED: bool = _env_bool("BLACK_REAL_PROBE_REQUIRED", True)
+    BLACK_REAL_PROBE_MIN_SUCCESS: int = _env_int("BLACK_REAL_PROBE_MIN_SUCCESS", _env_int("VPN_REAL_PROBE_MIN_SUCCESS", 2))
 
     def __post_init__(self) -> None:
         self.ANDROID_APP_URL = _normalize_store_url(self.ANDROID_APP_URL, "android")
