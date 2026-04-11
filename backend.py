@@ -39,6 +39,7 @@ from db_store import (
     create_payment_record,
     delete_device,
     delete_location,
+    due_vpn_import_sources,
     export_payments_csv,
     _compose_vpn_payload_for_location,
     _normalize_vpn_payload_keys,
@@ -63,6 +64,7 @@ from db_store import (
     list_bot_errors,
     list_broadcast_targets,
     list_locations,
+    list_vpn_import_sources,
     list_payments,
     patch_location,
     record_bot_error,
@@ -76,6 +78,8 @@ from db_store import (
     settings_snapshot,
     save_runtime_settings_payload,
     sync_plans_from_env,
+    mark_vpn_import_source_result,
+    upsert_vpn_import_source,
     upsert_telegram_user,
     update_payment,
     extend_user_subscription_by_telegram,
@@ -200,6 +204,21 @@ class LocationPatchIn(BaseModel):
 
 class AdminLocationImportIn(BaseModel):
     source: str
+    is_active: bool = True
+    is_recommended: bool = False
+    is_reserve: bool = False
+    status: str = "online"
+    sort_order_start: int = 100
+    sort_order_step: int = 10
+    save_source: bool = True
+    auto_refresh_minutes: Optional[int] = None
+    is_enabled: bool = True
+
+
+class AdminImportSourceIn(BaseModel):
+    source: str
+    is_enabled: bool = True
+    auto_refresh_minutes: Optional[int] = None
     is_active: bool = True
     is_recommended: bool = False
     is_reserve: bool = False
@@ -453,6 +472,15 @@ def _extract_plain_import_url(source: str) -> str:
     return raw if raw.startswith(("http://", "https://")) else ""
 
 
+def _is_persistable_import_source(source: str) -> bool:
+    raw = str(source or "").strip()
+    if not raw:
+        return False
+    if raw.lower().startswith(("happ://add/", "v2raytun://import/", "hiddify://import/")):
+        return True
+    return raw.startswith(("http://", "https://"))
+
+
 def _extract_subscription_url_from_html(text: str) -> str:
     raw = str(text or "")
     if not raw:
@@ -480,14 +508,14 @@ def _read_subscription_import_source(source: str) -> str:
         return raw
     plain_url = _extract_plain_import_url(raw)
     if plain_url:
-        response = requests.get(_fresh_source_url(plain_url), timeout=20, headers=_SUBSCRIPTION_IMPORT_HEADERS)
+        response = requests.get(_fresh_source_url(plain_url), timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)), headers=_SUBSCRIPTION_IMPORT_HEADERS)
         response.raise_for_status()
         text = response.text
         if "vless://" in text:
             return text
         nested_url = _extract_subscription_url_from_html(text)
         if nested_url and nested_url != plain_url:
-            nested_response = requests.get(_fresh_source_url(nested_url), timeout=20, headers=_SUBSCRIPTION_IMPORT_HEADERS)
+            nested_response = requests.get(_fresh_source_url(nested_url), timeout=max(5, int(getattr(settings, "VPN_IMPORT_FETCH_TIMEOUT_SEC", 20) or 20)), headers=_SUBSCRIPTION_IMPORT_HEADERS)
             nested_response.raise_for_status()
             return nested_response.text
         return text
@@ -2113,6 +2141,12 @@ def _run_startup_background_tasks() -> None:
         except Exception as exc:
             logger.exception("[vpn][startup] black_refresh_failed: %s", exc)
             _set_black_refresh_error(exc)
+    if bool(getattr(settings, "VPN_IMPORT_ON_STARTUP", True)):
+        try:
+            _run_due_vpn_import_sources_safe(source="startup")
+        except Exception as exc:
+            logger.exception("[vpn][startup] vpn_import_failed: %s", exc)
+            _set_vpn_import_error(exc)
     if bool(getattr(settings, "VPN_LIVE_CHECK_ON_STARTUP", True)):
         try:
             _run_vpn_live_check_safe(source="startup", active_only=bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)))
@@ -2128,6 +2162,7 @@ def on_startup() -> None:
     _log_probe_binary_status()
     _start_ru_lte_auto_refresh_loop()
     _start_black_auto_refresh_loop()
+    _start_vpn_import_auto_loop()
     _start_vpn_live_check_auto_loop()
     thread = threading.Thread(target=_run_startup_background_tasks, name="vpn-startup-tasks", daemon=True)
     thread.start()
@@ -2202,6 +2237,105 @@ def _config_version_payload() -> Dict[str, Any]:
 def _invalidate_locations_cache() -> None:
     _locations_cache["items"] = None
     _locations_cache["expires_at"] = 0.0
+
+
+_vpn_import_state: Dict[str, Any] = {
+    "last_success_at": None,
+    "last_error": None,
+    "last_error_at": None,
+    "last_started_at": None,
+    "last_finished_at": None,
+    "last_source": None,
+    "last_summary": None,
+}
+
+
+def _set_vpn_import_success(summary: Dict[str, Any], *, source: str) -> None:
+    _vpn_import_state["last_success_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_import_state["last_error"] = None
+    _vpn_import_state["last_error_at"] = None
+    _vpn_import_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_import_state["last_source"] = source
+    _vpn_import_state["last_summary"] = dict(summary)
+
+
+def _set_vpn_import_error(exc: Exception) -> None:
+    _vpn_import_state["last_error"] = str(exc)
+    _vpn_import_state["last_error_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_import_state["last_finished_at"] = datetime.now(timezone.utc).isoformat()
+
+
+def _run_vpn_import_source_safe(source_row: Dict[str, Any], *, source: str = "auto") -> Dict[str, Any]:
+    source_id = int(source_row.get("id") or 0)
+    source_url = str(source_row.get("source_url") or "").strip()
+    if source_id <= 0 or not source_url:
+        raise ValueError("Invalid import source")
+    _vpn_import_state["last_started_at"] = datetime.now(timezone.utc).isoformat()
+    _vpn_import_state["last_source"] = source_url
+    try:
+        result = _import_locations_from_source(
+            source_url,
+            is_active=bool(source_row.get("is_active", True)),
+            is_recommended=bool(source_row.get("is_recommended", False)),
+            is_reserve=bool(source_row.get("is_reserve", False)),
+            status=str(source_row.get("status") or "online").strip().lower() or "online",
+            sort_order_start=int(source_row.get("sort_order_start") or 100),
+            sort_order_step=int(source_row.get("sort_order_step") or 10),
+        )
+        try:
+            mark_vpn_import_source_result(source_id, ok=True, error=None)
+        except Exception:
+            logger.exception("[vpn][import] failed to mark source success id=%s", source_id)
+        result["refresh_source"] = source
+        result["source_id"] = source_id
+        _invalidate_locations_cache()
+        _set_vpn_import_success(result, source=source_url)
+        logger.info("[vpn][import] source=%s id=%s imported=%s updated=%s", source, source_id, len(result.get("imported") or []), len(result.get("updated") or []))
+        return result
+    except Exception as exc:
+        try:
+            mark_vpn_import_source_result(source_id, ok=False, error=str(exc))
+        except Exception:
+            logger.exception("[vpn][import] failed to mark source error id=%s", source_id)
+        _set_vpn_import_error(exc)
+        logger.exception("[vpn][import] source=%s id=%s failed: %s", source, source_id, exc)
+        raise
+
+
+def _run_due_vpn_import_sources_safe(*, source: str = "auto") -> Dict[str, Any]:
+    due_rows = due_vpn_import_sources()
+    summary = {"ok": True, "due_total": len(due_rows), "refreshed_total": 0, "errors": []}
+    for row in due_rows:
+        try:
+            _run_vpn_import_source_safe(row, source=source)
+            summary["refreshed_total"] += 1
+        except Exception as exc:
+            summary["errors"].append({"id": row.get("id"), "source_url": row.get("source_url"), "error": str(exc)})
+    if summary["errors"]:
+        summary["ok"] = False
+    return summary
+
+
+def _start_vpn_import_auto_loop() -> None:
+    if not bool(getattr(settings, "VPN_IMPORT_AUTO_ENABLED", True)):
+        return
+    poll_seconds = max(15, int(getattr(settings, "VPN_IMPORT_WORKER_POLL_SECONDS", 60) or 60))
+
+    def worker() -> None:
+        initial_delay = poll_seconds if bool(getattr(settings, "VPN_IMPORT_ON_STARTUP", True)) else 0
+        if initial_delay > 0:
+            time.sleep(initial_delay)
+        while True:
+            started = time.monotonic()
+            try:
+                _run_due_vpn_import_sources_safe(source="auto")
+            except Exception as exc:
+                _set_vpn_import_error(exc)
+            elapsed = time.monotonic() - started
+            time.sleep(max(5.0, poll_seconds - elapsed))
+
+    thread = threading.Thread(target=worker, name="vpn-import-auto-refresh", daemon=True)
+    thread.start()
 
 
 def _set_ru_lte_refresh_success() -> None:
@@ -5197,15 +5331,58 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
         "vpn_live_check_auto_enabled": bool(getattr(settings, "VPN_LIVE_CHECK_AUTO_ENABLED", True)),
         "vpn_live_check_auto_minutes": max(1, int(getattr(settings, "VPN_LIVE_CHECK_AUTO_MINUTES", 3) or 3)),
         "vpn_live_check_active_only": bool(getattr(settings, "VPN_LIVE_CHECK_ACTIVE_ONLY", True)),
+        "vpn_import": dict(_vpn_import_state),
+        "vpn_import_auto_enabled": bool(getattr(settings, "VPN_IMPORT_AUTO_ENABLED", True)),
+        "vpn_import_default_refresh_minutes": max(1, int(getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10)),
+        "import_sources": list_vpn_import_sources(enabled_only=False),
     }
+
+
+@app.get("/api/infra/admin/vpn/import-sources")
+def admin_import_sources_list(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    return {"ok": True, "items": list_vpn_import_sources(enabled_only=False), "state": dict(_vpn_import_state)}
+
+
+@app.post("/api/infra/admin/vpn/import-sources")
+def admin_import_sources_create(payload: AdminImportSourceIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    source = str(payload.source or "").strip()
+    if not _is_persistable_import_source(source):
+        raise HTTPException(status_code=400, detail="A happ://add/... or http(s) source is required")
+    try:
+        item = upsert_vpn_import_source({
+            "source_url": source,
+            "is_enabled": bool(payload.is_enabled),
+            "auto_refresh_minutes": int(payload.auto_refresh_minutes or getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10),
+            "is_active": bool(payload.is_active),
+            "is_recommended": bool(payload.is_recommended),
+            "is_reserve": bool(payload.is_reserve),
+            "status": str(payload.status or "online").strip().lower() or "online",
+            "sort_order_start": int(payload.sort_order_start or 100),
+            "sort_order_step": int(payload.sort_order_step or 10),
+        })
+        return {"ok": True, "item": item}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@app.post("/api/infra/admin/vpn/import-sources/refresh")
+def admin_import_sources_refresh(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    _ = admin_name
+    try:
+        return _run_due_vpn_import_sources_safe(source="manual")
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
 @app.post("/api/infra/admin/vpn/locations/import")
 def admin_locations_import(payload: AdminLocationImportIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
+    source = str(payload.source or "").strip()
     try:
-        return _import_locations_from_source(
-            payload.source,
+        result = _import_locations_from_source(
+            source,
             is_active=bool(payload.is_active),
             is_recommended=bool(payload.is_recommended),
             is_reserve=bool(payload.is_reserve),
@@ -5213,6 +5390,20 @@ def admin_locations_import(payload: AdminLocationImportIn, admin_name: str = Dep
             sort_order_start=int(payload.sort_order_start or 100),
             sort_order_step=int(payload.sort_order_step or 10),
         )
+        saved_source = None
+        if bool(payload.save_source) and _is_persistable_import_source(source):
+            saved_source = upsert_vpn_import_source({
+                "source_url": source,
+                "is_enabled": bool(payload.is_enabled),
+                "auto_refresh_minutes": int(payload.auto_refresh_minutes or getattr(settings, "VPN_IMPORT_DEFAULT_REFRESH_MINUTES", 10) or 10),
+                "is_active": bool(payload.is_active),
+                "is_recommended": bool(payload.is_recommended),
+                "is_reserve": bool(payload.is_reserve),
+                "status": str(payload.status or "online").strip().lower() or "online",
+                "sort_order_start": int(payload.sort_order_start or 100),
+                "sort_order_step": int(payload.sort_order_step or 10),
+            })
+        return {**result, "saved_source": saved_source}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except requests.RequestException as exc:
