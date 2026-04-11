@@ -2401,10 +2401,10 @@ def _decorate_location_text(base_name: str, effective_code: str) -> str:
     text_value = str(base_name or "").strip()
     if not text_value:
         return "VLESS"
-    if "→" in text_value and effective_code.lower().startswith("ru-lte"):
+    if "→" in text_value:
         left, right = text_value.split("→", 1)
         right_clean = _strip_leading_location_tokens(right)
-        if not right_clean.startswith("📶"):
+        if effective_code.lower().startswith("ru-lte") and not right_clean.startswith("📶"):
             right_clean = f"📶 {right_clean}".strip()
         return f"{left.strip()} → {right_clean}".strip()
     text_value = _strip_leading_location_tokens(text_value)
