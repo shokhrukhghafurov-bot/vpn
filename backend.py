@@ -3526,7 +3526,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         for item in devices
         if str(item.get("platform") or "").strip().lower() == normalized_platform
     ]
-    if len(same_platform_matches) == 1:
+    if platform_family == "desktop" and len(same_platform_matches) == 1:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
@@ -3544,7 +3544,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
         compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
         if same_family and compatible_client:
             same_family_matches.append(item)
-    if len(same_family_matches) == 1:
+    if platform_family != "mobile" and len(same_family_matches) == 1:
         relaxed = dict(gate)
         relaxed["allowed"] = True
         relaxed["known_device"] = True
