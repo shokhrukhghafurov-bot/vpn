@@ -3846,6 +3846,68 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
+
+
+def _subscription_inactive_response(request: Request, token: str, *, detail: str = "Active subscription required", head_only: bool = False) -> Response:
+    expires_ts = int(time.time())
+    profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
+    bot_public_url = str(_bot_public_url() or "").strip()
+    profile_web_page_url = bot_public_url or str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
+    support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+    update_interval_hours = _hiddify_profile_update_interval_header_value()
+    subscription_userinfo = f"upload=0; download=0; total=0; expire={expires_ts}"
+    reason_line = str(detail or "Access expired").strip() or "Access expired"
+    content = "\n".join(
+        _subscription_inline_comment_headers(
+            profile_title=profile_title,
+            update_interval_hours=update_interval_hours,
+            subscription_userinfo=subscription_userinfo,
+            support_url=support_url,
+            profile_web_page_url=profile_web_page_url,
+            moved_permanently_to_url=None,
+            content_version="inactive",
+        )
+        + [f"#inactive: {reason_line}"]
+    ) + "\n"
+    response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    headers = {
+        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
+        "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
+        "Subscription-Userinfo": subscription_userinfo,
+        "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
+        "CDN-Cache-Control": "no-store, no-cache, max-age=0",
+        "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
+        "Surrogate-Control": "no-store",
+        "Pragma": "no-cache",
+        "Expires": "0",
+        "ETag": f'W/"{response_etag}"',
+        "Last-Modified": _http_date_from_datetime(datetime.now(timezone.utc)) or "",
+        "Vary": "*",
+        "X-Accel-Expires": "0",
+        "profile-update-interval": update_interval_hours,
+        "support-url": support_url,
+        "profile-web-page-url": profile_web_page_url,
+        "moved-permanently-to": "",
+        "x-hiddify-source": "subscription",
+        "x-subscription-version": "inactive",
+        "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
+        "x-subscription-state": "inactive",
+    }
+    response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+    try:
+        response.set_cookie(
+            key="inet_sub_cid",
+            value=_subscription_cookie_value(request, token),
+            max_age=31536000,
+            httponly=False,
+            samesite="lax",
+            secure=_request_is_https(request),
+        )
+    except Exception:
+        pass
+    return response
+
+
 def _subscription_response(request: Request, token: str, *, head_only: bool = False) -> Response:
     access = _subscription_access_context(token)
     if not access:
@@ -3860,7 +3922,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             raise HTTPException(status_code=404, detail="Subscription not found")
         view = get_user_subscription_view(int(user["id"]))
         if not view.get("is_active") or not view.get("subscription"):
-            raise HTTPException(status_code=403, detail="Active subscription required")
+            return _subscription_inactive_response(request, token, detail="Active subscription required", head_only=head_only)
         subscription = view["subscription"] or {}
         expires_at = subscription.get("expires_at")
         if isinstance(expires_at, datetime):
