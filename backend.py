@@ -45,6 +45,7 @@ from db_store import (
     _compose_vpn_payload_for_location,
     _normalize_vpn_payload_keys,
     _config_is_complete,
+    build_user_vpn_payload_for_location,
     _pick_virtual_location,
     get_active_plans,
     get_payment_by_internal_or_external,
@@ -178,6 +179,7 @@ class LocationIn(BaseModel):
     upload_mbps: Optional[float] = None
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
+    access_mode: Optional[str] = None
     vpn_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -197,6 +199,7 @@ class LocationPatchIn(BaseModel):
     upload_mbps: Optional[float] = None
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
+    access_mode: Optional[str] = None
     vpn_payload: Optional[Dict[str, Any]] = None
 
 
@@ -3672,7 +3675,10 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
             return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
         resolved_row = dict(picked)
 
-    payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
+    if user_id is not None:
+        payload = build_user_vpn_payload_for_location(int(user_id), resolved_row, requested_location_code=code or None)
+    else:
+        payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
     if not payload:
         return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
 
