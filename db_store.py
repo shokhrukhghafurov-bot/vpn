@@ -1387,11 +1387,20 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
         SELECT vla.concrete_code, COUNT(DISTINCT vla.user_id) AS assigned_users
         FROM virtual_location_assignments vla
         JOIN users u ON u.id = vla.user_id
-        JOIN subscriptions s ON s.user_id = vla.user_id
+        JOIN locations l ON l.code = vla.concrete_code
         WHERE vla.concrete_code IN ({placeholders})
           AND COALESCE(u.status, 'active') <> 'blocked'
-          AND s.starts_at <= NOW()
-          AND s.expires_at >= NOW()
+          AND l.is_deleted = FALSE
+          AND l.is_active = TRUE
+          AND COALESCE(l.status, 'offline') IN ('online', 'reserve')
+          AND EXISTS (
+              SELECT 1
+              FROM subscriptions s
+              WHERE s.user_id = vla.user_id
+                AND COALESCE(s.status, 'active') = 'active'
+                AND s.starts_at <= NOW()
+                AND s.expires_at >= NOW()
+          )
         GROUP BY vla.concrete_code
     """
     counts: Dict[str, int] = {}
@@ -1503,23 +1512,17 @@ def _virtual_pool_best_quality(pool: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 
 def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
-    quality_pool = _virtual_pool_best_quality(pool)
-    if len(quality_pool) <= 3:
-        return list(quality_pool)
+    """Keep the full best-quality top-N pool for load balancing.
 
-    primary = list(quality_pool[:3])
-    overflow = list(quality_pool[3:])
-    if not overflow:
-        return primary
-
-    def row_load(row: Dict[str, Any]) -> int:
-        return int(loads.get(str(row.get("code") or "").strip(), 0))
-
-    best_primary_load = min(row_load(row) for row in primary)
-    best_overflow_load = min(row_load(row) for row in overflow)
-    if best_overflow_load + 1 < best_primary_load:
-        return overflow
-    return primary
+    Previous logic sometimes split the pool into top-3 and overflow buckets.
+    That could cause Auto | Fastest to ignore a valid 4th/5th live candidate even
+    though the user expectation is explicit: consider A/B/C/D/E, then move from A
+    to B to C to D to E as load rises. The strict pool has already been limited to
+    VIRTUAL_LOCATION_POOL_SIZE best candidates, so here we should preserve that
+    full pool rather than collapsing it to only the first 3 rows.
+    """
+    _ = loads
+    return list(_virtual_pool_best_quality(pool))
 
 
 def _virtual_row_load(row: Dict[str, Any], loads: Dict[str, int]) -> int:
@@ -1538,12 +1541,11 @@ def _pick_balanced_virtual_candidate(pool: List[Dict[str, Any]], loads: Dict[str
         return None
     threshold = max(0, int(VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD or 0))
     min_load = min(_virtual_row_load(row, loads) for row in pool) if pool else 0
-    for row in pool:
-        if _virtual_row_load(row, loads) <= min_load + threshold:
-            return row
+    eligible = [row for row in pool if _virtual_row_load(row, loads) <= min_load + threshold]
+    target_pool = eligible or list(pool)
     return min(
-        enumerate(pool),
-        key=lambda item: (_virtual_row_load(item[1], loads), item[0]),
+        enumerate(target_pool),
+        key=lambda item: (_virtual_row_load(item[1], loads), _virtual_ping_sort_key(item[1]), item[0]),
     )[1]
 
 
