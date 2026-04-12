@@ -2526,6 +2526,14 @@ def _diagnostic_string_list(value: Any) -> List[str]:
 
 
 
+def _diagnostic_access_mode(payload: Dict[str, Any]) -> str:
+    text = str((payload or {}).get("access_mode") or (payload or {}).get("credential_mode") or "").strip().lower()
+    if text in {"owned_per_user", "per_user", "owned", "template", "template_per_user", "user_uuid", "user-specific", "user_specific"}:
+        return "owned_per_user"
+    return "external_static"
+
+
+
 def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str) -> Dict[str, Any]:
     issues: List[str] = []
     fixes: List[str] = []
@@ -2543,20 +2551,31 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
     connect_mode = _diagnostic_text(payload.get("connect_mode") or "tun").lower() or "tun"
     full_tunnel = _diagnostic_bool(payload.get("full_tunnel"))
     dns_servers = _diagnostic_string_list(payload.get("dns_servers") or payload.get("dnsServers"))
+    access_mode = _diagnostic_access_mode(payload)
+    requires_runtime_uuid = access_mode == "owned_per_user"
 
     if not payload:
         issues.append("vpn_payload is empty")
-        fixes.append("Open Edit payload and fill server, port, uuid, and Reality fields.")
+        fixes.append("Open Edit payload and fill server, port, and Reality fields.")
 
     if not server or _diagnostic_placeholder(server):
         issues.append("server is missing or still contains a placeholder")
     if port <= 0:
         issues.append("port is missing")
-    if not uuid or _diagnostic_placeholder(uuid):
+    if requires_runtime_uuid:
+        if not uuid or _diagnostic_placeholder(uuid):
+            fixes.append("Template mode is enabled: the backend will inject a per-user UUID at выдаче конфигурации.")
+    elif not uuid or _diagnostic_placeholder(uuid):
         issues.append("uuid is missing or still contains a placeholder")
 
-    if any(issue in {"server is missing or still contains a placeholder", "port is missing", "uuid is missing or still contains a placeholder"} for issue in issues):
-        fixes.append("Set real server/port/uuid values in effective payload.")
+    base_required_issues = {"server is missing or still contains a placeholder", "port is missing"}
+    if not requires_runtime_uuid:
+        base_required_issues.add("uuid is missing or still contains a placeholder")
+    if any(issue in base_required_issues for issue in issues):
+        if requires_runtime_uuid:
+            fixes.append("Set real server/port values in effective payload. UUID comes from per-user credential mode.")
+        else:
+            fixes.append("Set real server/port/uuid values in effective payload.")
 
     if security == "reality":
         if not public_key or _diagnostic_placeholder(public_key):
@@ -2592,15 +2611,17 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
     elif platform_key == "macos":
         fixes.append("Allow VPN / Network Extension permissions in macOS System Settings if TUN does not start.")
 
-    fatal_prefixes = (
+    fatal_prefixes = [
         "vpn_payload is empty",
         "server is missing or still contains a placeholder",
         "port is missing",
-        "uuid is missing or still contains a placeholder",
         "Reality public_key is missing or still contains a placeholder",
         "Reality server_name / sni is missing or still contains a placeholder",
         "connect_mode must be tun",
-    )
+    ]
+    if not requires_runtime_uuid:
+        fatal_prefixes.append("uuid is missing or still contains a placeholder")
+    fatal_prefixes = tuple(fatal_prefixes)
     fatal_issues = [issue for issue in issues if issue.startswith(fatal_prefixes)]
 
     if fatal_issues:
