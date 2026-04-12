@@ -244,7 +244,7 @@ class AdminVpnSettingsIn(BaseModel):
     payments_enabled: bool = False
     maintenance_mode: bool = False
     new_activations_enabled: bool = True
-    max_devices_per_account: int = Field(default=1, ge=1)
+    max_devices_per_account: int = Field(default=settings.VPN_MAX_DEVICES_PER_ACCOUNT, ge=1)
     device_limit: Optional[int] = Field(default=None, ge=1)
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
 
@@ -4491,6 +4491,7 @@ def app_config() -> Dict[str, Any]:
         "bot_url": _bot_public_url(),
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "payments_enabled": settings.PAYMENTS_ENABLED,
+        "payment_commission_percent": max(float(getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0) or 0.0), 0.0),
         "client_mode": _selected_client_mode(),
         "client_name": _selected_client_name(),
         "mobile_client_mode": _selected_client_mode(),
