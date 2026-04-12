@@ -1075,12 +1075,15 @@ def _config_is_complete(payload: Dict[str, Any]) -> bool:
     service_name = str(normalized.get("service_name") or normalized.get("serviceName") or "").strip()
     path = str(normalized.get("path") or "").strip()
     dns_servers = normalized.get("dns_servers") or normalized.get("dnsServers") or []
+    requires_runtime_uuid = _location_requires_user_credential(payload=normalized)
     try:
         port = int(normalized.get("port") or 0)
     except (TypeError, ValueError):
         port = 0
 
-    if _placeholder_like_value(server) or _placeholder_like_value(uuid) or port <= 0:
+    if _placeholder_like_value(server) or port <= 0:
+        return False
+    if not requires_runtime_uuid and _placeholder_like_value(uuid):
         return False
     if not isinstance(dns_servers, list) or not [str(item).strip() for item in dns_servers if str(item).strip() and not _placeholder_like_value(item)]:
         return False
