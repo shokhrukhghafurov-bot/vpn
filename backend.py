@@ -3846,19 +3846,20 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, reason: str = "expired") -> Response:
-    now_ts = int(time.time())
-    profile_title = f"{settings.APP_NAME} · Subscription expired"
-    body_lines = [
-        f"# subscription-{reason}: access_inactive",
-        "# no-active-configs",
-    ]
-    content_version = hashlib.sha256(f"inactive:{token}:{reason}:{now_ts // 60}".encode("utf-8")).hexdigest()
+def _expired_subscription_response(request: Request, token: str, *, profile_title: str, head_only: bool = False) -> Response:
     bot_public_url = str(_bot_public_url() or "").strip()
-    profile_web_page_url = bot_public_url or str(getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
+    profile_web_page_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
     support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
     update_interval_hours = _hiddify_profile_update_interval_header_value()
-    subscription_userinfo = f"upload=0; download=0; total=0; expire={max(0, now_ts - 60)}"
+    subscription_userinfo = "upload=0; download=0; total=0; expire=0"
+    body_lines = [
+        "Subscription expired. Buy a new subscription in the Telegram bot.",
+        "Подписка истекла. Купите новую подписку в Telegram-боте.",
+    ]
+    if support_url:
+        body_lines.extend(["", support_url])
+    content_seed = "\n".join(body_lines) + "\n"
+    content_version = hashlib.sha256(content_seed.encode("utf-8")).hexdigest()
     moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
     inline_headers = _subscription_inline_comment_headers(
         profile_title=profile_title,
@@ -3869,13 +3870,11 @@ def _subscription_inactive_response(request: Request, token: str, *, head_only: 
         moved_permanently_to_url=moved_permanently_to_url,
         content_version=content_version,
     )
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
-    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
-    content = "\n".join(body_lines) + "\n" if suppress_inline_headers else "\n".join(inline_headers + body_lines) + "\n"
+    content = "\n".join(inline_headers + body_lines) + "\n"
     response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    now_dt = datetime.now(timezone.utc)
     headers = {
-        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
+        "Content-Disposition": 'inline; filename="inet-subscription-expired.txt"',
         "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
         "Subscription-Userinfo": subscription_userinfo,
         "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
@@ -3885,7 +3884,7 @@ def _subscription_inactive_response(request: Request, token: str, *, head_only: 
         "Pragma": "no-cache",
         "Expires": "0",
         "ETag": f'W/"{response_etag}"',
-        "Last-Modified": _http_date_from_datetime(datetime.now(timezone.utc)) or "",
+        "Last-Modified": _http_date_from_datetime(now_dt) or "",
         "Vary": "*",
         "X-Accel-Expires": "0",
         "profile-update-interval": update_interval_hours,
@@ -3894,8 +3893,8 @@ def _subscription_inactive_response(request: Request, token: str, *, head_only: 
         "moved-permanently-to": moved_permanently_to_url or "",
         "x-hiddify-source": "subscription",
         "x-subscription-version": content_version,
-        "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
-        "x-subscription-state": reason,
+        "x-subscription-generated-at": now_dt.isoformat(),
+        "x-subscription-state": "expired",
     }
     response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
     try:
@@ -3926,7 +3925,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             raise HTTPException(status_code=404, detail="Subscription not found")
         view = get_user_subscription_view(int(user["id"]))
         if not view.get("is_active") or not view.get("subscription"):
-            return _subscription_inactive_response(request, token, head_only=head_only, reason="expired")
+            return _expired_subscription_response(request, token, profile_title=f"{settings.APP_NAME} · subscription expired", head_only=head_only)
         subscription = view["subscription"] or {}
         expires_at = subscription.get("expires_at")
         if isinstance(expires_at, datetime):
