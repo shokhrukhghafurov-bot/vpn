@@ -1387,20 +1387,11 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
         SELECT vla.concrete_code, COUNT(DISTINCT vla.user_id) AS assigned_users
         FROM virtual_location_assignments vla
         JOIN users u ON u.id = vla.user_id
-        JOIN locations l ON l.code = vla.concrete_code
+        JOIN subscriptions s ON s.user_id = vla.user_id
         WHERE vla.concrete_code IN ({placeholders})
           AND COALESCE(u.status, 'active') <> 'blocked'
-          AND l.is_deleted = FALSE
-          AND l.is_active = TRUE
-          AND COALESCE(l.status, 'offline') IN ('online', 'reserve')
-          AND EXISTS (
-              SELECT 1
-              FROM subscriptions s
-              WHERE s.user_id = vla.user_id
-                AND COALESCE(s.status, 'active') = 'active'
-                AND s.starts_at <= NOW()
-                AND s.expires_at >= NOW()
-          )
+          AND s.starts_at <= NOW()
+          AND s.expires_at >= NOW()
         GROUP BY vla.concrete_code
     """
     counts: Dict[str, int] = {}
@@ -1512,17 +1503,23 @@ def _virtual_pool_best_quality(pool: List[Dict[str, Any]]) -> List[Dict[str, Any
 
 
 def _prefer_primary_virtual_pool(pool: List[Dict[str, Any]], loads: Dict[str, int]) -> List[Dict[str, Any]]:
-    """Keep the full best-quality top-N pool for load balancing.
+    quality_pool = _virtual_pool_best_quality(pool)
+    if len(quality_pool) <= 3:
+        return list(quality_pool)
 
-    Previous logic sometimes split the pool into top-3 and overflow buckets.
-    That could cause Auto | Fastest to ignore a valid 4th/5th live candidate even
-    though the user expectation is explicit: consider A/B/C/D/E, then move from A
-    to B to C to D to E as load rises. The strict pool has already been limited to
-    VIRTUAL_LOCATION_POOL_SIZE best candidates, so here we should preserve that
-    full pool rather than collapsing it to only the first 3 rows.
-    """
-    _ = loads
-    return list(_virtual_pool_best_quality(pool))
+    primary = list(quality_pool[:3])
+    overflow = list(quality_pool[3:])
+    if not overflow:
+        return primary
+
+    def row_load(row: Dict[str, Any]) -> int:
+        return int(loads.get(str(row.get("code") or "").strip(), 0))
+
+    best_primary_load = min(row_load(row) for row in primary)
+    best_overflow_load = min(row_load(row) for row in overflow)
+    if best_overflow_load + 1 < best_primary_load:
+        return overflow
+    return primary
 
 
 def _virtual_row_load(row: Dict[str, Any], loads: Dict[str, int]) -> int:
@@ -1541,49 +1538,22 @@ def _pick_balanced_virtual_candidate(pool: List[Dict[str, Any]], loads: Dict[str
         return None
     threshold = max(0, int(VIRTUAL_LOCATION_LOAD_IMBALANCE_THRESHOLD or 0))
     min_load = min(_virtual_row_load(row, loads) for row in pool) if pool else 0
-    eligible = [row for row in pool if _virtual_row_load(row, loads) <= min_load + threshold]
-    target_pool = eligible or list(pool)
+    for row in pool:
+        if _virtual_row_load(row, loads) <= min_load + threshold:
+            return row
     return min(
-        enumerate(target_pool),
-        key=lambda item: (_virtual_row_load(item[1], loads), _virtual_ping_sort_key(item[1]), item[0]),
+        enumerate(pool),
+        key=lambda item: (_virtual_row_load(item[1], loads), item[0]),
     )[1]
 
 
 def _virtual_assignment_reusable(assigned_row: Dict[str, Any], best_row: Optional[Dict[str, Any]], loads: Dict[str, int]) -> bool:
-    if best_row is None:
-        return False
-    if not _virtual_row_not_overloaded(assigned_row, loads):
-        return False
-
-    assigned_band = _virtual_row_health_band(assigned_row)
-    best_band = _virtual_row_health_band(best_row)
-    if assigned_band != best_band:
-        return False
-
-    assigned_code = str(assigned_row.get("code") or "").strip()
-    best_code = str(best_row.get("code") or "").strip()
-    if assigned_code == best_code:
-        return True
-
-    assigned_ping = _normalize_optional_int(assigned_row.get("ping_ms"))
-    best_ping = _normalize_optional_int(best_row.get("ping_ms"))
-    assigned_has_fresh_ping = _speed_ping_fresh(assigned_row)
-    best_has_fresh_ping = _speed_ping_fresh(best_row)
-    if best_has_fresh_ping:
-        if not assigned_has_fresh_ping:
-            return False
-        if assigned_ping is None or best_ping is None:
-            return False
-        return assigned_ping <= best_ping + max(1, int(VIRTUAL_LOCATION_REUSE_PING_DRIFT_MS or 1))
-
-    if _speed_ping_present(best_row):
-        if not _speed_ping_present(assigned_row):
-            return False
-        if assigned_ping is None or best_ping is None:
-            return False
-        return assigned_ping <= best_ping + max(20, int(VIRTUAL_LOCATION_MAX_PING_BALANCE_DRIFT_MS or 180))
-
-    return False
+    # Sticky assignment rule:
+    # keep the current concrete location as long as it is still a valid
+    # auto-candidate. Do not reshuffle existing users just because another node
+    # is slightly faster or less loaded. Reassignment should happen only when
+    # the current node is no longer eligible for the virtual pool.
+    return assigned_row is not None
 
 
 def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional[Dict[str, Any]]:
@@ -1595,11 +1565,11 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if not ranked_candidates:
         return None
 
-    pool = _virtual_strict_candidate_pool(code, rows)
-    if not pool:
-        pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
-    pool = _virtual_pool_best_quality(pool)
-    pool = _virtual_role_preferred_pool(code, pool)
+    # Main rule:
+    # take only the top-N live candidates in speed order and balance new users
+    # across that ordered pool. Existing users keep their current assignment as
+    # long as it remains in the valid candidate pool.
+    pool = ranked_candidates[: max(1, VIRTUAL_LOCATION_POOL_SIZE)]
     if not pool:
         return None
     if not user_id:
@@ -1607,17 +1577,15 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
 
     sibling_code = _virtual_sibling_code(code)
     sibling_assigned_code = get_user_virtual_location_assignment(user_id, sibling_code) if sibling_code else None
-
     if sibling_assigned_code:
         sibling_filtered_pool = [
             row for row in pool
             if str(row.get("code") or "").strip() != sibling_assigned_code
         ]
         if sibling_filtered_pool:
-            pool = _virtual_pool_best_quality(sibling_filtered_pool)
-            pool = _virtual_role_preferred_pool(code, pool)
-            if not pool:
-                return None
+            pool = sibling_filtered_pool
+        if not pool:
+            return None
 
     loads = get_virtual_location_assignment_counts([str(row.get("code") or "").strip() for row in pool])
 
@@ -1625,19 +1593,11 @@ def _pick_virtual_location(code: str, user_id: Optional[int] = None) -> Optional
     if assigned_code:
         sibling_collision = bool(sibling_assigned_code and assigned_code == sibling_assigned_code)
         if not sibling_collision:
-            best_row = pool[0] if pool else None
             assigned_row = next((row for row in pool if str(row.get("code") or "").strip() == assigned_code), None)
-            if assigned_row is not None and _virtual_assignment_reusable(assigned_row, best_row, loads):
+            if assigned_row is not None and _virtual_assignment_reusable(assigned_row, pool[0] if pool else None, loads):
                 return assigned_row
 
-    effective_pool = _virtual_pool_best_quality(_prefer_primary_virtual_pool(pool, loads))
-    effective_pool = _virtual_role_preferred_pool(code, effective_pool)
-    if not effective_pool:
-        effective_pool = _virtual_pool_best_quality(pool)
-        effective_pool = _virtual_role_preferred_pool(code, effective_pool)
-    if not effective_pool:
-        return None
-    selected = _pick_balanced_virtual_candidate(effective_pool, loads) or effective_pool[0]
+    selected = _pick_balanced_virtual_candidate(pool, loads) or pool[0]
     selected_code = str(selected.get("code") or "").strip()
     if selected_code:
         upsert_user_virtual_location_assignment(user_id, code, selected_code)
