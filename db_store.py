@@ -1,6 +1,7 @@
 import csv
 import io
 import json
+import re
 import secrets
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
@@ -411,6 +412,7 @@ def bootstrap() -> None:
             cur.execute(SCHEMA_TABLES_SQL)
             _run_schema_migrations(cur)
             _resync_serial_sequences(cur)
+            _cleanup_tracking_alias_duplicates(cur)
         conn.commit()
     apply_runtime_settings_overrides()
     sync_plans_from_env()
@@ -1968,6 +1970,106 @@ def _device_platform_family(platform: Any) -> str:
 
 
 
+def _is_subscription_tracking_fingerprint(value: Any) -> bool:
+    raw = str(value or "").strip().lower()
+    return bool(raw) and bool(re.fullmatch(r"[0-9a-f]{64}", raw))
+
+
+
+def _prefer_device_candidate(items: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
+    if not items:
+        return None
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_name = str(device_name or "").strip()
+
+    def sort_key(item: Dict[str, Any]) -> tuple:
+        item_platform = str(item.get("platform") or "").strip().lower()
+        item_name = str(item.get("device_name") or "").strip()
+        seen_at = _normalize_optional_timestamp(item.get("last_seen_at")) or _normalize_optional_timestamp(item.get("created_at")) or datetime.fromtimestamp(0, tz=timezone.utc)
+        fingerprint = str(item.get("device_fingerprint") or "").strip()
+        return (
+            1 if item_platform == normalized_platform else 0,
+            1 if item_name == normalized_name else 0,
+            1 if not _is_subscription_tracking_fingerprint(fingerprint) else 0,
+            1 if fingerprint else 0,
+            seen_at,
+            int(item.get("id") or 0),
+        )
+
+    return max(items, key=sort_key)
+
+
+
+def _select_tracking_alias_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str, incoming_fingerprint: str) -> Optional[Dict[str, Any]]:
+    if not _is_subscription_tracking_fingerprint(incoming_fingerprint):
+        return None
+
+    normalized_platform = str(platform or "").strip().lower()
+    normalized_name = str(device_name or "").strip()
+    platform_family = _device_platform_family(normalized_platform)
+    client_family = _device_client_family(normalized_name)
+
+    exact_matches = [
+        item for item in existing
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+        and str(item.get("device_name") or "").strip() == normalized_name
+    ]
+    if len(exact_matches) == 1:
+        return exact_matches[0]
+
+    strong_exact_matches = [
+        item for item in exact_matches
+        if not _is_subscription_tracking_fingerprint(item.get("device_fingerprint"))
+    ]
+    if len(strong_exact_matches) == 1:
+        return strong_exact_matches[0]
+
+    same_platform = [
+        item for item in existing
+        if str(item.get("platform") or "").strip().lower() == normalized_platform
+    ]
+    strong_same_platform = [
+        item for item in same_platform
+        if not _is_subscription_tracking_fingerprint(item.get("device_fingerprint"))
+    ]
+
+    if platform_family == "desktop":
+        if len(same_platform) == 1:
+            return same_platform[0]
+        if len(strong_same_platform) == 1:
+            return strong_same_platform[0]
+    else:
+        if len(strong_same_platform) == 1 and len(same_platform) == 1:
+            return strong_same_platform[0]
+
+    same_family = []
+    for item in existing:
+        item_platform = str(item.get("platform") or "").strip().lower()
+        item_name = str(item.get("device_name") or "").strip()
+        item_family = _device_platform_family(item_platform)
+        item_client_family = _device_client_family(item_name)
+        compatible_family = item_family == platform_family
+        compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
+        if compatible_family and compatible_client:
+            same_family.append(item)
+    if len(same_family) == 1:
+        return same_family[0]
+
+    if len(existing) == 1:
+        only_item = existing[0]
+        only_platform = str(only_item.get("platform") or "").strip().lower()
+        only_name = str(only_item.get("device_name") or "").strip()
+        only_family = _device_platform_family(only_platform)
+        only_client_family = _device_client_family(only_name)
+        compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
+        compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
+        if compatible_family and compatible_client:
+            return only_item
+
+    return None
+
+
+
 def _device_client_family(device_name: Any) -> str:
     normalized = str(device_name or "").strip().lower()
     if "v2raytun" in normalized:
@@ -2038,52 +2140,70 @@ def _collapse_duplicate_device_slots(user_id: int, platform: str, device_name: s
         conn.commit()
 
 
-def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str) -> Optional[Dict[str, Any]]:
-    normalized_platform = str(platform or "").strip().lower()
-    normalized_name = str(device_name or "").strip()
-    platform_family = _device_platform_family(normalized_platform)
-    client_family = _device_client_family(normalized_name)
+def _select_soft_match_device(existing: List[Dict[str, Any]], platform: str, device_name: str, incoming_fingerprint: str = "") -> Optional[Dict[str, Any]]:
+    return _select_tracking_alias_match_device(existing, platform, device_name, incoming_fingerprint)
 
-    exact_matches = [
-        item for item in existing
-        if str(item.get("platform") or "").strip().lower() == normalized_platform
-        and str(item.get("device_name") or "").strip() == normalized_name
-    ]
-    if len(exact_matches) == 1:
-        return exact_matches[0]
 
-    same_platform = [
-        item for item in existing
-        if str(item.get("platform") or "").strip().lower() == normalized_platform
-    ]
-    if len(same_platform) == 1:
-        return same_platform[0]
 
-    same_family = []
-    for item in existing:
-        item_platform = str(item.get("platform") or "").strip().lower()
-        item_name = str(item.get("device_name") or "").strip()
-        item_family = _device_platform_family(item_platform)
-        item_client_family = _device_client_family(item_name)
-        compatible_family = item_family == platform_family
-        compatible_client = client_family == item_client_family or "generic" in {client_family, item_client_family}
-        if compatible_family and compatible_client:
-            same_family.append(item)
-    if len(same_family) == 1:
-        return same_family[0]
+def _cleanup_tracking_alias_duplicates(cur: psycopg.Cursor) -> None:
+    cur.execute(
+        """
+        SELECT DISTINCT user_id
+        FROM devices
+        WHERE is_active = TRUE
+        """
+    )
+    user_ids = [int(row["user_id"]) for row in cur.fetchall()]
+    for user_id in user_ids:
+        cur.execute(
+            """
+            SELECT *
+            FROM devices
+            WHERE user_id = %s AND is_active = TRUE
+            ORDER BY last_seen_at DESC, created_at DESC, id DESC
+            """,
+            (user_id,),
+        )
+        devices = [dict(row) for row in cur.fetchall()]
+        if len(devices) <= 1:
+            continue
 
-    if len(existing) == 1:
-        only_item = existing[0]
-        only_platform = str(only_item.get("platform") or "").strip().lower()
-        only_name = str(only_item.get("device_name") or "").strip()
-        only_family = _device_platform_family(only_platform)
-        only_client_family = _device_client_family(only_name)
-        compatible_family = only_family == platform_family or "generic" in {only_family, platform_family}
-        compatible_client = client_family == only_client_family or "generic" in {client_family, only_client_family}
-        if compatible_family and compatible_client:
-            return only_item
+        drop_ids: List[int] = []
+        desktop_platform_groups: Dict[str, List[Dict[str, Any]]] = {}
+        for item in devices:
+            platform = str(item.get("platform") or "").strip().lower()
+            if _device_platform_family(platform) == "desktop":
+                desktop_platform_groups.setdefault(platform, []).append(item)
 
-    return None
+        for platform, group in desktop_platform_groups.items():
+            strong = [item for item in group if not _is_subscription_tracking_fingerprint(item.get("device_fingerprint"))]
+            tracking = [item for item in group if _is_subscription_tracking_fingerprint(item.get("device_fingerprint"))]
+            if not tracking:
+                continue
+            if len(strong) == 1:
+                keep = _prefer_device_candidate([strong[0]] + tracking, platform, str(strong[0].get("device_name") or ""))
+                for item in group:
+                    item_id = int(item.get("id") or 0)
+                    if item_id and keep and item_id != int(keep.get("id") or 0):
+                        drop_ids.append(item_id)
+                continue
+            if not strong and len(group) > 1:
+                by_client: Dict[str, List[Dict[str, Any]]] = {}
+                for item in group:
+                    by_client.setdefault(_device_client_family(item.get("device_name")), []).append(item)
+                if len(by_client) > 1:
+                    keep = _prefer_device_candidate(group, platform, str(group[0].get("device_name") or ""))
+                    for item in group:
+                        item_id = int(item.get("id") or 0)
+                        if item_id and keep and item_id != int(keep.get("id") or 0):
+                            drop_ids.append(item_id)
+
+        if drop_ids:
+            unique_drop_ids = sorted(set(drop_ids))
+            cur.execute(
+                "UPDATE devices SET is_active = FALSE, last_seen_at = NOW() WHERE user_id = %s AND id = ANY(%s)",
+                (user_id, unique_drop_ids),
+            )
 
 
 def _upsert_device_record(
@@ -2124,9 +2244,33 @@ def _upsert_device_record(
                     row = cur.fetchone()
                 conn.commit()
             return dict(row) if row else None
+
+    alias_match = None
+    if not enforce_limit:
+        alias_match = _select_tracking_alias_match_device(existing, platform, device_name, device_fingerprint)
+        if alias_match:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        """
+                        UPDATE devices
+                        SET device_fingerprint = %s,
+                            platform = %s,
+                            device_name = %s,
+                            is_active = TRUE,
+                            last_seen_at = NOW()
+                        WHERE id = %s
+                        RETURNING *
+                        """,
+                        (device_fingerprint, platform, device_name, alias_match["id"]),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+            return dict(row) if row else None
+
     if len(existing) >= allowed_limit:
         if not enforce_limit:
-            matched_item = _select_soft_match_device(existing, platform, device_name)
+            matched_item = _select_soft_match_device(existing, platform, device_name, device_fingerprint)
             if matched_item:
                 with db() as conn:
                     with conn.cursor() as cur:
