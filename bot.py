@@ -188,7 +188,7 @@ TEXT: Dict[str, Dict[str, str]] = {
 bot: Optional[Bot] = None
 dp = Dispatcher()
 
-_APP_CONFIG_CACHE: Dict[str, float] = {"ts": 0.0}
+_APP_CONFIG_CACHE: Dict[str, Any] = {"ts": 0.0, "payment_commission_percent": None}
 
 
 def selected_client_mode() -> str:
@@ -208,7 +208,9 @@ def tx(lang: str, key: str) -> str:
 
 
 def payment_created_text(lang: str) -> str:
-    commission = max(float(getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0) or 0.0), 0.0)
+    cached_commission = _APP_CONFIG_CACHE.get("payment_commission_percent")
+    raw_commission = cached_commission if cached_commission is not None else getattr(settings, "PAYMENTS_COMMISSION_PERCENT", 0.0)
+    commission = max(float(raw_commission or 0.0), 0.0)
     percent = int(commission) if float(commission).is_integer() else commission
     if lang == "ru":
         lines = [
@@ -253,6 +255,8 @@ async def refresh_app_config(force: bool = False) -> None:
     settings.IOS_APP_URL = str(data.get("ios_app_url") or settings.IOS_APP_URL)
     settings.WINDOWS_APP_URL = str(data.get("windows_app_url") or getattr(settings, "WINDOWS_APP_URL", ""))
     settings.MACOS_APP_URL = str(data.get("macos_app_url") or getattr(settings, "MACOS_APP_URL", ""))
+    commission = data.get("payment_commission_percent")
+    _APP_CONFIG_CACHE["payment_commission_percent"] = float(commission or 0.0) if commission is not None else None
     _APP_CONFIG_CACHE["ts"] = now
 
 
