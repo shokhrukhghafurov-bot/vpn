@@ -2666,6 +2666,30 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
     return dict(row)
 
 
+def delete_location(location_id: int) -> Dict[str, Any]:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE locations
+                SET is_deleted = TRUE,
+                    is_active = FALSE,
+                    is_recommended = FALSE,
+                    is_reserve = FALSE,
+                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
+                    updated_at = NOW()
+                WHERE id = %s AND is_deleted = FALSE
+                RETURNING *
+                """,
+                (location_id,),
+            )
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("Location not found")
+        conn.commit()
+    return dict(row)
+
+
 def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
     subscription = get_current_subscription(user_id)
     if not subscription:
