@@ -3846,36 +3846,25 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def _expired_subscription_response(request: Request, token: str, *, profile_title: str, head_only: bool = False) -> Response:
-    bot_public_url = str(_bot_public_url() or "").strip()
-    profile_web_page_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or getattr(settings, "ADMIN_PANEL_BASE_URL", "") or getattr(settings, "APP_BASE_URL", "") or "").strip()
-    support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+
+
+def _expired_subscription_response(request: Request, token: str, *, profile_title: str, bot_url: str, head_only: bool = False) -> Response:
+    safe_bot_url = str(bot_url or "").strip()
     update_interval_hours = _hiddify_profile_update_interval_header_value()
     subscription_userinfo = "upload=0; download=0; total=0; expire=0"
-    body_lines = [
-        "Subscription expired. Buy a new subscription in the Telegram bot.",
-        "Подписка истекла. Купите новую подписку в Telegram-боте.",
+    inline_headers = [
+        f"#profile-title: {profile_title}",
+        f"#profile-update-interval: {update_interval_hours}",
+        f"#subscription-userinfo: {subscription_userinfo}",
     ]
-    if support_url:
-        body_lines.extend(["", support_url])
-    content_seed = "\n".join(body_lines) + "\n"
-    content_version = hashlib.sha256(content_seed.encode("utf-8")).hexdigest()
-    moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
-    inline_headers = _subscription_inline_comment_headers(
-        profile_title=profile_title,
-        update_interval_hours=update_interval_hours,
-        subscription_userinfo=subscription_userinfo,
-        support_url=support_url,
-        profile_web_page_url=profile_web_page_url,
-        moved_permanently_to_url=moved_permanently_to_url,
-        content_version=content_version,
-    )
-    content = "\n".join(inline_headers + body_lines) + "\n"
-    response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    now_dt = datetime.now(timezone.utc)
+    if safe_bot_url:
+        inline_headers.append(f"#support-url: {safe_bot_url}")
+        inline_headers.append(f"#profile-web-page-url: {safe_bot_url}")
+    content = "\n".join(inline_headers) + "\n"
+    content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
     headers = {
-        "Content-Disposition": 'inline; filename="inet-subscription-expired.txt"',
-        "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
+        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
+        "Profile-Title": quote(profile_title, safe=' '),
         "Subscription-Userinfo": subscription_userinfo,
         "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
         "CDN-Cache-Control": "no-store, no-cache, max-age=0",
@@ -3883,17 +3872,16 @@ def _expired_subscription_response(request: Request, token: str, *, profile_titl
         "Surrogate-Control": "no-store",
         "Pragma": "no-cache",
         "Expires": "0",
-        "ETag": f'W/"{response_etag}"',
-        "Last-Modified": _http_date_from_datetime(now_dt) or "",
+        "ETag": f'W/"{content_version}"',
+        "Last-Modified": _http_date_from_datetime(datetime.now(timezone.utc)) or "",
         "Vary": "*",
         "X-Accel-Expires": "0",
         "profile-update-interval": update_interval_hours,
-        "support-url": support_url,
-        "profile-web-page-url": profile_web_page_url,
-        "moved-permanently-to": moved_permanently_to_url or "",
+        "support-url": safe_bot_url,
+        "profile-web-page-url": safe_bot_url,
         "x-hiddify-source": "subscription",
-        "x-subscription-version": content_version,
-        "x-subscription-generated-at": now_dt.isoformat(),
+        "x-subscription-version": content_version[:16],
+        "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
         "x-subscription-state": "expired",
     }
     response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
@@ -3910,7 +3898,6 @@ def _expired_subscription_response(request: Request, token: str, *, profile_titl
         pass
     return response
 
-
 def _subscription_response(request: Request, token: str, *, head_only: bool = False) -> Response:
     access = _subscription_access_context(token)
     if not access:
@@ -3924,9 +3911,20 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not user or user.get("status") == "blocked":
             raise HTTPException(status_code=404, detail="Subscription not found")
         view = get_user_subscription_view(int(user["id"]))
-        if not view.get("is_active") or not view.get("subscription"):
-            return _expired_subscription_response(request, token, profile_title=f"{settings.APP_NAME} · subscription expired", head_only=head_only)
-        subscription = view["subscription"] or {}
+        latest_subscription = view.get("subscription") or {}
+        if not view.get("is_active"):
+            if latest_subscription:
+                return _expired_subscription_response(
+                    request,
+                    token,
+                    profile_title=profile_title,
+                    bot_url=str(_bot_public_url() or "").strip(),
+                    head_only=head_only,
+                )
+            raise HTTPException(status_code=403, detail="Active subscription required")
+        if not latest_subscription:
+            raise HTTPException(status_code=403, detail="Active subscription required")
+        subscription = latest_subscription
         expires_at = subscription.get("expires_at")
         if isinstance(expires_at, datetime):
             expires_ts = int(expires_at.timestamp())
