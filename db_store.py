@@ -218,6 +218,17 @@ CREATE TABLE IF NOT EXISTS vpn_runtime_settings (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
+CREATE TABLE IF NOT EXISTS user_location_credentials (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    location_code TEXT NOT NULL,
+    uuid TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, location_code)
+);
+
 CREATE TABLE IF NOT EXISTS virtual_location_assignments (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -305,6 +316,9 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
+    "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
+    "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_user_id ON user_location_credentials(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_location_code ON user_location_credentials(location_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
 ]
@@ -328,6 +342,8 @@ POST_MIGRATION_SQL = [
     "UPDATE payments SET status = 'created' WHERE status IS NULL OR status = ''",
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
+    "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
+    "UPDATE user_location_credentials SET status = 'active' WHERE status IS NULL OR status = ''",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
     "UPDATE locations SET name_en = 'Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en IN ('Auto | Fastest', '★ Auto | Fastest'))",
@@ -341,6 +357,7 @@ SERIAL_SEQUENCE_TARGETS = (
     ("subscriptions", "id"),
     ("devices", "id"),
     ("locations", "id"),
+    ("user_location_credentials", "id"),
     ("admin_notes", "id"),
     ("manual_extensions", "id"),
     ("bot_notifications", "id"),
@@ -996,6 +1013,41 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     return _apply_admin_mobile_defaults(normalized)
 
 
+def _normalize_location_access_mode(value: Any) -> str:
+    text = str(value or "").strip().lower()
+    if text in {"owned_per_user", "per_user", "owned", "template", "template_per_user", "user_uuid", "user-specific", "user_specific"}:
+        return "owned_per_user"
+    return "external_static"
+
+
+def _extract_location_access_mode(row: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> str:
+    sources = []
+    if isinstance(payload, dict):
+        sources.extend([payload.get("access_mode"), payload.get("credential_mode")])
+    if isinstance(row, dict):
+        sources.extend([row.get("access_mode")])
+        row_payload = row.get("vpn_payload")
+        if isinstance(row_payload, dict):
+            sources.extend([row_payload.get("access_mode"), row_payload.get("credential_mode")])
+    for candidate in sources:
+        normalized = _normalize_location_access_mode(candidate)
+        if str(candidate or "").strip():
+            return normalized
+    return "external_static"
+
+
+def _apply_location_access_mode(payload: Dict[str, Any], access_mode: str) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    mode = _normalize_location_access_mode(access_mode)
+    normalized["access_mode"] = mode
+    normalized["credential_mode"] = "per_user" if mode == "owned_per_user" else "static"
+    return normalized
+
+
+def _location_requires_user_credential(row: Optional[Dict[str, Any]] = None, payload: Optional[Dict[str, Any]] = None) -> bool:
+    return _extract_location_access_mode(row=row, payload=payload) == "owned_per_user"
+
+
 def _placeholder_like_value(value: Any) -> bool:
     text = str(value or "").strip()
     if not text:
@@ -1058,12 +1110,88 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
     if not payload:
         return {}
 
+    payload = _apply_location_access_mode(payload, _extract_location_access_mode(row, payload))
     payload.setdefault("location_code", requested_location_code or row.get("code"))
     payload.setdefault("resolved_location_code", row.get("code"))
     payload.setdefault("country_code", row.get("country_code"))
     payload.setdefault("resolved_country_code", row.get("country_code"))
     payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
     payload.setdefault("display_name", row.get("name_en") or row.get("name_ru") or row.get("code"))
+    return payload
+
+
+def _get_user_location_credential(cur: psycopg.Cursor, user_id: int, location_code: str) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT *
+        FROM user_location_credentials
+        WHERE user_id = %s AND location_code = %s
+        LIMIT 1
+        """,
+        (int(user_id), str(location_code or "").strip()),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+
+def ensure_user_location_credential(user_id: int, location_code: str) -> Dict[str, Any]:
+    resolved_code = str(location_code or "").strip()
+    if not resolved_code:
+        raise ValueError("location_code is required for per-user credential")
+    with db() as conn:
+        with conn.cursor() as cur:
+            existing = _get_user_location_credential(cur, user_id, resolved_code)
+            if existing:
+                if str(existing.get("status") or "").strip().lower() != "active":
+                    cur.execute(
+                        """
+                        UPDATE user_location_credentials
+                        SET status = 'active', updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING *
+                        """,
+                        (existing["id"],),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    return dict(row) if row else existing
+                return existing
+            generated_uuid = str(uuid4())
+            cur.execute(
+                """
+                INSERT INTO user_location_credentials (user_id, location_code, uuid, status)
+                VALUES (%s, %s, %s, 'active')
+                ON CONFLICT (user_id, location_code) DO UPDATE
+                    SET updated_at = NOW()
+                RETURNING *
+                """,
+                (int(user_id), resolved_code, generated_uuid),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise ValueError("Failed to create per-user credential")
+    return dict(row)
+
+
+
+def build_user_vpn_payload_for_location(user_id: int, row: Dict[str, Any], *, requested_location_code: Optional[str] = None) -> Dict[str, Any]:
+    payload = _compose_vpn_payload_for_location(row, requested_location_code=requested_location_code)
+    if not payload:
+        return {}
+    if not _location_requires_user_credential(row=row, payload=payload):
+        return payload
+    resolved_location_code = str(row.get("code") or requested_location_code or "").strip()
+    credential = ensure_user_location_credential(int(user_id), resolved_location_code)
+    payload = dict(payload)
+    template_uuid = str(payload.get("uuid") or "").strip()
+    payload["uuid"] = str(credential.get("uuid") or "").strip()
+    payload["id"] = payload["uuid"]
+    payload["credential_status"] = str(credential.get("status") or "active").strip() or "active"
+    payload["credential_location_code"] = resolved_location_code
+    if template_uuid and template_uuid != payload["uuid"]:
+        payload["template_uuid"] = template_uuid
     return payload
 
 
@@ -2389,6 +2517,8 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
     data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
     vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
+    access_mode = _extract_location_access_mode(data, vpn_payload)
+    vpn_payload = _apply_location_access_mode(vpn_payload, access_mode)
     if data["code"] and not vpn_payload.get("location_code"):
         vpn_payload["location_code"] = data["code"]
     if data["name_en"] and not vpn_payload.get("remark"):
@@ -2470,67 +2600,65 @@ def create_location(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
-    updates = []
-    values: List[Any] = []
-    allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
-    for key, value in payload.items():
-        if key not in allowed:
-            continue
-        if key in {"name_ru", "name_en"}:
-            value = str(value or "").strip()
-        elif key == "country_code":
-            value = str(value).strip().upper() or None if value is not None else None
-        elif key == "status":
-            value = str(value or "offline").strip() or "offline"
-        elif key == "sort_order":
-            try:
-                value = int(value)
-            except (TypeError, ValueError):
-                value = 100
-        elif key in {"download_mbps", "upload_mbps"}:
-            value = _normalize_optional_float(value)
-        elif key == "ping_ms":
-            value = _normalize_optional_int(value)
-        elif key == "speed_checked_at":
-            value = _normalize_optional_timestamp(value)
-        elif key == "vpn_payload":
-            value = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(value or {})))
-            if "name_en" in payload and payload.get("name_en") and not value.get("remark"):
-                value["remark"] = str(payload.get("name_en") or "").strip()
-            value = Jsonb(value)
-        updates.append(f"{key} = %s")
-        values.append(value)
-    if not updates:
-        raise ValueError("No valid fields to update")
-    values.append(location_id)
-    query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s AND is_deleted = FALSE RETURNING *"
+    normalized_payload = dict(payload or {})
+    access_mode_requested = "access_mode" in normalized_payload
+
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, tuple(values))
-            row = cur.fetchone()
-            if not row:
+            cur.execute("SELECT * FROM locations WHERE id = %s AND is_deleted = FALSE LIMIT 1", (location_id,))
+            existing = cur.fetchone()
+            if not existing:
                 raise ValueError("Location not found")
-        conn.commit()
-    return dict(row)
+            existing_row = dict(existing)
 
+            if access_mode_requested:
+                current_vpn_payload = dict(existing_row.get("vpn_payload") or {})
+                if isinstance(normalized_payload.get("vpn_payload"), dict):
+                    current_vpn_payload.update(normalized_payload.get("vpn_payload") or {})
+                merged_mode = _extract_location_access_mode({"access_mode": normalized_payload.get("access_mode")}, current_vpn_payload)
+                normalized_payload["vpn_payload"] = _apply_location_access_mode(current_vpn_payload, merged_mode)
 
-def delete_location(location_id: int) -> Dict[str, Any]:
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                UPDATE locations
-                SET is_deleted = TRUE,
-                    is_active = FALSE,
-                    is_recommended = FALSE,
-                    is_reserve = FALSE,
-                    status = CASE WHEN status = 'online' THEN 'offline' ELSE status END,
-                    updated_at = NOW()
-                WHERE id = %s AND is_deleted = FALSE
-                RETURNING *
-                """,
-                (location_id,),
-            )
+            updates: List[str] = []
+            values: List[Any] = []
+            allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
+            for key, value in normalized_payload.items():
+                if key not in allowed:
+                    continue
+                if key in {"name_ru", "name_en"}:
+                    value = str(value or "").strip()
+                elif key == "country_code":
+                    value = str(value).strip().upper() or None if value is not None else None
+                elif key == "status":
+                    value = str(value or "offline").strip() or "offline"
+                elif key == "sort_order":
+                    try:
+                        value = int(value)
+                    except (TypeError, ValueError):
+                        value = 100
+                elif key in {"download_mbps", "upload_mbps"}:
+                    value = _normalize_optional_float(value)
+                elif key == "ping_ms":
+                    value = _normalize_optional_int(value)
+                elif key == "speed_checked_at":
+                    value = _normalize_optional_timestamp(value)
+                elif key == "vpn_payload":
+                    merged_payload = dict(existing_row.get("vpn_payload") or {})
+                    if isinstance(value, dict):
+                        merged_payload.update(value or {})
+                    merged_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(merged_payload or {})))
+                    merged_payload = _apply_location_access_mode(merged_payload, _extract_location_access_mode(normalized_payload, merged_payload))
+                    if "name_en" in normalized_payload and normalized_payload.get("name_en") and not merged_payload.get("remark"):
+                        merged_payload["remark"] = str(normalized_payload.get("name_en") or "").strip()
+                    value = Jsonb(merged_payload)
+                updates.append(f"{key} = %s")
+                values.append(value)
+
+            if not updates:
+                raise ValueError("No valid fields to update")
+
+            values.append(location_id)
+            query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s AND is_deleted = FALSE RETURNING *"
+            cur.execute(query, tuple(values))
             row = cur.fetchone()
             if not row:
                 raise ValueError("Location not found")
@@ -2566,7 +2694,7 @@ def get_vpn_config_for_user(user_id: int, location_code: str) -> Dict[str, Any]:
         elif not _location_has_fresh_live_signal(current_row):
             raise ValueError("Location is offline or has not passed a fresh live tunnel check")
 
-    payload = _compose_vpn_payload_for_location(dict(row), requested_location_code=location_code)
+    payload = build_user_vpn_payload_for_location(int(user_id), dict(row), requested_location_code=location_code)
     if not payload:
         raise ValueError("VLESS config is not configured for this location")
     if not _config_is_complete(payload):
