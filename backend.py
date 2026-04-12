@@ -440,6 +440,40 @@ def _xray_reality_spider_x(payload: Dict[str, Any], transport: str) -> Optional[
     return fallback if fallback.startswith("/") else f"/{fallback.lstrip('/')}"
 
 
+def _probe_runtime_uuid(payload: Dict[str, Any]) -> str:
+    candidates: List[Any] = [
+        payload.get("uuid"),
+        payload.get("probe_uuid"),
+        payload.get("live_probe_uuid"),
+        payload.get("probeUuid"),
+        payload.get("liveProbeUuid"),
+    ]
+    nested_probe = payload.get("_probe")
+    if isinstance(nested_probe, dict):
+        candidates.extend([
+            nested_probe.get("uuid"),
+            nested_probe.get("probe_uuid"),
+            nested_probe.get("live_probe_uuid"),
+        ])
+    for value in candidates:
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _payload_probe_ready(payload: Dict[str, Any]) -> bool:
+    return bool(_probe_runtime_uuid(payload))
+
+
+def _payload_for_real_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    runtime_uuid = _probe_runtime_uuid(normalized)
+    if runtime_uuid:
+        normalized["uuid"] = runtime_uuid
+    return normalized
+
+
 def _candidate_identity_key(payload: Dict[str, Any]) -> str:
     return "|".join([
         str(payload.get("server") or "").strip().lower(),
@@ -502,23 +536,24 @@ def _mark_candidate_dead(pool: str, payload: Dict[str, Any]) -> None:
 
 def _candidate_quality_reasons(payload: Dict[str, Any], *, pool: str) -> List[str]:
     reasons: List[str] = []
-    protocol = str(payload.get("protocol") or "vless").strip().lower()
-    transport = _payload_transport(payload)
-    security = _payload_security(payload)
-    server_name = str(payload.get("server_name") or payload.get("sni") or "").strip()
-    public_key = str(payload.get("public_key") or payload.get("publicKey") or "").strip()
-    short_id = str(payload.get("short_id") or payload.get("shortId") or "").strip()
-    flow = str(payload.get("flow") or "").strip().lower()
-    service_name = str(payload.get("service_name") or "").strip()
-    path = str(payload.get("path") or "").strip()
+    probe_payload = _payload_for_real_probe(payload)
+    protocol = str(probe_payload.get("protocol") or "vless").strip().lower()
+    transport = _payload_transport(probe_payload)
+    security = _payload_security(probe_payload)
+    server_name = str(probe_payload.get("server_name") or probe_payload.get("sni") or "").strip()
+    public_key = str(probe_payload.get("public_key") or probe_payload.get("publicKey") or "").strip()
+    short_id = str(probe_payload.get("short_id") or probe_payload.get("shortId") or "").strip()
+    flow = str(probe_payload.get("flow") or "").strip().lower()
+    service_name = str(probe_payload.get("service_name") or "").strip()
+    path = str(probe_payload.get("path") or "").strip()
 
     if protocol != "vless":
         reasons.append("protocol")
-    if not str(payload.get("server") or "").strip():
+    if not str(probe_payload.get("server") or "").strip():
         reasons.append("server")
-    if int(payload.get("port") or 0) <= 0:
+    if int(probe_payload.get("port") or 0) <= 0:
         reasons.append("port")
-    if not str(payload.get("uuid") or "").strip():
+    if not _payload_probe_ready(probe_payload):
         reasons.append("uuid")
 
     allowed = settings.BLACK_ALLOWED_TRANSPORTS if pool == "black" else settings.RU_LTE_ALLOWED_TRANSPORTS
@@ -710,7 +745,7 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
     security = _payload_security(payload)
     server_name = str(payload.get("server_name") or payload.get("sni") or payload.get("host") or "").strip()
     user: Dict[str, Any] = {
-        "id": str(payload.get("uuid") or "").strip(),
+        "id": _probe_runtime_uuid(payload),
         "encryption": str(payload.get("encryption") or "none").strip() or "none",
     }
     flow = str(payload.get("flow") or "").strip()
@@ -826,7 +861,7 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
         "tag": "proxy",
         "server": str(payload.get("server") or "").strip(),
         "server_port": int(payload.get("port") or 0),
-        "uuid": str(payload.get("uuid") or "").strip(),
+        "uuid": _probe_runtime_uuid(payload),
         "packet_encoding": str(payload.get("packet_encoding") or payload.get("packetEncoding") or "xudp").strip() or "xudp",
     }
     if security in {"tls", "reality"}:
@@ -1053,8 +1088,12 @@ def _candidate_probe_targets(payload: Dict[str, Any], *, pool: str = "generic") 
 
 
 def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "generic") -> Dict[str, Any]:
+    probe_payload = _payload_for_real_probe(payload)
+    if not _payload_probe_ready(probe_payload):
+        return {"ok": False, "latency_ms": None, "error": "probe_uuid_missing", "method": "probe_setup"}
+
     runner_name, runner_bin = _resolve_probe_runner()
-    transport = _payload_transport(payload)
+    transport = _payload_transport(probe_payload)
     if transport == "xhttp" and runner_name == "singbox":
         xray_bin = shutil.which(str(getattr(settings, "VPN_REAL_PROBE_XRAY_BIN", "xray") or "xray").strip() or "xray")
         if xray_bin:
@@ -1062,7 +1101,7 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
     if not runner_bin:
         return {"ok": False, "latency_ms": None, "error": f"{runner_name}_binary_missing", "method": f"{runner_name}_real"}
 
-    targets = _candidate_probe_targets(payload, pool=pool)
+    targets = _candidate_probe_targets(probe_payload, pool=pool)
     if not targets:
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
@@ -1077,10 +1116,10 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
     with tempfile.TemporaryDirectory(prefix=f"inet_{pool}_probe_") as temp_dir:
         config_path = Path(temp_dir) / "config.json"
         if runner_name == "singbox":
-            config_payload = _build_singbox_ru_lte_probe_config(payload, socks_port)
+            config_payload = _build_singbox_ru_lte_probe_config(probe_payload, socks_port)
             command = [runner_bin, "run", "-c", str(config_path)]
         else:
-            config_payload = _build_xray_ru_lte_probe_config(payload, socks_port)
+            config_payload = _build_xray_ru_lte_probe_config(probe_payload, socks_port)
             command = [runner_bin, "-config", str(config_path)]
         config_path.write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
@@ -2565,6 +2604,7 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
     if requires_runtime_uuid:
         if not uuid or _diagnostic_placeholder(uuid):
             fixes.append("Template mode is enabled: the backend will inject a per-user UUID at выдаче конфигурации.")
+            fixes.append("For live tunnel probe add probe_uuid (or live_probe_uuid) for this server template.")
     elif not uuid or _diagnostic_placeholder(uuid):
         issues.append("uuid is missing or still contains a placeholder")
 
