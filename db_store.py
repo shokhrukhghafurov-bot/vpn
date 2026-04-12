@@ -654,9 +654,16 @@ def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -
     settings.VPN_MAINTENANCE_MODE = _coerce_runtime_bool(data.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE)
     settings.VPN_NEW_ACTIVATIONS_ENABLED = _coerce_runtime_bool(data.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED)
     max_devices = _coerce_runtime_int(data.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
-    default_device_limit = _coerce_runtime_int(data.get("device_limit"), max_devices, minimum=1)
-    settings.VPN_MAX_DEVICES_PER_ACCOUNT = max_devices
-    settings.VPN_DEFAULT_DEVICE_LIMIT = min(default_device_limit, max_devices)
+    plan_limits = [
+        _as_positive_int(item.get("device_limit"))
+        for item in (data.get("plans") or [])
+        if isinstance(item, dict)
+    ]
+    max_plan_limit = max([limit for limit in plan_limits if limit is not None], default=1)
+    effective_max_devices = max(max_devices, max_plan_limit)
+    default_device_limit = _coerce_runtime_int(data.get("device_limit"), effective_max_devices, minimum=1)
+    settings.VPN_MAX_DEVICES_PER_ACCOUNT = effective_max_devices
+    settings.VPN_DEFAULT_DEVICE_LIMIT = min(default_device_limit, effective_max_devices)
     settings.VPN_SETTINGS_EDITABLE = True
 
     plans = data.get("plans") if isinstance(data.get("plans"), list) else _current_runtime_plan_payloads()
@@ -683,7 +690,7 @@ def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -
         fixed_duration = 1 if slot == "daily" else 30
         fixed_limit = 1 if slot in {"daily", "monthly_1"} else (2 if slot == "monthly_2" else 3)
         setattr(settings, duration_attr, fixed_duration)
-        setattr(settings, limit_attr, min(fixed_limit, settings.VPN_MAX_DEVICES_PER_ACCOUNT))
+        setattr(settings, limit_attr, fixed_limit)
         setattr(settings, active_attr, _coerce_runtime_bool(plan.get("is_active"), getattr(settings, active_attr)))
 
     return data
@@ -1763,9 +1770,9 @@ def _resolve_effective_device_limit(plan_limit: Any = None, user_override: Any =
         return override_limit
     plan_value = _as_positive_int(plan_limit)
     if plan_value is not None:
-        return min(plan_value, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+        return plan_value
     default_limit = _as_positive_int(settings.VPN_DEFAULT_DEVICE_LIMIT) or 1
-    return min(default_limit, settings.VPN_MAX_DEVICES_PER_ACCOUNT)
+    return default_limit
 
 
 def _normalize_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
