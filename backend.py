@@ -403,8 +403,8 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
         "packet_encoding": (query.get("packetEncoding") or query.get("packet_encoding") or query.get("packet-encoding") or "xudp").strip() or "xudp",
         "remark": _decode_vless_name(fragment),
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
-        "connect_mode": "tun",
-        "full_tunnel": True,
+        "connect_mode": (query.get("connectMode") or query.get("connect_mode") or "tun").strip() or "tun",
+        "full_tunnel": str(query.get("fullTunnel") or query.get("full_tunnel") or "1").strip().lower() not in {"0", "false", "no", "off"},
     }
     if query.get("mode"):
         payload["mode"] = query.get("mode")
@@ -3705,12 +3705,14 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
         "host": normalized.get("host"),
         "path": normalized.get("path"),
         "serviceName": normalized.get("service_name") or normalized.get("serviceName"),
-        "mode": normalized.get("mode") or ("auto" if transport == "xhttp" else None),
+        "mode": normalized.get("mode") or ("gun" if transport == "grpc" else ("auto" if transport == "xhttp" else None)),
         "pbk": normalized.get("public_key") or normalized.get("publicKey"),
         "sid": normalized.get("short_id") or normalized.get("shortId"),
         "fp": normalized.get("fingerprint"),
         "alpn": ",".join(str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()),
         "packetEncoding": normalized.get("packet_encoding") or normalized.get("packetEncoding"),
+        "connectMode": normalized.get("connect_mode") or normalized.get("connectMode"),
+        "fullTunnel": "1" if bool(normalized.get("full_tunnel", True)) else "0",
     }
     for key, value in optional_keys.items():
         text = str(value or "").strip()
