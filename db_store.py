@@ -1,4 +1,5 @@
 import csv
+import hashlib
 import io
 import json
 import re
@@ -935,6 +936,117 @@ def _convert_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     return {key: value for key, value in converted.items() if value is not None and value != ""}
 
 
+def _antiblock_location_code(payload: Dict[str, Any]) -> str:
+    code = str(payload.get("location_code") or payload.get("code") or payload.get("locationCode") or "").strip().lower()
+    if code:
+        return code
+    remark = str(payload.get("remark") or payload.get("display_name") or "").strip().lower()
+    if "lte" in remark:
+        return "ru-lte"
+    if "fast / international" in remark or "international" in remark:
+        return "intl-fast"
+    return ""
+
+
+def _is_antiblock_location_code(code: str) -> bool:
+    normalized = str(code or "").strip().lower()
+    return normalized.startswith("ru-lte") or normalized.startswith("intl-fast")
+
+
+def _antiblock_sni_pool_for_code(code: str) -> List[str]:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("ru-lte"):
+        pool = list(getattr(settings, "VLESS_ANTI_BLOCK_SNI_POOL_RU_LTE", []) or [])
+    elif normalized.startswith("intl-fast"):
+        pool = list(getattr(settings, "VLESS_ANTI_BLOCK_SNI_POOL_INTL", []) or [])
+    else:
+        pool = []
+    if not pool:
+        pool = list(getattr(settings, "VLESS_ANTI_BLOCK_SNI_POOL", []) or [])
+    cleaned = [str(item or "").strip() for item in pool if str(item or "").strip()]
+    return cleaned or ["www.cloudflare.com", "www.cloudflare-dns.com", "cp.cloudflare.com", "cdn.cloudflare.com"]
+
+
+def _choose_antiblock_sni(payload: Dict[str, Any], code: str) -> str:
+    pool = _antiblock_sni_pool_for_code(code)
+    seed_parts = [
+        code,
+        str(payload.get("server") or "").strip(),
+        str(payload.get("public_key") or payload.get("publicKey") or "").strip(),
+        str(payload.get("short_id") or payload.get("shortId") or "").strip(),
+        str(payload.get("uuid") or "").strip(),
+        str(payload.get("remark") or payload.get("display_name") or "").strip(),
+    ]
+    seed = "|".join(seed_parts) or code or "antiblock"
+    idx = int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % len(pool)
+    return pool[idx]
+
+
+def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    if not normalized:
+        return {}
+    code = _antiblock_location_code(normalized)
+    if not _is_antiblock_location_code(code):
+        return normalized
+
+    normalized.setdefault("engine", "xray")
+    normalized.setdefault("protocol", "vless")
+    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
+    normalized["transport"] = transport
+    normalized["network"] = transport
+
+    selected_sni = _choose_antiblock_sni(normalized, code)
+    normalized["server_name"] = selected_sni
+    normalized["sni"] = selected_sni
+    normalized.setdefault("fingerprint", "chrome")
+    normalized.setdefault("mtu", 1400)
+    normalized["domain_resolver"] = str(normalized.get("domain_resolver") or normalized.get("domainResolver") or "dns-remote").strip() or "dns-remote"
+    normalized["packet_encoding"] = str(normalized.get("packet_encoding") or normalized.get("packetEncoding") or "xudp").strip() or "xudp"
+    normalized["connect_mode"] = str(normalized.get("connect_mode") or normalized.get("connectMode") or "tun").strip() or "tun"
+    normalized["full_tunnel"] = True
+    normalized["dns_servers"] = [str(item or "").strip() for item in (normalized.get("dns_servers") or normalized.get("dnsServers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()] or ["1.1.1.1", "8.8.8.8"]
+    normalized["dnsServers"] = list(normalized["dns_servers"])
+
+    has_reality_material = bool(str(normalized.get("public_key") or normalized.get("publicKey") or "").strip())
+    security = str(normalized.get("security") or "").strip().lower()
+    if has_reality_material or security in {"", "tls", "reality"}:
+        normalized["security"] = "reality"
+
+    if transport == "tcp":
+        normalized["flow"] = "xtls-rprx-vision"
+        normalized.pop("service_name", None)
+        normalized.pop("serviceName", None)
+        normalized.pop("path", None)
+        normalized.pop("mode", None)
+    else:
+        if str(normalized.get("flow") or "").strip().lower() == "xtls-rprx-vision":
+            normalized.pop("flow", None)
+        if transport == "grpc":
+            normalized.setdefault("service_name", "grpc")
+            normalized["mode"] = "gun"
+        elif transport in {"ws", "websocket"}:
+            normalized["path"] = str(normalized.get("path") or "/").strip() or "/"
+            normalized["host"] = str(normalized.get("host") or selected_sni).strip() or selected_sni
+            normalized["security"] = "tls" if not has_reality_material else "reality"
+        elif transport == "xhttp":
+            normalized["path"] = str(normalized.get("path") or "/").strip() or "/"
+            normalized["mode"] = str(normalized.get("mode") or "auto").strip() or "auto"
+            normalized["host"] = str(normalized.get("host") or selected_sni).strip() or selected_sni
+            normalized["security"] = "tls" if not has_reality_material else "reality"
+
+    if code.startswith("ru-lte"):
+        normalized["anti_block_profile"] = "lte"
+    else:
+        normalized["anti_block_profile"] = "global"
+    normalized["location_code"] = normalized.get("location_code") or code
+    normalized["locationCode"] = normalized.get("locationCode") or normalized["location_code"]
+    normalized["domainResolver"] = normalized["domain_resolver"]
+    normalized["packetEncoding"] = normalized["packet_encoding"]
+    normalized["connectMode"] = normalized["connect_mode"]
+    return normalized
+
+
 def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
     if not normalized:
@@ -977,7 +1089,7 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not dns_servers:
         normalized["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
         normalized["dnsServers"] = ["1.1.1.1", "8.8.8.8"]
-    return normalized
+    return _apply_anti_block_profile(normalized)
 
 
 def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1026,7 +1138,7 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
     if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
         normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
-    return _apply_admin_mobile_defaults(normalized)
+    return _apply_anti_block_profile(_apply_admin_mobile_defaults(normalized))
 
 
 def _normalize_location_access_mode(value: Any) -> str:
