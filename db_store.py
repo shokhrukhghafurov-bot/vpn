@@ -826,194 +826,6 @@ def _parse_json_object_if_possible(raw: Any) -> Optional[Dict[str, Any]]:
     return None
 
 
-
-
-def _safe_json_dumps(value: Dict[str, Any]) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-def _anti_block_dns_config(dns_servers: List[str]) -> Dict[str, Any]:
-    servers = [str(item).strip() for item in (dns_servers or []) if str(item).strip()]
-    if not servers:
-        servers = ["1.1.1.1", "8.8.8.8"]
-    return {
-        "queryStrategy": "UseIP",
-        "servers": servers,
-    }
-
-
-def _anti_block_routing_rules(server: str) -> List[Dict[str, Any]]:
-    rules: List[Dict[str, Any]] = [
-        {
-            "type": "field",
-            "ip": [
-                "geoip:private",
-                "geoip:loopback",
-            ],
-            "outboundTag": "direct",
-        },
-        {
-            "type": "field",
-            "domain": [
-                "domain:localhost",
-            ],
-            "outboundTag": "direct",
-        },
-        {
-            "type": "field",
-            "protocol": ["bittorrent"],
-            "outboundTag": "block",
-        },
-    ]
-    upstream = str(server or "").strip()
-    if upstream:
-        rules.insert(0, {
-            "type": "field",
-            "ip": [upstream],
-            "outboundTag": "direct",
-        })
-    return rules
-
-
-def _build_antiblock_xray_config(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-    normalized = dict(payload or {})
-    server = str(normalized.get("server") or "").strip()
-    uuid = str(normalized.get("uuid") or normalized.get("id") or "").strip()
-    security = str(normalized.get("security") or "reality").strip() or "reality"
-    transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
-    if not server or not uuid:
-        return None
-    try:
-        port = int(normalized.get("port") or 0)
-    except (TypeError, ValueError):
-        port = 0
-    if port <= 0:
-        return None
-
-    outbound: Dict[str, Any] = {
-        "protocol": "vless",
-        "tag": "proxy",
-        "settings": {
-            "vnext": [{
-                "address": server,
-                "port": port,
-                "users": [{
-                    "id": uuid,
-                    "encryption": str(normalized.get("encryption") or "none").strip() or "none",
-                }],
-            }],
-        },
-        "streamSettings": {
-            "network": transport,
-            "security": security,
-        },
-    }
-    user = outbound["settings"]["vnext"][0]["users"][0]
-    flow = str(normalized.get("flow") or "").strip()
-    if flow:
-        user["flow"] = flow
-
-    stream = outbound["streamSettings"]
-    server_name = str(normalized.get("server_name") or normalized.get("sni") or "").strip()
-    fingerprint = str(normalized.get("fingerprint") or "chrome").strip() or "chrome"
-    if security == "reality":
-        stream["realitySettings"] = {
-            "fingerprint": fingerprint,
-            "serverName": server_name,
-            "publicKey": str(normalized.get("public_key") or normalized.get("publicKey") or "").strip(),
-            "shortId": str(normalized.get("short_id") or normalized.get("shortId") or "").strip(),
-            "spiderX": str(normalized.get("spider_x") or normalized.get("spiderX") or "/").strip() or "/",
-        }
-    elif security == "tls":
-        tls_settings: Dict[str, Any] = {
-            "fingerprint": fingerprint,
-        }
-        if server_name:
-            tls_settings["serverName"] = server_name
-        if normalized.get("alpn"):
-            tls_settings["alpn"] = [str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()]
-        if normalized.get("allow_insecure") is not None:
-            tls_settings["allowInsecure"] = bool(normalized.get("allow_insecure"))
-        stream["tlsSettings"] = tls_settings
-
-    if transport == "grpc":
-        stream["grpcSettings"] = {
-            "serviceName": str(normalized.get("service_name") or normalized.get("serviceName") or "grpc").strip() or "grpc",
-            "authority": str(normalized.get("host") or "").strip(),
-            "multiMode": False,
-        }
-    elif transport in {"ws", "websocket"}:
-        stream["wsSettings"] = {
-            "path": str(normalized.get("path") or "/").strip() or "/",
-            "headers": {},
-        }
-        host = str(normalized.get("host") or "").strip()
-        if host:
-            stream["wsSettings"]["headers"]["Host"] = host
-    elif transport == "xhttp":
-        stream["xhttpSettings"] = {
-            "path": str(normalized.get("path") or "/").strip() or "/",
-            "host": str(normalized.get("host") or "").strip(),
-            "mode": str(normalized.get("mode") or "auto").strip() or "auto",
-        }
-    elif transport in {"httpupgrade", "http"}:
-        stream["httpupgradeSettings"] = {
-            "path": str(normalized.get("path") or "/").strip() or "/",
-            "host": str(normalized.get("host") or "").strip(),
-        }
-    else:
-        stream["tcpSettings"] = {"header": {"type": "none"}}
-
-    return {
-        "dns": _anti_block_dns_config(list(normalized.get("dns_servers") or normalized.get("dnsServers") or [])),
-        "inbounds": [
-            {
-                "listen": "127.0.0.1",
-                "port": 10808,
-                "protocol": "socks",
-                "settings": {"auth": "noauth", "udp": True},
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False},
-                "tag": "socks",
-            },
-            {
-                "listen": "127.0.0.1",
-                "port": 10809,
-                "protocol": "http",
-                "settings": {"allowTransparent": False},
-                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False},
-                "tag": "http",
-            },
-            {
-                "listen": "::1",
-                "port": 1080,
-                "protocol": "socks",
-                "settings": {"udp": True},
-                "tag": "socks-internal",
-            },
-        ],
-        "meta": None,
-        "outbounds": [
-            outbound,
-            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "AsIs"}},
-            {"protocol": "blackhole", "tag": "block"},
-        ],
-        "remarks": str(normalized.get("remark") or normalized.get("display_name") or normalized.get("location_code") or "VPN").strip() or "VPN",
-        "routing": {
-            "domainMatcher": "hybrid",
-            "domainStrategy": "IPIfNonMatch",
-            "rules": _anti_block_routing_rules(server),
-        },
-    }
-
-
-def _sanitize_raw_xray_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    converted = _convert_raw_xray_payload(payload)
-    if not converted:
-        return payload
-    rebuilt = _build_antiblock_xray_config(converted)
-    return rebuilt or payload
-
-
 def _extract_dns_servers_from_xray(payload: Dict[str, Any]) -> List[str]:
     dns = payload.get("dns")
     if not isinstance(dns, dict):
@@ -1128,13 +940,19 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not normalized:
         return {}
 
+    raw_xray_payload = None
     raw_xray = normalized.get("raw_xray_config") or normalized.get("rawXrayConfig")
-    raw_xray_payload = _parse_json_object_if_possible(raw_xray)
+    parsed_raw_xray = _parse_json_object_if_possible(raw_xray)
+    if isinstance(parsed_raw_xray, dict):
+        raw_xray_payload = parsed_raw_xray
+    elif isinstance(normalized.get("outbounds"), list) and isinstance(normalized.get("inbounds"), list):
+        # Admin may paste a full raw Xray JSON directly into vpn_payload.
+        raw_xray_payload = dict(normalized)
+        normalized.setdefault("raw_xray_config", json.dumps(raw_xray_payload, ensure_ascii=False))
+        normalized.setdefault("rawXrayConfig", normalized.get("raw_xray_config"))
+
     if raw_xray_payload:
-        sanitized_raw_xray_payload = _sanitize_raw_xray_payload(raw_xray_payload)
-        normalized["raw_xray_config"] = _safe_json_dumps(sanitized_raw_xray_payload)
-        normalized["rawXrayConfig"] = normalized["raw_xray_config"]
-        converted = _convert_raw_xray_payload(sanitized_raw_xray_payload)
+        converted = _convert_raw_xray_payload(raw_xray_payload)
         for key, value in converted.items():
             if normalized.get(key) in (None, "", [], {}):
                 normalized[key] = value
@@ -1159,11 +977,6 @@ def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not dns_servers:
         normalized["dns_servers"] = ["1.1.1.1", "8.8.8.8"]
         normalized["dnsServers"] = ["1.1.1.1", "8.8.8.8"]
-
-    synthesized_raw = _build_antiblock_xray_config(normalized)
-    if synthesized_raw:
-        normalized["raw_xray_config"] = _safe_json_dumps(synthesized_raw)
-        normalized["rawXrayConfig"] = normalized["raw_xray_config"]
     return normalized
 
 
