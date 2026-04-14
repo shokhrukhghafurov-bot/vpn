@@ -245,6 +245,9 @@ class AdminVpnSettingsIn(BaseModel):
     payments_enabled: bool = False
     maintenance_mode: bool = False
     new_activations_enabled: bool = True
+    access_mode: str = "paid"
+    free_mode_device_limit: int = Field(default=max(1, int(getattr(settings, "VPN_FREE_MODE_DEVICE_LIMIT", settings.VPN_DEFAULT_DEVICE_LIMIT) or settings.VPN_DEFAULT_DEVICE_LIMIT)), ge=1)
+    paid_grace_hours: int = Field(default=max(1, int(getattr(settings, "VPN_PAID_GRACE_HOURS", 24) or 24)), ge=1)
     max_devices_per_account: int = Field(default=settings.VPN_MAX_DEVICES_PER_ACCOUNT, ge=1)
     device_limit: Optional[int] = Field(default=None, ge=1)
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
@@ -3181,7 +3184,7 @@ def _subscription_token_is_active(token: Optional[str]) -> bool:
     if not user or user.get("status") == "blocked":
         return False
     view = get_user_subscription_view(int(user["id"]))
-    return bool(view.get("is_active") and view.get("subscription"))
+    return bool(view.get("is_active"))
 
 
 
@@ -3931,7 +3934,21 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 expires_ts = int(datetime.fromisoformat(expires_at.replace("Z", "+00:00")).timestamp())
             except Exception:
                 pass
-        if not view.get("is_active") or not subscription:
+        if not view.get("is_active"):
+            return _subscription_inactive_response(request, token, head_only=head_only, expires_ts=expires_ts)
+        access_source = str(view.get("access_source") or "").strip().lower()
+        if access_source in {"free_mode", "paid_grace"}:
+            grace_hours = int(view.get("paid_grace_hours") or 24)
+            grace_started_at = view.get("paid_grace_started_at")
+            if access_source == "paid_grace" and grace_started_at:
+                try:
+                    started_at = grace_started_at if isinstance(grace_started_at, datetime) else datetime.fromisoformat(str(grace_started_at).replace("Z", "+00:00"))
+                    expires_ts = int((started_at + timedelta(hours=grace_hours)).timestamp())
+                except Exception:
+                    expires_ts = int((datetime.now(timezone.utc) + timedelta(hours=grace_hours)).timestamp())
+            elif access_source == "free_mode":
+                expires_ts = int((datetime.now(timezone.utc) + timedelta(days=3650)).timestamp())
+        elif not subscription:
             return _subscription_inactive_response(request, token, head_only=head_only, expires_ts=expires_ts)
         profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
         subscription_user_id = int(user["id"])
@@ -4587,7 +4604,7 @@ def plans() -> Dict[str, Any]:
 def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
-    if view.get("is_active") and view.get("subscription"):
+    if view.get("is_active"):
         subscription_token = view.get("subscription_token") or ensure_user_subscription_token(int(user["id"]))
         subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, subscription_token)
     else:
@@ -4852,6 +4869,9 @@ def payments_create(payload: PaymentCreateIn, user: Dict[str, Any] = Depends(get
         raise HTTPException(status_code=503, detail="Maintenance mode is enabled")
     if user["status"] == "blocked":
         raise HTTPException(status_code=403, detail="Blocked user cannot create payment")
+    access_view = get_user_subscription_view(int(user["id"]))
+    if not bool(access_view.get("show_buy_button", True)):
+        raise HTTPException(status_code=409, detail="Free mode is enabled right now; buying is temporarily unavailable")
     plan = get_plan_by_code(payload.plan_code)
     if not plan or not plan["is_active"]:
         raise HTTPException(status_code=404, detail="Plan not found or inactive")
