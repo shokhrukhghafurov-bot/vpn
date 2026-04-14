@@ -60,7 +60,6 @@ from db_store import (
     get_user_subscription_view,
     get_subscription_device_gate_by_token,
     ensure_user_subscription_token,
-    is_revoked_device_fingerprint,
     issue_auth_code,
     consume_auth_code,
     list_admin_users,
@@ -3670,17 +3669,6 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
     if not fingerprint:
         return None
     try:
-        user_id = int(user.get("id") or 0)
-        if user_id > 0 and is_revoked_device_fingerprint(user_id, fingerprint):
-            return {
-                "allowed": False,
-                "reason": "device_revoked",
-                "detail": "Device removed and revoked",
-                "user_id": user_id,
-                "devices_used": 0,
-                "device_limit": 0,
-                "known_device": False,
-            }
         gate = get_subscription_device_gate_by_token(token, fingerprint)
     except Exception:
         return None
@@ -3969,15 +3957,15 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not is_browser_preview:
             gate = _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
-                reason = str(gate.get("reason") or "").strip().lower()
+                reason = str(gate.get("reason") or "").strip()
+                used = int(gate.get("devices_used") or 0)
+                limit = int(gate.get("device_limit") or 0)
                 if reason == "device_revoked":
                     content = (
-                        "This device was removed in the bot. Open a new subscription link from the bot to reconnect.\n"
-                        "Это устройство было удалено в боте. Откройте новую ссылку подписки из бота, чтобы подключиться снова.\n"
+                        "This device was removed in the bot. Open a fresh connection from the bot to connect again.\n"
+                        "Это устройство было удалено в боте. Откройте новое подключение из бота, чтобы подключиться снова.\n"
                     )
                 else:
-                    used = int(gate.get("devices_used") or 0)
-                    limit = int(gate.get("device_limit") or 0)
                     content = (
                         f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
                         f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
@@ -4260,6 +4248,7 @@ def open_app_bridge(
       const userAgent = navigator.userAgent || '';
       const isAndroid = /Android/i.test(userAgent);
       const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
+      const forceRenewClientId = /(?:[?&])renew=1(?:&|$)/.test(window.location.search);
       let hiddenAt = 0;
 
       const markHidden = function () {{
@@ -4275,11 +4264,15 @@ def open_app_bridge(
 
       const getClientId = function () {{
         const key = 'inet-subscription-client-id';
+        if (forceRenewClientId) {{
+          try {{ window.localStorage.removeItem(key); }} catch (storageError) {{}}
+          try {{ document.cookie = 'inet_sub_cid=; Max-Age=0; path=/; SameSite=Lax'; }} catch (cookieError) {{}}
+        }}
         try {{
           if (baseSubscriptionUrl) {{
             const parsed = new URL(baseSubscriptionUrl);
             const fromUrl = parsed.searchParams.get('client_id');
-            if (fromUrl) {{
+            if (fromUrl && !forceRenewClientId) {{
               try {{ window.localStorage.setItem(key, fromUrl); }} catch (storageError) {{}}
               return fromUrl;
             }}
@@ -4287,7 +4280,7 @@ def open_app_bridge(
         }} catch (error) {{}}
         try {{
           const cookieMatch = document.cookie.match(/(?:^|; )inet_sub_cid=([^;]+)/);
-          if (cookieMatch && cookieMatch[1]) {{
+          if (cookieMatch && cookieMatch[1] && !forceRenewClientId) {{
             const fromCookie = decodeURIComponent(cookieMatch[1]);
             if (fromCookie) {{
               try {{ window.localStorage.setItem(key, fromCookie); }} catch (storageError) {{}}
@@ -4296,7 +4289,7 @@ def open_app_bridge(
           }}
         }} catch (error) {{}}
         try {{
-          let existing = window.localStorage.getItem(key);
+          let existing = forceRenewClientId ? '' : window.localStorage.getItem(key);
           if (existing) return existing;
           const generated = 'cid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
           window.localStorage.setItem(key, generated);
