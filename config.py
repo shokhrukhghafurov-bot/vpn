@@ -481,3 +481,12 @@ class Settings:
 
 
 settings = Settings()
+
+
+# Runtime access mode defaults
+if not hasattr(settings, "VPN_ACCESS_MODE"):
+    settings.VPN_ACCESS_MODE = "paid"
+if not hasattr(settings, "VPN_FREE_MODE_DEVICE_LIMIT"):
+    settings.VPN_FREE_MODE_DEVICE_LIMIT = max(1, int(getattr(settings, "VPN_DEFAULT_DEVICE_LIMIT", 1) or 1))
+if not hasattr(settings, "VPN_PAID_GRACE_HOURS"):
+    settings.VPN_PAID_GRACE_HOURS = 24
