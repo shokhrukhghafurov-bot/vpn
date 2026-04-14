@@ -3865,42 +3865,11 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
 
 
 def _subscription_revoked_device_response(request: Request, token: str, *, head_only: bool = False) -> Response:
-    bot_public_url = str(_bot_public_url() or "").strip()
-    support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
-    fallback_web_url = str(getattr(settings, "APP_BASE_URL", "") or getattr(settings, "ADMIN_PANEL_BASE_URL", "") or "").strip()
-    profile_web_page_url = support_url or fallback_web_url
     expires_ts = int(time.time()) + 300
-    profile_title = f"{settings.APP_NAME} · device removed"
-    message_lines = [
-        "# subscription-state: device_revoked",
-        "# access: removed",
-        "# message: Device removed in bot. Open a fresh connection from the Telegram bot.",
-        "# message-ru: Устройство удалено в боте. Откройте новое подключение из Telegram-бота.",
-    ]
-    if support_url:
-        message_lines.append(f"# reconnect-url: {support_url}")
-    update_interval_hours = _hiddify_profile_update_interval_header_value()
-    content = "\n".join(message_lines) + "\n"
-    content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
-    moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
-    inline_headers = _subscription_inline_comment_headers(
-        profile_title=profile_title,
-        update_interval_hours=update_interval_hours,
-        subscription_userinfo=f"upload=0; download=0; total=0; expire={expires_ts}",
-        support_url=support_url,
-        profile_web_page_url=profile_web_page_url,
-        moved_permanently_to_url=moved_permanently_to_url,
-        content_version=content_version,
-    )
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
-    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
-    rendered_content = content if suppress_inline_headers else "\n".join(inline_headers + message_lines) + "\n"
-    response_etag = hashlib.sha256(rendered_content.encode("utf-8")).hexdigest()
     now_utc = datetime.now(timezone.utc)
+    content_version = hashlib.sha256(f"device_revoked:{token}".encode("utf-8")).hexdigest()
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
-        "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
         "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
         "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
         "CDN-Cache-Control": "no-store, no-cache, max-age=0",
@@ -3908,20 +3877,18 @@ def _subscription_revoked_device_response(request: Request, token: str, *, head_
         "Surrogate-Control": "no-store",
         "Pragma": "no-cache",
         "Expires": "0",
-        "ETag": f'W/"{response_etag}"',
+        "ETag": f'W/"{content_version}"',
         "Last-Modified": _http_date_from_datetime(now_utc) or "",
         "Vary": "*",
         "X-Accel-Expires": "0",
-        "profile-update-interval": update_interval_hours,
-        "support-url": support_url,
-        "profile-web-page-url": profile_web_page_url,
-        "moved-permanently-to": moved_permanently_to_url or "",
+        "profile-update-interval": _hiddify_profile_update_interval_header_value(),
         "x-hiddify-source": "subscription",
         "x-subscription-version": content_version,
         "x-subscription-generated-at": now_utc.isoformat(),
         "x-subscription-state": "device_revoked",
+        "x-device-access": "revoked",
     }
-    return Response(status_code=200, headers=headers) if head_only else Response(content=rendered_content, media_type="text/plain; charset=utf-8", headers=headers)
+    return Response(status_code=200, headers=headers) if head_only else Response(content="", media_type="text/plain; charset=utf-8", headers=headers)
 
 
 def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, expires_ts: Optional[int] = None) -> Response:
