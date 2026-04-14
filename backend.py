@@ -68,6 +68,7 @@ from db_store import (
     list_locations,
     list_payments,
     patch_location,
+    reset_virtual_location_assignments_for_concrete_code,
     record_bot_error,
     refresh_subscription_statuses,
     register_device,
@@ -5430,7 +5431,11 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
     try:
         item = patch_location(location_id, data)
-        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+        reset_assignments = 0
+        code = str(item.get("code") or "").strip()
+        if code and code not in PUBLIC_VIRTUAL_LOCATION_CODES and any(key in data for key in {"is_active", "status", "vpn_payload", "is_reserve"}):
+            reset_assignments = reset_virtual_location_assignments_for_concrete_code(code)
+        return {"ok": True, "item": serialize_location(item, include_payload=True), "reset_virtual_assignments": reset_assignments}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
@@ -5440,7 +5445,9 @@ def admin_locations_delete(location_id: int, admin_name: str = Depends(require_a
     _ = admin_name
     try:
         item = delete_location(location_id)
-        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+        code = str(item.get("code") or "").strip()
+        reset_assignments = reset_virtual_location_assignments_for_concrete_code(code) if code and code not in PUBLIC_VIRTUAL_LOCATION_CODES else 0
+        return {"ok": True, "item": serialize_location(item, include_payload=True), "reset_virtual_assignments": reset_assignments}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
