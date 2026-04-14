@@ -132,17 +132,6 @@ CREATE TABLE IF NOT EXISTS devices (
     UNIQUE(user_id, device_fingerprint)
 );
 
-CREATE TABLE IF NOT EXISTS revoked_device_fingerprints (
-    id SERIAL PRIMARY KEY,
-    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    device_fingerprint TEXT NOT NULL,
-    platform TEXT,
-    device_name TEXT,
-    revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    UNIQUE(user_id, device_fingerprint)
-);
-
 CREATE TABLE IF NOT EXISTS locations (
     id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
@@ -326,9 +315,6 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status)",
     "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)",
-    "CREATE TABLE IF NOT EXISTS revoked_device_fingerprints (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, platform TEXT, device_name TEXT, revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint))",
-    "CREATE INDEX IF NOT EXISTS idx_revoked_device_fingerprints_user_id ON revoked_device_fingerprints(user_id)",
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_revoked_device_fingerprints_unique ON revoked_device_fingerprints(user_id, device_fingerprint)",
     "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
@@ -372,7 +358,6 @@ SERIAL_SEQUENCE_TARGETS = (
     ("plans", "id"),
     ("subscriptions", "id"),
     ("devices", "id"),
-    ("revoked_device_fingerprints", "id"),
     ("locations", "id"),
     ("user_location_credentials", "id"),
     ("admin_notes", "id"),
@@ -2243,6 +2228,29 @@ def get_subscription_device_gate_by_token(subscription_token: str, device_finger
     user = get_user_by_subscription_token(token)
     if not user:
         return None
+    removed_device = None
+    if fingerprint:
+        with db() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "SELECT * FROM devices WHERE user_id = %s AND device_fingerprint = %s ORDER BY id DESC LIMIT 1",
+                    (int(user["id"]), fingerprint),
+                )
+                removed_device = cur.fetchone()
+        if removed_device and not bool(removed_device.get("is_active")):
+            devices = get_user_devices(int(user["id"]))
+            subscription = get_current_subscription(int(user["id"]))
+            access_state = _resolve_user_access_state(user, subscription)
+            allowed_limit = int(access_state.get("device_limit") or 0)
+            return {
+                "allowed": False,
+                "reason": "device_removed",
+                "detail": "Device was removed",
+                "user_id": int(user["id"]),
+                "devices_used": len(devices),
+                "device_limit": allowed_limit,
+                "known_device": False,
+            }
     if user.get("status") == "blocked":
         return {
             "allowed": False,
@@ -2266,16 +2274,6 @@ def get_subscription_device_gate_by_token(subscription_token: str, device_finger
             "known_device": False,
         }
     allowed_limit = int(access_state.get("device_limit") or 0)
-    if fingerprint and is_revoked_device_fingerprint(int(user["id"]), fingerprint):
-        return {
-            "allowed": False,
-            "reason": "device_revoked",
-            "detail": "This device was removed and must be reconnected from a new bot import",
-            "user_id": int(user["id"]),
-            "devices_used": 0,
-            "device_limit": allowed_limit,
-            "known_device": False,
-        }
     devices = get_user_devices(int(user["id"]))
     known_device = bool(fingerprint) and any(str(item.get("device_fingerprint") or "") == fingerprint for item in devices)
     return {
@@ -2287,40 +2285,6 @@ def get_subscription_device_gate_by_token(subscription_token: str, device_finger
         "device_limit": allowed_limit,
         "known_device": known_device,
     }
-
-
-
-def is_revoked_device_fingerprint(user_id: int, device_fingerprint: str) -> bool:
-    fingerprint = str(device_fingerprint or "").strip()
-    if user_id <= 0 or not fingerprint:
-        return False
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                "SELECT 1 FROM revoked_device_fingerprints WHERE user_id = %s AND device_fingerprint = %s LIMIT 1",
-                (user_id, fingerprint),
-            )
-            return bool(cur.fetchone())
-
-
-def revoke_device_fingerprint(user_id: int, device_fingerprint: str, platform: Optional[str] = None, device_name: Optional[str] = None) -> None:
-    fingerprint = str(device_fingerprint or "").strip()
-    if user_id <= 0 or not fingerprint:
-        return
-    with db() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO revoked_device_fingerprints (user_id, device_fingerprint, platform, device_name, revoked_at)
-                VALUES (%s, %s, %s, %s, NOW())
-                ON CONFLICT (user_id, device_fingerprint)
-                DO UPDATE SET platform = EXCLUDED.platform,
-                              device_name = EXCLUDED.device_name,
-                              revoked_at = NOW()
-                """,
-                (user_id, fingerprint, str(platform or "").strip() or None, str(device_name or "").strip() or None),
-            )
-        conn.commit()
 
 
 def get_latest_subscription(user_id: int) -> Optional[Dict[str, Any]]:
@@ -2441,12 +2405,6 @@ def _select_tracking_alias_match_device(existing: List[Dict[str, Any]], platform
     normalized_name = str(device_name or "").strip()
     platform_family = _device_platform_family(normalized_platform)
     client_family = _device_client_family(normalized_name)
-
-    # Never merge mobile subscription imports by heuristics.
-    # Each fresh bot import carries its own client_id and must keep its own slot,
-    # otherwise two profiles inside the same app collapse into one device record.
-    if platform_family == "mobile":
-        return None
 
     exact_matches = [
         item for item in existing
@@ -2662,8 +2620,6 @@ def _upsert_device_record(
     access_view = get_user_subscription_view(user_id)
     if not bool(access_view.get("is_active")):
         raise PermissionError("Active subscription required")
-    if is_revoked_device_fingerprint(user_id, device_fingerprint):
-        raise PermissionError("Device was removed and must be reconnected from a fresh bot import")
     if enforce_limit and not settings.VPN_NEW_ACTIVATIONS_ENABLED:
         raise PermissionError("New activations are disabled")
     allowed_limit = max(1, int(access_view.get("device_limit") or 0))
@@ -2766,6 +2722,15 @@ def touch_subscription_device_by_token(subscription_token: str, platform: str, d
     user = get_user_by_subscription_token(token)
     if not user:
         return None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT * FROM devices WHERE user_id = %s AND device_fingerprint = %s ORDER BY id DESC LIMIT 1",
+                (int(user["id"]), str(device_fingerprint or "").strip()),
+            )
+            existing = cur.fetchone()
+    if existing and not bool(existing.get("is_active")):
+        return None
     try:
         return _upsert_device_record(
             int(user["id"]),
@@ -2781,25 +2746,17 @@ def touch_subscription_device_by_token(subscription_token: str, platform: str, d
 def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE devices SET is_active = FALSE, last_seen_at = NOW() WHERE user_id = %s AND id = %s RETURNING *", (user_id, device_id))
+            cur.execute(
+                """
+                UPDATE devices
+                SET is_active = FALSE,
+                    last_seen_at = NOW()
+                WHERE user_id = %s AND id = %s AND is_active = TRUE
+                RETURNING *
+                """,
+                (user_id, device_id),
+            )
             row = cur.fetchone()
-            if row and str(row.get("device_fingerprint") or "").strip():
-                cur.execute(
-                    """
-                    INSERT INTO revoked_device_fingerprints (user_id, device_fingerprint, platform, device_name, revoked_at)
-                    VALUES (%s, %s, %s, %s, NOW())
-                    ON CONFLICT (user_id, device_fingerprint)
-                    DO UPDATE SET platform = EXCLUDED.platform,
-                                  device_name = EXCLUDED.device_name,
-                                  revoked_at = NOW()
-                    """,
-                    (
-                        user_id,
-                        str(row.get("device_fingerprint") or "").strip(),
-                        str(row.get("platform") or "").strip() or None,
-                        str(row.get("device_name") or "").strip() or None,
-                    ),
-                )
         conn.commit()
     if row:
         enqueue_notification(
