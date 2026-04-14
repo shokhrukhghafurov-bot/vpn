@@ -3860,44 +3860,32 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, expires_ts: Optional[int] = None) -> Response:
+def _subscription_empty_response(
+    request: Request,
+    token: str,
+    *,
+    head_only: bool = False,
+    expires_ts: Optional[int] = None,
+    state: str = "empty",
+    profile_suffix: str = "subscription inactive",
+    support_url_override: Optional[str] = None,
+) -> Response:
     bot_public_url = str(_bot_public_url() or "").strip()
-    support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
+    support_url = str(support_url_override or "").strip() or bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
     fallback_web_url = str(getattr(settings, "APP_BASE_URL", "") or getattr(settings, "ADMIN_PANEL_BASE_URL", "") or "").strip()
     profile_web_page_url = support_url or fallback_web_url
-    expired_ts = int(expires_ts or (time.time() - 300))
-    profile_title = f"{settings.APP_NAME} · subscription expired"
-    message_lines = [
-        "# subscription-state: expired",
-        "# access: inactive",
-        "# message: Subscription expired. Buy a new subscription in the Telegram bot.",
-        "# message-ru: Подписка истекла. Купите новую подписку в Telegram-боте.",
-    ]
-    if support_url:
-        message_lines.append(f"# buy-subscription-url: {support_url}")
+    target_expire_ts = int(expires_ts or (time.time() - 300))
+    profile_title = f"{settings.APP_NAME} · {profile_suffix}"
     update_interval_hours = _hiddify_profile_update_interval_header_value()
-    content = "\n".join(message_lines) + "\n"
+    content = ""
     content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
     moved_permanently_to_url = _subscription_cache_buster_url(request, token, content_version)
-    inline_headers = _subscription_inline_comment_headers(
-        profile_title=profile_title,
-        update_interval_hours=update_interval_hours,
-        subscription_userinfo=f"upload=0; download=0; total=0; expire={expired_ts}",
-        support_url=support_url,
-        profile_web_page_url=profile_web_page_url,
-        moved_permanently_to_url=moved_permanently_to_url,
-        content_version=content_version,
-    )
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
-    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
-    rendered_content = content if suppress_inline_headers else "\n".join(inline_headers + message_lines) + "\n"
-    response_etag = hashlib.sha256(rendered_content.encode("utf-8")).hexdigest()
+    response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
     now_utc = datetime.now(timezone.utc)
     headers = {
         "Content-Disposition": 'inline; filename="inet-subscription.txt"',
         "Profile-Title": quote(f"base64:{base64.b64encode(profile_title.encode('utf-8')).decode('ascii')}", safe=':='),
-        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expired_ts}",
+        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={target_expire_ts}",
         "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
         "CDN-Cache-Control": "no-store, no-cache, max-age=0",
         "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
@@ -3915,9 +3903,21 @@ def _subscription_inactive_response(request: Request, token: str, *, head_only: 
         "x-hiddify-source": "subscription",
         "x-subscription-version": content_version,
         "x-subscription-generated-at": now_utc.isoformat(),
-        "x-subscription-state": "expired",
+        "x-subscription-state": state,
     }
-    return Response(status_code=200, headers=headers) if head_only else Response(content=rendered_content, media_type="text/plain; charset=utf-8", headers=headers)
+    return Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
+
+
+
+def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, expires_ts: Optional[int] = None) -> Response:
+    return _subscription_empty_response(
+        request,
+        token,
+        head_only=head_only,
+        expires_ts=expires_ts,
+        state="expired",
+        profile_suffix="subscription expired",
+    )
 
 
 def _subscription_response(request: Request, token: str, *, head_only: bool = False) -> Response:
@@ -3965,6 +3965,15 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not is_browser_preview:
             gate = _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
+                if str(gate.get("reason") or "").strip() == "device_removed":
+                    return _subscription_empty_response(
+                        request,
+                        token,
+                        head_only=head_only,
+                        expires_ts=int(time.time()) - 300,
+                        state="revoked",
+                        profile_suffix="device revoked",
+                    )
                 used = int(gate.get("devices_used") or 0)
                 limit = int(gate.get("device_limit") or 0)
                 content = (
@@ -4114,6 +4123,8 @@ def open_app_bridge(
             query = dict(parse_qsl(parts.query, keep_blank_values=True))
             if client_mode:
                 query["client"] = client_mode
+            if subscription_client_id:
+                query["subcid"] = subscription_client_id
             tracked_subscription_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
         except Exception:
             tracked_subscription_url = subscription_url
