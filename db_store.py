@@ -2052,6 +2052,84 @@ def ensure_user_subscription_token(user_id: int) -> str:
             raise RuntimeError("Failed to generate unique subscription token")
 
 
+
+def rotate_user_subscription_token(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> str:
+    def _rotate(active_conn: psycopg.Connection) -> str:
+        with active_conn.cursor() as cur:
+            cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
+            row = cur.fetchone()
+            if not row:
+                raise ValueError("User not found")
+            for _ in range(5):
+                token = _generate_subscription_token()
+                cur.execute(
+                    "UPDATE users SET subscription_token = %s, updated_at = NOW() WHERE id = %s RETURNING subscription_token",
+                    (token, user_id),
+                )
+                updated = cur.fetchone()
+                if updated and updated.get("subscription_token"):
+                    return str(updated["subscription_token"])
+            raise RuntimeError("Failed to rotate subscription token")
+
+    if conn is not None:
+        return _rotate(conn)
+    with db() as own_conn:
+        token = _rotate(own_conn)
+        own_conn.commit()
+        return token
+
+
+
+def rotate_user_location_credentials(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> int:
+    def _rotate(active_conn: psycopg.Connection) -> int:
+        with active_conn.cursor() as cur:
+            cur.execute(
+                "SELECT id FROM user_location_credentials WHERE user_id = %s FOR UPDATE",
+                (user_id,),
+            )
+            rows = cur.fetchall() or []
+            rotated = 0
+            for row in rows:
+                credential_id = int(row.get("id") or 0)
+                if credential_id <= 0:
+                    continue
+                cur.execute(
+                    """
+                    UPDATE user_location_credentials
+                    SET uuid = %s, status = 'active', updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (str(uuid4()), credential_id),
+                )
+                rotated += 1
+            return rotated
+
+    if conn is not None:
+        return _rotate(conn)
+    with db() as own_conn:
+        rotated = _rotate(own_conn)
+        own_conn.commit()
+        return rotated
+
+
+
+def revoke_user_access_credentials(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> Dict[str, Any]:
+    def _revoke(active_conn: psycopg.Connection) -> Dict[str, Any]:
+        new_token = rotate_user_subscription_token(user_id, conn=active_conn)
+        rotated_credentials = rotate_user_location_credentials(user_id, conn=active_conn)
+        return {
+            "subscription_token": new_token,
+            "rotated_credentials": rotated_credentials,
+        }
+
+    if conn is not None:
+        return _revoke(conn)
+    with db() as own_conn:
+        result = _revoke(own_conn)
+        own_conn.commit()
+        return result
+
+
 def get_user_by_active_auth_code(code: str) -> Optional[Dict[str, Any]]:
     normalized = (code or "").strip()
     if not normalized:
@@ -2712,20 +2790,27 @@ def touch_subscription_device_by_token(subscription_token: str, platform: str, d
 
 
 def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
+    access_revoked: Optional[Dict[str, Any]] = None
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM devices WHERE user_id = %s AND id = %s RETURNING *", (user_id, device_id))
             row = cur.fetchone()
+        if row:
+            access_revoked = revoke_user_access_credentials(user_id, conn=conn)
         conn.commit()
     if row:
+        payload = {
+            "platform": row.get("platform"),
+            "device_name": row.get("device_name"),
+        }
+        if access_revoked:
+            payload["access_revoked"] = True
+            payload["rotated_credentials"] = int(access_revoked.get("rotated_credentials") or 0)
         enqueue_notification(
             user_id=user_id,
             event_type="device_removed",
             unique_key=f"device_removed:{row['id']}:{int(datetime.now(timezone.utc).timestamp())}",
-            payload={
-                "platform": row.get("platform"),
-                "device_name": row.get("device_name"),
-            },
+            payload=payload,
         )
         return dict(row)
     return None
