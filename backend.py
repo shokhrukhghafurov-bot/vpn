@@ -3813,18 +3813,45 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
     return payload_for_subscription, fallback_name
 
 
+def _subscription_publish_dedupe_key(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    row_code = str(row.get("code") or "").strip().lower()
+    resolved_code = str(
+        normalized.get("resolved_location_code")
+        or normalized.get("credential_location_code")
+        or normalized.get("location_code")
+        or row_code
+        or ""
+    ).strip().lower()
+    return resolved_code or row_code
+
+
+
 def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
     public_rows = _public_location_rows()
 
     def collect(*, strict_health: bool) -> List[Dict[str, Any]]:
         published: List[Dict[str, Any]] = []
+        seen_publish_keys: set[str] = set()
         for row in public_rows:
             base_row = dict(row)
             if not _subscription_row_allowed_for_publish(base_row, user_id=user_id, strict_health=strict_health):
                 continue
             payload, _ = _subscription_payload_and_fallback_name(base_row, user_id=user_id)
-            if payload and _hiddify_subscription_transport_allowed(payload):
-                published.append(base_row)
+            if not payload or not _hiddify_subscription_transport_allowed(payload):
+                continue
+            publish_key = _subscription_publish_dedupe_key(base_row, payload)
+            if publish_key and publish_key in seen_publish_keys:
+                logger.info(
+                    "[sub][dedupe] skip_duplicate_row code=%s resolved=%s user_id=%s",
+                    str(base_row.get("code") or "-") or "-",
+                    publish_key,
+                    user_id if user_id is not None else "-",
+                )
+                continue
+            if publish_key:
+                seen_publish_keys.add(publish_key)
+            published.append(base_row)
         return published
 
     strict_rows = collect(strict_health=True)
