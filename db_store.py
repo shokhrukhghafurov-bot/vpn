@@ -666,6 +666,12 @@ def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -
     default_device_limit = _coerce_runtime_int(data.get("device_limit"), effective_max_devices, minimum=1)
     settings.VPN_MAX_DEVICES_PER_ACCOUNT = effective_max_devices
     settings.VPN_DEFAULT_DEVICE_LIMIT = min(default_device_limit, effective_max_devices)
+    settings.VPN_ACCESS_MODE = "free" if str(data.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid")).strip().lower() == "free" else "paid"
+    settings.VPN_FREE_MODE_DEVICE_LIMIT = min(
+        _coerce_runtime_int(data.get("free_mode_device_limit"), settings.VPN_DEFAULT_DEVICE_LIMIT, minimum=1),
+        settings.VPN_MAX_DEVICES_PER_ACCOUNT,
+    )
+    settings.VPN_PAID_GRACE_HOURS = _coerce_runtime_int(data.get("paid_grace_hours"), getattr(settings, "VPN_PAID_GRACE_HOURS", 24), minimum=1)
     settings.VPN_SETTINGS_EDITABLE = True
 
     plans = data.get("plans") if isinstance(data.get("plans"), list) else _current_runtime_plan_payloads()
@@ -699,6 +705,10 @@ def apply_runtime_settings_overrides(payload: Optional[Dict[str, Any]] = None) -
 
 
 def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    previous = get_runtime_settings_payload()
+    prev_mode = "free" if str(previous.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid")).strip().lower() == "free" else "paid"
+    next_mode = "free" if str(payload.get("access_mode") or previous.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid")).strip().lower() == "free" else "paid"
+    now_iso = datetime.now(timezone.utc).isoformat()
     normalized = {
         "app_name": _coerce_runtime_str(payload.get("app_name"), settings.APP_NAME),
         "client_mode": _normalize_client_mode(payload.get("client_mode") or getattr(settings, "VPN_CLIENT_MODE", "hiddify")),
@@ -710,6 +720,9 @@ def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
         "payments_enabled": _coerce_runtime_bool(payload.get("payments_enabled"), settings.PAYMENTS_ENABLED),
         "maintenance_mode": _coerce_runtime_bool(payload.get("maintenance_mode"), settings.VPN_MAINTENANCE_MODE),
         "new_activations_enabled": _coerce_runtime_bool(payload.get("new_activations_enabled"), settings.VPN_NEW_ACTIVATIONS_ENABLED),
+        "access_mode": next_mode,
+        "free_mode_device_limit": _coerce_runtime_int(payload.get("free_mode_device_limit"), previous.get("free_mode_device_limit") or getattr(settings, "VPN_FREE_MODE_DEVICE_LIMIT", settings.VPN_DEFAULT_DEVICE_LIMIT), minimum=1),
+        "paid_grace_hours": _coerce_runtime_int(payload.get("paid_grace_hours"), previous.get("paid_grace_hours") or getattr(settings, "VPN_PAID_GRACE_HOURS", 24), minimum=1),
     }
     max_devices = _coerce_runtime_int(payload.get("max_devices_per_account"), settings.VPN_MAX_DEVICES_PER_ACCOUNT, minimum=1)
     normalized["max_devices_per_account"] = max_devices
@@ -744,6 +757,12 @@ def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "is_active": _coerce_runtime_bool(raw_plan.get("is_active"), base_active),
         })
     normalized["plans"] = normalized_plans
+    if prev_mode == "free" and next_mode == "paid":
+        normalized["paid_grace_started_at"] = now_iso
+    elif next_mode == "free":
+        normalized["paid_grace_started_at"] = None
+    else:
+        normalized["paid_grace_started_at"] = previous.get("paid_grace_started_at")
 
     with db() as conn:
         with conn.cursor() as cur:
@@ -1879,6 +1898,113 @@ def _resolve_effective_device_limit(plan_limit: Any = None, user_override: Any =
     return default_limit
 
 
+
+def _runtime_access_mode_payload(payload: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    data = dict(payload or get_runtime_settings_payload() or {})
+    access_mode = "free" if str(data.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid")).strip().lower() == "free" else "paid"
+    free_mode_device_limit = min(
+        _coerce_runtime_int(data.get("free_mode_device_limit"), getattr(settings, "VPN_FREE_MODE_DEVICE_LIMIT", settings.VPN_DEFAULT_DEVICE_LIMIT), minimum=1),
+        max(1, int(getattr(settings, "VPN_MAX_DEVICES_PER_ACCOUNT", settings.VPN_DEFAULT_DEVICE_LIMIT) or settings.VPN_DEFAULT_DEVICE_LIMIT or 1)),
+    )
+    paid_grace_hours = _coerce_runtime_int(data.get("paid_grace_hours"), getattr(settings, "VPN_PAID_GRACE_HOURS", 24), minimum=1)
+    grace_started_at = _normalize_optional_timestamp(data.get("paid_grace_started_at"))
+    return {
+        "access_mode": access_mode,
+        "free_mode_device_limit": free_mode_device_limit,
+        "paid_grace_hours": paid_grace_hours,
+        "paid_grace_started_at": grace_started_at,
+    }
+
+
+def _user_has_paid_grace(user: Optional[Dict[str, Any]], access_payload: Dict[str, Any]) -> bool:
+    if not user or access_payload.get("access_mode") != "paid":
+        return False
+    grace_started_at = access_payload.get("paid_grace_started_at")
+    if not grace_started_at:
+        return False
+    user_created_at = _normalize_optional_timestamp((user or {}).get("created_at"))
+    if not user_created_at or user_created_at > grace_started_at:
+        return False
+    grace_hours = max(1, int(access_payload.get("paid_grace_hours") or 24))
+    grace_until = grace_started_at + timedelta(hours=grace_hours)
+    return datetime.now(timezone.utc) <= grace_until
+
+
+def _resolve_user_access_state(
+    user: Optional[Dict[str, Any]],
+    latest_subscription: Optional[Dict[str, Any]],
+    *,
+    access_payload: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    payload = _runtime_access_mode_payload(access_payload)
+    if not user or str((user or {}).get("status") or "").strip().lower() == "blocked":
+        return {
+            "is_active": False,
+            "access_source": "blocked",
+            "show_buy_button": payload.get("access_mode") != "free",
+            "grace_active": False,
+            "free_mode_active": payload.get("access_mode") == "free",
+            "device_limit": 0,
+            "access_mode": payload.get("access_mode"),
+            "free_mode_device_limit": payload.get("free_mode_device_limit"),
+            "paid_grace_hours": payload.get("paid_grace_hours"),
+            "paid_grace_started_at": payload.get("paid_grace_started_at"),
+        }
+    paid_limit = _resolve_effective_device_limit((latest_subscription or {}).get("device_limit"), (user or {}).get("device_limit_override"))
+    if latest_subscription and str(latest_subscription.get("status") or "").strip().lower() == "active":
+        return {
+            "is_active": True,
+            "access_source": "paid_subscription",
+            "show_buy_button": payload.get("access_mode") != "free",
+            "grace_active": False,
+            "free_mode_active": payload.get("access_mode") == "free",
+            "device_limit": paid_limit,
+            "access_mode": payload.get("access_mode"),
+            "free_mode_device_limit": payload.get("free_mode_device_limit"),
+            "paid_grace_hours": payload.get("paid_grace_hours"),
+            "paid_grace_started_at": payload.get("paid_grace_started_at"),
+        }
+    grace_active = _user_has_paid_grace(user, payload)
+    if payload.get("access_mode") == "free":
+        return {
+            "is_active": True,
+            "access_source": "free_mode",
+            "show_buy_button": False,
+            "grace_active": False,
+            "free_mode_active": True,
+            "device_limit": _resolve_effective_device_limit(payload.get("free_mode_device_limit"), (user or {}).get("device_limit_override")),
+            "access_mode": payload.get("access_mode"),
+            "free_mode_device_limit": payload.get("free_mode_device_limit"),
+            "paid_grace_hours": payload.get("paid_grace_hours"),
+            "paid_grace_started_at": payload.get("paid_grace_started_at"),
+        }
+    if grace_active:
+        return {
+            "is_active": True,
+            "access_source": "paid_grace",
+            "show_buy_button": True,
+            "grace_active": True,
+            "free_mode_active": False,
+            "device_limit": _resolve_effective_device_limit(payload.get("free_mode_device_limit"), (user or {}).get("device_limit_override")),
+            "access_mode": payload.get("access_mode"),
+            "free_mode_device_limit": payload.get("free_mode_device_limit"),
+            "paid_grace_hours": payload.get("paid_grace_hours"),
+            "paid_grace_started_at": payload.get("paid_grace_started_at"),
+        }
+    return {
+        "is_active": False,
+        "access_source": "inactive",
+        "show_buy_button": True,
+        "grace_active": False,
+        "free_mode_active": False,
+        "device_limit": paid_limit,
+        "access_mode": payload.get("access_mode"),
+        "free_mode_device_limit": payload.get("free_mode_device_limit"),
+        "paid_grace_hours": payload.get("paid_grace_hours"),
+        "paid_grace_started_at": payload.get("paid_grace_started_at"),
+    }
+
+
 def _normalize_user(row: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not row:
         return None
@@ -2113,7 +2239,8 @@ def get_subscription_device_gate_by_token(subscription_token: str, device_finger
             "known_device": False,
         }
     subscription = get_current_subscription(int(user["id"]))
-    if not subscription:
+    access_state = _resolve_user_access_state(user, subscription)
+    if not access_state.get("is_active"):
         return {
             "allowed": False,
             "reason": "subscription_inactive",
@@ -2123,7 +2250,7 @@ def get_subscription_device_gate_by_token(subscription_token: str, device_finger
             "device_limit": 0,
             "known_device": False,
         }
-    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
+    allowed_limit = int(access_state.get("device_limit") or 0)
     devices = get_user_devices(int(user["id"]))
     known_device = bool(fingerprint) and any(str(item.get("device_fingerprint") or "") == fingerprint for item in devices)
     return {
@@ -2179,19 +2306,24 @@ def _get_user_subscription_view_with_conn(conn: psycopg.Connection, user_id: int
         )
         devices = [dict(row) for row in cur.fetchall()]
 
-    allowed_limit = _resolve_effective_device_limit(
-        (latest or {}).get("device_limit"),
-        (user or {}).get("device_limit_override"),
-    )
-    subscription_token = ensure_user_subscription_token(user_id) if user else None
+    access_state = _resolve_user_access_state(user, subscription)
+    subscription_token = ensure_user_subscription_token(user_id) if user and access_state.get("is_active") else None
     return {
         "subscription": latest,
-        "is_active": bool(subscription),
+        "is_active": bool(access_state.get("is_active")),
         "devices": devices,
         "devices_used": len(devices),
-        "device_limit": allowed_limit,
+        "device_limit": int(access_state.get("device_limit") or 0),
         "device_limit_override": (user or {}).get("device_limit_override"),
         "subscription_token": subscription_token,
+        "access_mode": access_state.get("access_mode"),
+        "access_source": access_state.get("access_source"),
+        "free_mode_active": bool(access_state.get("free_mode_active")),
+        "grace_active": bool(access_state.get("grace_active")),
+        "show_buy_button": bool(access_state.get("show_buy_button")),
+        "free_mode_device_limit": int(access_state.get("free_mode_device_limit") or 0),
+        "paid_grace_hours": int(access_state.get("paid_grace_hours") or 0),
+        "paid_grace_started_at": access_state.get("paid_grace_started_at"),
     }
 
 
@@ -2461,12 +2593,13 @@ def _upsert_device_record(
         raise ValueError("User not found")
     if user["status"] == "blocked":
         raise PermissionError("User is blocked")
-    subscription = get_current_subscription(user_id)
-    if not subscription:
+
+    access_view = get_user_subscription_view(user_id)
+    if not bool(access_view.get("is_active")):
         raise PermissionError("Active subscription required")
     if enforce_limit and not settings.VPN_NEW_ACTIVATIONS_ENABLED:
         raise PermissionError("New activations are disabled")
-    allowed_limit = _resolve_effective_device_limit(subscription.get("device_limit"), user.get("device_limit_override"))
+    allowed_limit = max(1, int(access_view.get("device_limit") or 0))
     if not enforce_limit:
         _collapse_duplicate_device_slots(user_id, platform, device_name)
     existing = get_user_devices(user_id)
@@ -3323,6 +3456,10 @@ def settings_snapshot() -> Dict[str, Any]:
         "max_devices_per_account": settings.VPN_MAX_DEVICES_PER_ACCOUNT,
         "maintenance_mode": settings.VPN_MAINTENANCE_MODE,
         "new_activations_enabled": settings.VPN_NEW_ACTIVATIONS_ENABLED,
+        "access_mode": getattr(settings, "VPN_ACCESS_MODE", "paid"),
+        "free_mode_device_limit": getattr(settings, "VPN_FREE_MODE_DEVICE_LIMIT", settings.VPN_DEFAULT_DEVICE_LIMIT),
+        "paid_grace_hours": getattr(settings, "VPN_PAID_GRACE_HOURS", 24),
+        "paid_grace_started_at": (get_runtime_settings_payload() or {}).get("paid_grace_started_at"),
         "payments_enabled": settings.PAYMENTS_ENABLED,
         "payments_provider": settings.PAYMENTS_PROVIDER,
         "support_telegram_url": settings.SUPPORT_TELEGRAM_URL,
