@@ -60,6 +60,7 @@ from db_store import (
     get_user_subscription_view,
     get_subscription_device_gate_by_token,
     ensure_user_subscription_token,
+    is_revoked_device_fingerprint,
     issue_auth_code,
     consume_auth_code,
     list_admin_users,
@@ -3669,6 +3670,17 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
     if not fingerprint:
         return None
     try:
+        user_id = int(user.get("id") or 0)
+        if user_id > 0 and is_revoked_device_fingerprint(user_id, fingerprint):
+            return {
+                "allowed": False,
+                "reason": "device_revoked",
+                "detail": "Device removed and revoked",
+                "user_id": user_id,
+                "devices_used": 0,
+                "device_limit": 0,
+                "known_device": False,
+            }
         gate = get_subscription_device_gate_by_token(token, fingerprint)
     except Exception:
         return None
@@ -3957,12 +3969,19 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not is_browser_preview:
             gate = _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
-                used = int(gate.get("devices_used") or 0)
-                limit = int(gate.get("device_limit") or 0)
-                content = (
-                    f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
-                    f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
-                )
+                reason = str(gate.get("reason") or "").strip().lower()
+                if reason == "device_revoked":
+                    content = (
+                        "This device was removed in the bot. Open a new subscription link from the bot to reconnect.\n"
+                        "Это устройство было удалено в боте. Откройте новую ссылку подписки из бота, чтобы подключиться снова.\n"
+                    )
+                else:
+                    used = int(gate.get("devices_used") or 0)
+                    limit = int(gate.get("device_limit") or 0)
+                    content = (
+                        f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
+                        f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
+                    )
                 return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
 
     if not head_only and not _subscription_browser_preview_request(request):
