@@ -3873,12 +3873,9 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
 
 
 def _subscription_revoked_device_response(request: Request, token: str, *, head_only: bool = False) -> Response:
-    expires_ts = int(time.time()) + 300
     now_utc = datetime.now(timezone.utc)
     content_version = hashlib.sha256(f"device_revoked:{token}".encode("utf-8")).hexdigest()
     headers = {
-        "Content-Disposition": 'inline; filename="inet-subscription.txt"',
-        "Subscription-Userinfo": f"upload=0; download=0; total=0; expire={expires_ts}",
         "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
         "CDN-Cache-Control": "no-store, no-cache, max-age=0",
         "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
@@ -3889,14 +3886,15 @@ def _subscription_revoked_device_response(request: Request, token: str, *, head_
         "Last-Modified": _http_date_from_datetime(now_utc) or "",
         "Vary": "*",
         "X-Accel-Expires": "0",
-        "profile-update-interval": _hiddify_profile_update_interval_header_value(),
-        "x-hiddify-source": "subscription",
-        "x-subscription-version": content_version,
-        "x-subscription-generated-at": now_utc.isoformat(),
         "x-subscription-state": "device_revoked",
         "x-device-access": "revoked",
     }
-    return Response(status_code=200, headers=headers) if head_only else Response(content="", media_type="text/plain; charset=utf-8", headers=headers)
+    response = Response(status_code=204, headers=headers)
+    try:
+        response.delete_cookie("inet_sub_cid")
+    except Exception:
+        pass
+    return response
 
 
 def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, expires_ts: Optional[int] = None) -> Response:
@@ -4147,6 +4145,14 @@ def open_app_bridge(
     client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
+    device_gate: Optional[Dict[str, Any]] = None
+    if active_token:
+        try:
+            device_gate = _subscription_device_gate(request, active_token, _subscription_access_context(active_token))
+        except Exception:
+            device_gate = None
+        if device_gate and not device_gate.get("allowed") and str(device_gate.get("reason") or "").strip() == "device_revoked":
+            active_token = None
     subscription_client_id = _mint_subscription_client_id(request, active_token) if active_token else ""
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     tracked_subscription_url = None
@@ -4172,6 +4178,7 @@ def open_app_bridge(
             "body_auto": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
             "body_manual": f"Для {client_name} на этой платформе используйте ручной импорт: скопируйте персональную ссылку ниже и добавьте её в приложение как Subscription / URL. Токен уже зашит в ссылку.",
             "invalid_link": "Ссылка недействительна или срок доступа истёк. Вернитесь в бота и купите подписку.",
+            "device_removed": "Это устройство удалено. Откройте подключение заново из бота.",
             "open_button": f"Открыть в {client_name}",
             "copy_button": f"Скопировать ссылку для {client_name}",
             "android_button": f"Скачать {_client_name_for_platform('android')} для Android",
@@ -4189,6 +4196,7 @@ def open_app_bridge(
             "body_auto": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
             "body_manual": f"On this platform, use manual import for {client_name}: copy the personal subscription link below and add it inside the app as Subscription / URL. The token is already embedded in the link.",
             "invalid_link": "This link is invalid or access has expired. Return to the bot and buy a subscription.",
+            "device_removed": "This device was removed. Reconnect it again from the bot.",
             "open_button": f"Open in {client_name}",
             "copy_button": f"Copy link for {client_name}",
             "android_button": f"Download {_client_name_for_platform('android')} for Android",
@@ -4228,7 +4236,10 @@ def open_app_bridge(
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
-    body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
+    if device_gate and not device_gate.get("allowed") and str(device_gate.get("reason") or "").strip() == "device_revoked":
+        body_value = page_text["device_removed"]
+    else:
+        body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
     body = html.escape(body_value)
     open_button = html.escape(page_text["open_button"] if supports_native_launch else page_text["copy_button"])
     android_button = html.escape(page_text["android_button"])
@@ -4503,6 +4514,11 @@ def open_app_bridge(
                 samesite="lax",
                 secure=_request_is_https(request),
             )
+        except Exception:
+            pass
+    else:
+        try:
+            response.delete_cookie("inet_sub_cid")
         except Exception:
             pass
     return response
