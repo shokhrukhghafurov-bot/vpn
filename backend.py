@@ -3538,9 +3538,25 @@ def _build_subscription_device_fingerprint(request: Request, token: str, client_
 
 
 
+def _subscription_client_id_is_removed(request: Request, token: str, client_id: str) -> bool:
+    normalized_token = str(token or "").strip()
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    if not normalized_token or not normalized_client_id:
+        return False
+    try:
+        fingerprint = _build_subscription_device_fingerprint(request, normalized_token, normalized_client_id)
+        if not fingerprint:
+            return False
+        gate = get_subscription_device_gate_by_token(normalized_token, fingerprint)
+        return str((gate or {}).get("reason") or "").strip() == "device_removed"
+    except Exception:
+        return False
+
+
+
 def _subscription_cookie_value(request: Request, token: str) -> str:
     current = _subscription_client_id_from_request(request)
-    if current:
+    if current and not _subscription_client_id_is_removed(request, token, current):
         return current
     ua = str(request.headers.get("user-agent") or "").strip()
     platform, _ = _detect_device_platform_and_name(request)
