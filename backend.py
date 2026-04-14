@@ -3502,16 +3502,8 @@ def _subscription_client_id_from_request(request: Request) -> str:
 
 
 def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
-    mobile_subscription_client = (
-        client_hint in {"v2raytun", "hiddify", "happ"}
-        or "v2raytun" in user_agent_hint
-        or "hiddify" in user_agent_hint
-        or "happ" in user_agent_hint
-    )
     normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
-    if normalized_client_id and not mobile_subscription_client:
+    if normalized_client_id:
         return (f"cid:{normalized_client_id}", "client_id")
     user_agent = str(request.headers.get("user-agent") or "").strip()
     accept_language = str(request.headers.get("accept-language") or "").strip()
@@ -3538,11 +3530,41 @@ def _build_subscription_device_fingerprint(request: Request, token: str, client_
 
 
 
+def _subscription_client_id_fingerprint(token: str, client_id: str) -> str:
+    normalized_token = str(token or "").strip()
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    source = f"cid:{normalized_client_id}"
+    return hashlib.sha256(f"sub-device:v3:{normalized_token}:{source}".encode("utf-8")).hexdigest()
+
+
+
 def _subscription_client_id_is_removed(request: Request, token: str, client_id: str) -> bool:
     normalized_token = str(token or "").strip()
     normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
     if not normalized_token or not normalized_client_id:
         return False
+    try:
+        fingerprint = _subscription_client_id_fingerprint(normalized_token, normalized_client_id)
+        user = get_user_by_subscription_token(normalized_token)
+        if not user:
+            return False
+        with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    SELECT is_active
+                    FROM devices
+                    WHERE user_id = %s AND device_fingerprint = %s
+                    ORDER BY id DESC
+                    LIMIT 1
+                    """,
+                    (int(user["id"]), fingerprint),
+                )
+                row = cur.fetchone()
+        if row is not None:
+            return not bool(row.get("is_active"))
+    except Exception:
+        pass
     try:
         fingerprint = _build_subscription_device_fingerprint(request, normalized_token, normalized_client_id)
         if not fingerprint:
@@ -3987,8 +4009,8 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                         token,
                         head_only=head_only,
                         expires_ts=int(time.time()) - 300,
-                        state="revoked",
-                        profile_suffix="device revoked",
+                        state="empty",
+                        profile_suffix=_bot_profile_title_label(),
                     )
                 used = int(gate.get("devices_used") or 0)
                 limit = int(gate.get("device_limit") or 0)
