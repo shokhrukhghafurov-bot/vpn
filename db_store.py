@@ -2442,6 +2442,12 @@ def _select_tracking_alias_match_device(existing: List[Dict[str, Any]], platform
     platform_family = _device_platform_family(normalized_platform)
     client_family = _device_client_family(normalized_name)
 
+    # Never merge mobile subscription imports by heuristics.
+    # Each fresh bot import carries its own client_id and must keep its own slot,
+    # otherwise two profiles inside the same app collapse into one device record.
+    if platform_family == "mobile":
+        return None
+
     exact_matches = [
         item for item in existing
         if str(item.get("platform") or "").strip().lower() == normalized_platform
