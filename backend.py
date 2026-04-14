@@ -3502,31 +3502,27 @@ def _subscription_client_id_from_request(request: Request) -> str:
 
 
 def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    explicit_device_id = _sanitize_tracking_value(
-        request.query_params.get("device_id")
-        or request.query_params.get("device_fingerprint")
-        or request.query_params.get("fp")
-        or request.headers.get("x-device-id")
-        or request.headers.get("x-device-fingerprint"),
-        max_len=160,
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+    mobile_subscription_client = (
+        client_hint in {"v2raytun", "hiddify", "happ"}
+        or "v2raytun" in user_agent_hint
+        or "hiddify" in user_agent_hint
+        or "happ" in user_agent_hint
     )
-    if explicit_device_id:
-        return (f"device:{explicit_device_id}", "device_id")
-
-    # IMPORTANT:
-    # client_id identifies an import/profile, not the physical device.
-    # Do not use client_id for device-slot tracking, otherwise one phone can
-    # create 2+ logical devices in the bot. We keep client_id only for the
-    # subscription URL lifecycle, while device gating is tied to a stable
-    # per-device fingerprint derived from request characteristics.
+    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+    if normalized_client_id and not mobile_subscription_client:
+        return (f"cid:{normalized_client_id}", "client_id")
     user_agent = str(request.headers.get("user-agent") or "").strip()
     accept_language = str(request.headers.get("accept-language") or "").strip()
     sec_ch_ua = str(request.headers.get("sec-ch-ua") or "").strip()
     sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
     sec_mobile = str(request.headers.get("sec-ch-ua-mobile") or "").strip()
     platform, device_name = _detect_device_platform_and_name(request)
-    parts = [platform, device_name, user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile]
+    parts = [user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile, str(platform or "").strip(), str(device_name or "").strip()]
     normalized_parts = [part.strip() for part in parts if part and part.strip()]
+    if normalized_client_id:
+        normalized_parts.append(f"subcid:{normalized_client_id}")
     if not normalized_parts:
         return None
     return ("fallback:" + "|".join(normalized_parts), "fallback")
@@ -3542,27 +3538,14 @@ def _build_subscription_device_fingerprint(request: Request, token: str, client_
 
 
 
-def _mint_subscription_client_id(request: Request, token: str) -> str:
-    # Keep the subscription source stable for the same physical device.
-    # V2RayTun/Happ treats different client_id values as separate imports,
-    # so a random client_id creates duplicate accounts/sources inside one app.
-    platform, device_name = _detect_device_platform_and_name(request)
-    fingerprint_source = _subscription_fingerprint_source(request, token)
-    if fingerprint_source:
-        source, source_kind = fingerprint_source
-        seed = f"stable-sub-cid:v2:{token}:{platform}:{device_name}:{source_kind}:{source}"
-    else:
-        ua = str(request.headers.get("user-agent") or "").strip()
-        seed = f"stable-sub-cid:v2:{token}:{platform}:{device_name}:{ua}"
-    return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
-
-
-
 def _subscription_cookie_value(request: Request, token: str) -> str:
     current = _subscription_client_id_from_request(request)
     if current:
         return current
-    return _mint_subscription_client_id(request, token)
+    ua = str(request.headers.get("user-agent") or "").strip()
+    platform, _ = _detect_device_platform_and_name(request)
+    seed = f"{token}|{platform}|{ua}|{uuid4().hex}"
+    return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
 
@@ -3574,7 +3557,12 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
     client_hint = str(request.query_params.get("client") or "").strip().lower()
     user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
     has_explicit_client_id = bool(_subscription_client_id_from_request(request))
-    if has_explicit_client_id:
+    allow_soft_match_with_client_id = (
+        client_hint in {"v2raytun", "hiddify"}
+        or "v2raytun" in user_agent_hint
+        or "hiddify" in user_agent_hint
+    )
+    if has_explicit_client_id and not allow_soft_match_with_client_id:
         return gate
     used = int(gate.get("devices_used") or 0)
     limit = int(gate.get("device_limit") or 0)
@@ -3872,31 +3860,6 @@ def _http_date_from_datetime(value: Optional[datetime]) -> Optional[str]:
     return aware.astimezone(timezone.utc).strftime("%a, %d %b %Y %H:%M:%S GMT")
 
 
-def _subscription_revoked_device_response(request: Request, token: str, *, head_only: bool = False) -> Response:
-    now_utc = datetime.now(timezone.utc)
-    content_version = hashlib.sha256(f"device_revoked:{token}".encode("utf-8")).hexdigest()
-    headers = {
-        "Cache-Control": "private, no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0, s-maxage=0",
-        "CDN-Cache-Control": "no-store, no-cache, max-age=0",
-        "Cloudflare-CDN-Cache-Control": "no-store, no-cache, max-age=0",
-        "Surrogate-Control": "no-store",
-        "Pragma": "no-cache",
-        "Expires": "0",
-        "ETag": f'W/"{content_version}"',
-        "Last-Modified": _http_date_from_datetime(now_utc) or "",
-        "Vary": "*",
-        "X-Accel-Expires": "0",
-        "x-subscription-state": "device_revoked",
-        "x-device-access": "revoked",
-    }
-    response = Response(status_code=204, headers=headers)
-    try:
-        response.delete_cookie("inet_sub_cid")
-    except Exception:
-        pass
-    return response
-
-
 def _subscription_inactive_response(request: Request, token: str, *, head_only: bool = False, expires_ts: Optional[int] = None) -> Response:
     bot_public_url = str(_bot_public_url() or "").strip()
     support_url = bot_public_url or str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or "").strip()
@@ -4002,11 +3965,8 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not is_browser_preview:
             gate = _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
-                reason = str(gate.get("reason") or "").strip()
                 used = int(gate.get("devices_used") or 0)
                 limit = int(gate.get("device_limit") or 0)
-                if reason == "device_revoked":
-                    return _subscription_revoked_device_response(request, token, head_only=head_only)
                 content = (
                     f"Device limit reached ({used}/{limit}). Remove one device in the bot or admin panel and try again.\n"
                     f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
@@ -4145,29 +4105,18 @@ def open_app_bridge(
     client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
-    device_gate: Optional[Dict[str, Any]] = None
-    if active_token:
-        try:
-            device_gate = _subscription_device_gate(request, active_token, _subscription_access_context(active_token))
-        except Exception:
-            device_gate = None
-        if device_gate and not device_gate.get("allowed") and str(device_gate.get("reason") or "").strip() == "device_revoked":
-            active_token = None
-    subscription_client_id = _mint_subscription_client_id(request, active_token) if active_token else ""
+    subscription_client_id = _subscription_cookie_value(request, active_token) if active_token else ""
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     tracked_subscription_url = None
-    if subscription_url and subscription_client_id:
+    if subscription_url:
         try:
             parts = urlsplit(subscription_url)
             query = dict(parse_qsl(parts.query, keep_blank_values=True))
-            query["client_id"] = subscription_client_id
             if client_mode:
                 query["client"] = client_mode
             tracked_subscription_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
         except Exception:
             tracked_subscription_url = subscription_url
-    elif subscription_url:
-        tracked_subscription_url = subscription_url
     native_url = _build_native_import_url(tracked_subscription_url, platform=target_platform) if tracked_subscription_url else ""
     supports_native_launch = bool(native_url)
     bot_url = _bot_public_url()
@@ -4178,7 +4127,6 @@ def open_app_bridge(
             "body_auto": f"{client_name} должен открыться автоматически и импортировать вашу персональную подписку. Если этого не произошло, используйте кнопки ниже.",
             "body_manual": f"Для {client_name} на этой платформе используйте ручной импорт: скопируйте персональную ссылку ниже и добавьте её в приложение как Subscription / URL. Токен уже зашит в ссылку.",
             "invalid_link": "Ссылка недействительна или срок доступа истёк. Вернитесь в бота и купите подписку.",
-            "device_removed": "Это устройство удалено. Откройте подключение заново из бота.",
             "open_button": f"Открыть в {client_name}",
             "copy_button": f"Скопировать ссылку для {client_name}",
             "android_button": f"Скачать {_client_name_for_platform('android')} для Android",
@@ -4196,7 +4144,6 @@ def open_app_bridge(
             "body_auto": f"{client_name} should open automatically and import your personal subscription. If it does not, use the buttons below.",
             "body_manual": f"On this platform, use manual import for {client_name}: copy the personal subscription link below and add it inside the app as Subscription / URL. The token is already embedded in the link.",
             "invalid_link": "This link is invalid or access has expired. Return to the bot and buy a subscription.",
-            "device_removed": "This device was removed. Reconnect it again from the bot.",
             "open_button": f"Open in {client_name}",
             "copy_button": f"Copy link for {client_name}",
             "android_button": f"Download {_client_name_for_platform('android')} for Android",
@@ -4236,10 +4183,7 @@ def open_app_bridge(
     bot_url_attr = html.escape(bot_url, quote=True)
     title = html.escape(page_text["title"])
     headline = html.escape(page_text["headline"])
-    if device_gate and not device_gate.get("allowed") and str(device_gate.get("reason") or "").strip() == "device_revoked":
-        body_value = page_text["device_removed"]
-    else:
-        body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
+    body_value = (page_text["body_auto"] if supports_native_launch else page_text["body_manual"]) if subscription_url else page_text["invalid_link"]
     body = html.escape(body_value)
     open_button = html.escape(page_text["open_button"] if supports_native_launch else page_text["copy_button"])
     android_button = html.escape(page_text["android_button"])
@@ -4302,7 +4246,6 @@ def open_app_bridge(
       const userAgent = navigator.userAgent || '';
       const isAndroid = /Android/i.test(userAgent);
       const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
-      const forceRenewClientId = false;
       let hiddenAt = 0;
 
       const markHidden = function () {{
@@ -4316,52 +4259,8 @@ def open_app_bridge(
       window.addEventListener('pagehide', markHidden);
       window.addEventListener('blur', markHidden);
 
-      const getClientId = function () {{
-        const key = 'inet-subscription-client-id';
-        if (forceRenewClientId) {{
-          try {{ window.localStorage.removeItem(key); }} catch (storageError) {{}}
-          try {{ document.cookie = 'inet_sub_cid=; Max-Age=0; path=/; SameSite=Lax'; }} catch (cookieError) {{}}
-        }}
-        try {{
-          if (baseSubscriptionUrl) {{
-            const parsed = new URL(baseSubscriptionUrl);
-            const fromUrl = parsed.searchParams.get('client_id');
-            if (fromUrl && !forceRenewClientId) {{
-              try {{ window.localStorage.setItem(key, fromUrl); }} catch (storageError) {{}}
-              return fromUrl;
-            }}
-          }}
-        }} catch (error) {{}}
-        try {{
-          const cookieMatch = document.cookie.match(/(?:^|; )inet_sub_cid=([^;]+)/);
-          if (cookieMatch && cookieMatch[1] && !forceRenewClientId) {{
-            const fromCookie = decodeURIComponent(cookieMatch[1]);
-            if (fromCookie) {{
-              try {{ window.localStorage.setItem(key, fromCookie); }} catch (storageError) {{}}
-              return fromCookie;
-            }}
-          }}
-        }} catch (error) {{}}
-        try {{
-          let existing = forceRenewClientId ? '' : window.localStorage.getItem(key);
-          if (existing) return existing;
-          const generated = 'cid-' + Math.random().toString(36).slice(2) + Date.now().toString(36);
-          window.localStorage.setItem(key, generated);
-          return generated;
-        }} catch (error) {{
-          return 'cid-' + Date.now().toString(36);
-        }}
-      }};
-
       const buildTrackedSubscriptionUrl = function () {{
-        if (!baseSubscriptionUrl) return '';
-        try {{
-          const url = new URL(baseSubscriptionUrl);
-          url.searchParams.set('client_id', getClientId());
-          return url.toString();
-        }} catch (error) {{
-          return baseSubscriptionUrl;
-        }}
+        return baseSubscriptionUrl || '';
       }};
 
       const buildNativeUrl = function () {{
@@ -4514,11 +4413,6 @@ def open_app_bridge(
                 samesite="lax",
                 secure=_request_is_https(request),
             )
-        except Exception:
-            pass
-    else:
-        try:
-            response.delete_cookie("inet_sub_cid")
         except Exception:
             pass
     return response
