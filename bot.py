@@ -106,6 +106,11 @@ TEXT: Dict[str, Dict[str, str]] = {
         "copy_subscription": "📋 Скопировать ссылку подписки",
         "manual_import_hint": "Если Hiddify не открылся автоматически, скопируйте ссылку подписки и импортируйте её вручную в Hiddify. На Windows для TUN запустите клиент от имени администратора.",
         "subscription_buy_prompt": "Чтобы подключиться, купите или продлите подписку.",
+        "free_mode_label": "Бесплатный режим",
+        "free_mode_access": "Сейчас для всех включён бесплатный режим доступа.",
+        "grace_mode_access": "Сейчас у вас временный бесплатный доступ после возврата в платный режим.",
+        "buy_hidden_free_mode": "Сейчас включён бесплатный режим. Кнопка покупки скрыта, потому что доступ уже бесплатный.",
+        "grace_hours_left": "Осталось часов",
     },
     "en": {
         "welcome": "👋 Welcome to INET\nChoose an action below",
@@ -181,6 +186,11 @@ TEXT: Dict[str, Dict[str, str]] = {
         "copy_subscription": "📋 Copy subscription link",
         "manual_import_hint": "If Hiddify does not open automatically, copy the subscription link and import it manually in Hiddify. On Windows, run the client as Administrator before enabling TUN.",
         "subscription_buy_prompt": "To connect, buy or renew a subscription.",
+        "free_mode_label": "Free mode",
+        "free_mode_access": "Free access for all users is enabled right now.",
+        "grace_mode_access": "You currently have temporary free access after switching back to paid mode.",
+        "buy_hidden_free_mode": "Free mode is enabled right now. The buy button is hidden because access is already free.",
+        "grace_hours_left": "Hours left",
     },
 }
 
@@ -403,10 +413,28 @@ def platform_store_url(platform: str) -> str:
     return str(getattr(settings, "HAPP_WINDOWS_APP_URL", getattr(settings, "WINDOWS_APP_URL", "")) or "").strip()
 
 
+def normalize_telegram_contact_url(url: Optional[str]) -> str:
+    raw = str(url or "").strip()
+    if not raw:
+        return ""
+    if raw.startswith("@"):
+        username = raw[1:].strip()
+        return f"https://t.me/{username}" if username else ""
+    lowered = raw.lower()
+    if lowered.startswith("t.me/"):
+        return f"https://{raw}"
+    if lowered.startswith(("http://", "https://", "tg://")):
+        return raw
+    if raw and " " not in raw and "/" not in raw:
+        return f"https://t.me/{raw}"
+    return raw
+
+
 def is_supported_telegram_url(url: Optional[str]) -> bool:
-    if not url:
+    normalized = normalize_telegram_contact_url(url)
+    if not normalized:
         return False
-    scheme = (urlsplit(url).scheme or "").lower()
+    scheme = (urlsplit(normalized).scheme or "").lower()
     return scheme in {"http", "https", "tg"}
 
 
@@ -424,7 +452,7 @@ async def safe_edit(callback: CallbackQuery, text: str, markup: Optional[InlineK
 async def show_backend_error(target: Message | CallbackQuery, lang: str) -> None:
     text = TEXT[lang]["service_unavailable"]
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=main_menu_inline(lang))
+        await target.answer(text)
     else:
         await safe_edit(target, text, back_inline(lang))
         await target.answer()
@@ -433,7 +461,7 @@ async def show_backend_error(target: Message | CallbackQuery, lang: str) -> None
 async def show_unexpected_error(target: Message | CallbackQuery, lang: str) -> None:
     text = TEXT[lang]["unexpected_error"]
     if isinstance(target, Message):
-        await target.answer(text, reply_markup=main_menu_inline(lang))
+        await target.answer(text)
     else:
         await safe_edit(target, text, back_inline(lang))
         await target.answer()
@@ -454,7 +482,7 @@ async def with_user_guard(target: Message | CallbackQuery, handler, preferred_la
         logger.warning("Backend returned error %s: %s", exc.status_code, exc.detail)
         message = f"Error {exc.status_code}: {exc.detail}"
         if isinstance(target, Message):
-            await target.answer(message, reply_markup=main_menu_inline(lang))
+            await target.answer(message)
         else:
             await safe_edit(target, message, back_inline(lang))
             await target.answer()
@@ -464,14 +492,33 @@ async def with_user_guard(target: Message | CallbackQuery, handler, preferred_la
 
 
 
-def main_menu_inline(lang: str) -> InlineKeyboardMarkup:
+def _show_buy_button_from_access(data: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(data, dict):
+        return True
+    return bool(data.get("show_buy_button", True))
+
+
+async def _fetch_access_state(token: Optional[str]) -> Dict[str, Any]:
+    if not token:
+        return {}
+    data = await api_request("GET", "/subscriptions/me", token=token)
+    return data if isinstance(data, dict) else {}
+
+
+async def build_main_menu_inline(lang: str, token: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
+    show_buy = True
+    if token:
+        with contextlib.suppress(Exception):
+            access = await api_request("GET", "/subscriptions/me", token=token)
+            show_buy = _show_buy_button_from_access(access)
+    top_row = []
+    if show_buy:
+        top_row.append(InlineKeyboardButton(text=t["buy"], callback_data="menu:buy"))
+    top_row.append(InlineKeyboardButton(text=t["sub"], callback_data="menu:sub"))
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [
-                InlineKeyboardButton(text=t["buy"], callback_data="menu:buy"),
-                InlineKeyboardButton(text=t["sub"], callback_data="menu:sub"),
-            ],
+            top_row,
             [
                 InlineKeyboardButton(text=t["devices"], callback_data="menu:devices"),
                 InlineKeyboardButton(text=tx(lang, "download"), callback_data="menu:download"),
@@ -564,14 +611,14 @@ def activated_inline(
 
 
 
-def support_inline(lang: str) -> InlineKeyboardMarkup:
+def support_inline(lang: str, support_url: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=t["write_support"], url=settings.SUPPORT_TELEGRAM_URL)],
-            [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
-        ]
-    )
+    final_support_url = normalize_telegram_contact_url(support_url or settings.SUPPORT_TELEGRAM_URL)
+    rows: List[List[InlineKeyboardButton]] = []
+    if is_supported_telegram_url(final_support_url):
+        rows.append([InlineKeyboardButton(text=t["write_support"], url=final_support_url)])
+    rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -647,16 +694,22 @@ async def remove_legacy_reply_keyboard(message: Message) -> None:
             await cleanup.delete()
 
 
-async def send_menu(message: Message, lang: str, welcome: bool = False, cleanup_keyboard: bool = False) -> None:
+async def send_menu(
+    message: Message,
+    lang: str,
+    token: Optional[str] = None,
+    welcome: bool = False,
+    cleanup_keyboard: bool = False,
+) -> None:
     if cleanup_keyboard:
         await remove_legacy_reply_keyboard(message)
     text = TEXT[lang]["welcome"] if welcome else TEXT[lang]["welcome_back"]
-    await message.answer(text, reply_markup=main_menu_inline(lang))
+    await message.answer(text, reply_markup=await build_main_menu_inline(lang, token))
 
 
-async def send_menu_for_callback(callback: CallbackQuery, lang: str) -> None:
+async def send_menu_for_callback(callback: CallbackQuery, lang: str, token: Optional[str] = None) -> None:
     if callback.message:
-        await safe_edit(callback, TEXT[lang]["menu"], main_menu_inline(lang))
+        await safe_edit(callback, TEXT[lang]["menu"], await build_main_menu_inline(lang, token))
         return
     await callback.answer(TEXT[lang]["menu"])
 
@@ -677,14 +730,13 @@ async def fetch_subscription_access(token: str) -> Dict[str, Optional[str]]:
     }
 
 
-def subscription_required_inline(lang: str) -> InlineKeyboardMarkup:
+def subscription_required_inline(lang: str, show_buy: bool = True) -> InlineKeyboardMarkup:
     t = TEXT[lang]
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")],
-            [InlineKeyboardButton(text=t["back"], callback_data="menu:root")],
-        ]
-    )
+    rows = []
+    if show_buy:
+        rows.append([InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")])
+    rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def render_subscription_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
@@ -697,10 +749,64 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
     subscription_url = (data.get("subscription_url") or "").strip() or None
     subscription_token = (data.get("subscription_token") or "").strip() or None
     open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
+    access_source = str(data.get("access_source") or "").strip().lower()
+    show_buy = _show_buy_button_from_access(data)
+
+    if access_source == "free_mode":
+        text = "\n".join(
+            [
+                f"{t['subscription_status']}: {t['subscription_active']}",
+                f"{t['plan']}: {t['free_mode_label']}",
+                f"{t['devices_used']}: {used} / {limit}",
+                "",
+                t["free_mode_access"],
+                "",
+                tx(lang, "manual_import_hint"),
+            ]
+        ).strip()
+        rows: List[List[InlineKeyboardButton]] = []
+        rows.extend(subscription_copy_rows(lang, subscription_url))
+        if is_supported_telegram_url(open_app_url):
+            rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=open_app_url)])
+        rows.append([InlineKeyboardButton(text=tx(lang, "download_app"), callback_data="menu:download")])
+        rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
+
+    if access_source == "paid_grace":
+        grace_started_at = data.get("paid_grace_started_at")
+        grace_hours = int(data.get("paid_grace_hours") or 24)
+        hours_left_text = str(grace_hours)
+        if grace_started_at:
+            with contextlib.suppress(Exception):
+                from datetime import datetime, timezone, timedelta
+                started = datetime.fromisoformat(str(grace_started_at).replace("Z", "+00:00"))
+                left = started + timedelta(hours=grace_hours) - datetime.now(timezone.utc)
+                hours_left_text = str(max(0, int(left.total_seconds() // 3600)))
+        text = "\n".join(
+            [
+                f"{t['subscription_status']}: {t['subscription_active']}",
+                f"{t['plan']}: {t['free_mode_label']} / grace",
+                f"{t['devices_used']}: {used} / {limit}",
+                "",
+                t["grace_mode_access"],
+                f"{t['grace_hours_left']}: {hours_left_text}",
+                "",
+                tx(lang, "manual_import_hint"),
+            ]
+        ).strip()
+        rows: List[List[InlineKeyboardButton]] = []
+        rows.extend(subscription_copy_rows(lang, subscription_url))
+        if show_buy:
+            rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
+        if is_supported_telegram_url(open_app_url):
+            rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=open_app_url)])
+        rows.append([InlineKeyboardButton(text=tx(lang, "download_app"), callback_data="menu:download")])
+        rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
+        return text, InlineKeyboardMarkup(inline_keyboard=rows)
 
     if not sub:
         text = "\n".join([t["subscription_none"], "", t["subscription_buy_prompt"]]).strip()
-        return text, subscription_required_inline(lang)
+        return text, subscription_required_inline(lang, show_buy=show_buy)
 
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     status_text = t["subscription_active"] if data.get("is_active") else t["subscription_expired"]
@@ -717,7 +823,7 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
                 t["expired_buy_cta"],
             ]
         ).strip()
-        return text, subscription_required_inline(lang)
+        return text, subscription_required_inline(lang, show_buy=show_buy)
 
     text = "\n".join(
         [
@@ -731,7 +837,8 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
     ).strip()
     rows: List[List[InlineKeyboardButton]] = []
     rows.extend(subscription_copy_rows(lang, subscription_url))
-    rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
+    if show_buy:
+        rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
     if is_supported_telegram_url(open_app_url):
         rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=open_app_url)])
     rows.append([InlineKeyboardButton(text=tx(lang, "download_app"), callback_data="menu:download")])
@@ -767,9 +874,10 @@ async def render_devices_message(lang: str, token: str) -> Tuple[str, InlineKeyb
 
 async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
     data = await api_request("GET", "/subscriptions/me", token=token)
-    sub = data.get("subscription")
-    if data.get("is_active") and sub:
+    if data.get("is_active"):
         return None
+    sub = data.get("subscription")
+    show_buy = _show_buy_button_from_access(data)
     if sub:
         plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
         text = "\n".join(
@@ -784,14 +892,15 @@ async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple
         ).strip()
     else:
         text = "\n".join([TEXT[lang]["subscription_none"], "", TEXT[lang]["subscription_buy_prompt"]]).strip()
-    return text, subscription_required_inline(lang)
+    return text, subscription_required_inline(lang, show_buy=show_buy)
 
 
 async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
     t = TEXT[lang]
     faq = await api_request("GET", f"/support/faq?lang={lang}")
-    text = f"{t['support_text']}\n{faq.get('support_url', settings.SUPPORT_TELEGRAM_URL)}\n\n{faq.get('faq', '')}"
-    return text, support_inline(lang)
+    support_url = normalize_telegram_contact_url(faq.get("support_url") or settings.SUPPORT_TELEGRAM_URL)
+    text = f"{t['support_text']}\n{support_url}\n\n{faq.get('faq', '')}"
+    return text, support_inline(lang, support_url)
 
 
 async def render_instructions_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
@@ -845,7 +954,7 @@ async def start(message: Message) -> None:
 @dp.message(Command("menu"))
 async def menu_command(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang, cleanup_keyboard=True)
+        await send_menu(message, lang, _ctx.get('token') if isinstance(_ctx, dict) else None, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -853,6 +962,10 @@ async def menu_command(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["buy"], TEXT["en"]["buy"]}))
 async def buy_from_text(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        access = await _fetch_access_state(_ctx.get("token") if isinstance(_ctx, dict) else None)
+        if not _show_buy_button_from_access(access):
+            await message.answer(TEXT[lang]["buy_hidden_free_mode"], reply_markup=await build_main_menu_inline(lang, _ctx.get("token") if isinstance(_ctx, dict) else None))
+            return
         plans = await api_request("GET", "/plans")
         rows = []
         for item in plans.get("items", []):
@@ -916,7 +1029,7 @@ async def language_from_text(message: Message) -> None:
             await api_request("PATCH", "/users/me/language", token=ctx["token"], json_body={"language": lang})
             await message.answer(
                 f"{TEXT[lang]['language_saved']}\n\n{TEXT[lang]['welcome']}",
-                reply_markup=main_menu_inline(lang),
+                reply_markup=await build_main_menu_inline(lang, ctx.get('token') if isinstance(ctx, dict) else None),
             )
         await with_user_guard(message, _handler, preferred_lang=lang)
         return
@@ -931,7 +1044,7 @@ async def renew_from_text(message: Message) -> None:
 @dp.message(F.text.in_({TEXT["ru"]["back"], TEXT["en"]["back"], TEXT["ru"]["main_menu"], TEXT["en"]["main_menu"]}))
 async def menu_from_text_alias(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang, cleanup_keyboard=True)
+        await send_menu(message, lang, _ctx.get('token') if isinstance(_ctx, dict) else None, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -995,7 +1108,7 @@ async def download_macos_from_text(message: Message) -> None:
 @dp.message()
 async def fallback_message(message: Message) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu(message, lang, cleanup_keyboard=True)
+        await send_menu(message, lang, _ctx.get('token') if isinstance(_ctx, dict) else None, cleanup_keyboard=True)
 
     await with_user_guard(message, _handler)
 
@@ -1003,7 +1116,7 @@ async def fallback_message(message: Message) -> None:
 @dp.callback_query(F.data == "menu:root")
 async def cb_root(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
-        await send_menu_for_callback(callback, lang)
+        await send_menu_for_callback(callback, lang, _ctx.get('token') if isinstance(_ctx, dict) else None)
         await callback.answer()
 
     await with_user_guard(callback, _handler)
@@ -1012,6 +1125,11 @@ async def cb_root(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data == "menu:buy")
 async def cb_buy(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        access = await _fetch_access_state(_ctx.get("token") if isinstance(_ctx, dict) else None)
+        if not _show_buy_button_from_access(access):
+            await safe_edit(callback, TEXT[lang]["buy_hidden_free_mode"], await build_main_menu_inline(lang, _ctx["token"]))
+            await callback.answer()
+            return
         plans = await api_request("GET", "/plans")
         rows = []
         for item in plans.get("items", []):
@@ -1027,6 +1145,11 @@ async def cb_buy(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("plan:view:"))
 async def cb_plan_view(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
+        access = await _fetch_access_state(_ctx.get("token") if isinstance(_ctx, dict) else None)
+        if not _show_buy_button_from_access(access):
+            await safe_edit(callback, TEXT[lang]["buy_hidden_free_mode"], await build_main_menu_inline(lang, _ctx.get("token") if isinstance(_ctx, dict) else None))
+            await callback.answer()
+            return
         plan_code = callback.data.split(":", 2)[2]
         plans = await api_request("GET", "/plans")
         plan = next((item for item in plans.get("items", []) if item["code"] == plan_code), None)
@@ -1052,6 +1175,11 @@ async def cb_plan_view(callback: CallbackQuery) -> None:
 @dp.callback_query(F.data.startswith("plan:pay:"))
 async def cb_plan_pay(callback: CallbackQuery) -> None:
     async def _handler(lang: str, ctx: Dict[str, Any]) -> None:
+        access = await _fetch_access_state(ctx.get("token") if isinstance(ctx, dict) else None)
+        if not _show_buy_button_from_access(access):
+            await safe_edit(callback, TEXT[lang]["buy_hidden_free_mode"], await build_main_menu_inline(lang, ctx.get("token") if isinstance(ctx, dict) else None))
+            await callback.answer()
+            return
         plan_code = callback.data.split(":", 2)[2]
         result = await api_request("POST", "/payments/create", token=ctx["token"], json_body={"plan_code": plan_code, "method": "telegram"})
         payment = result.get("payment") or {}
@@ -1186,7 +1314,7 @@ async def cb_set_language(callback: CallbackQuery) -> None:
         await safe_edit(
             callback,
             f"{TEXT[norm]['language_saved']}\n\n{TEXT[norm]['welcome']}",
-            main_menu_inline(norm),
+            await build_main_menu_inline(norm, ctx.get('token')),
         )
         await callback.answer()
 
