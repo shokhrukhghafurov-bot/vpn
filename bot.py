@@ -896,11 +896,10 @@ async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple
 
 
 async def render_support_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
-    t = TEXT[lang]
     faq = await api_request("GET", f"/support/faq?lang={lang}")
     support_url = normalize_telegram_contact_url(faq.get("support_url") or settings.SUPPORT_TELEGRAM_URL)
-    text = f"{t['support_text']}\n{support_url}\n\n{faq.get('faq', '')}"
-    return text, support_inline(lang, support_url)
+    text = faq.get("faq") or (settings.SUPPORT_FAQ_EN if lang == "en" else settings.SUPPORT_FAQ_RU)
+    return str(text).strip(), support_inline(lang, support_url)
 
 
 async def render_instructions_message(lang: str) -> Tuple[str, InlineKeyboardMarkup]:
