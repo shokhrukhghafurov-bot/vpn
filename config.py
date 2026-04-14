@@ -163,7 +163,7 @@ class Settings:
     SUPPORT_TELEGRAM_URL: str = os.getenv("SUPPORT_TELEGRAM_URL", "https://t.me/your_admin")
     SUPPORT_FAQ_RU: str = os.getenv(
         "SUPPORT_FAQ_RU",
-        "FAQ:\n1. Оплатите тариф в боте.\n2. Установите Hiddify.\n3. Откройте персональную ссылку подписки.\n4. Если не получается — напишите в поддержку.",
+        "📩 Поддержка\n\nНапишите:\n• ваш Telegram ID (можно узнать у @userinfobot)\n• подробно опишите проблему\n• приложите скриншот\n\nМы ответим как можно быстрее.",
     )
     SUPPORT_FAQ_EN: str = os.getenv(
         "SUPPORT_FAQ_EN",
