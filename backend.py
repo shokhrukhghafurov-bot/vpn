@@ -3502,19 +3502,31 @@ def _subscription_client_id_from_request(request: Request) -> str:
 
 
 def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
-    normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
-    if normalized_client_id:
-        return (f"cid:{normalized_client_id}", "client_id")
+    explicit_device_id = _sanitize_tracking_value(
+        request.query_params.get("device_id")
+        or request.query_params.get("device_fingerprint")
+        or request.query_params.get("fp")
+        or request.headers.get("x-device-id")
+        or request.headers.get("x-device-fingerprint"),
+        max_len=160,
+    )
+    if explicit_device_id:
+        return (f"device:{explicit_device_id}", "device_id")
+
+    # IMPORTANT:
+    # client_id identifies an import/profile, not the physical device.
+    # Do not use client_id for device-slot tracking, otherwise one phone can
+    # create 2+ logical devices in the bot. We keep client_id only for the
+    # subscription URL lifecycle, while device gating is tied to a stable
+    # per-device fingerprint derived from request characteristics.
     user_agent = str(request.headers.get("user-agent") or "").strip()
     accept_language = str(request.headers.get("accept-language") or "").strip()
     sec_ch_ua = str(request.headers.get("sec-ch-ua") or "").strip()
     sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
     sec_mobile = str(request.headers.get("sec-ch-ua-mobile") or "").strip()
-    client_ip = _client_ip_from_request(request)
-    parts = [user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile]
+    platform, device_name = _detect_device_platform_and_name(request)
+    parts = [platform, device_name, user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile]
     normalized_parts = [part.strip() for part in parts if part and part.strip()]
-    if client_ip:
-        normalized_parts.append(client_ip)
     if not normalized_parts:
         return None
     return ("fallback:" + "|".join(normalized_parts), "fallback")
@@ -3530,14 +3542,19 @@ def _build_subscription_device_fingerprint(request: Request, token: str, client_
 
 
 
-def _subscription_cookie_value(request: Request, token: str) -> str:
-    current = _subscription_client_id_from_request(request)
-    if current:
-        return current
+def _mint_subscription_client_id(request: Request, token: str) -> str:
     ua = str(request.headers.get("user-agent") or "").strip()
     platform, _ = _detect_device_platform_and_name(request)
     seed = f"{token}|{platform}|{ua}|{uuid4().hex}"
     return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
+
+
+
+def _subscription_cookie_value(request: Request, token: str) -> str:
+    current = _subscription_client_id_from_request(request)
+    if current:
+        return current
+    return _mint_subscription_client_id(request, token)
 
 
 
@@ -3549,12 +3566,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
     client_hint = str(request.query_params.get("client") or "").strip().lower()
     user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
     has_explicit_client_id = bool(_subscription_client_id_from_request(request))
-    allow_soft_match_with_client_id = (
-        client_hint in {"v2raytun", "hiddify"}
-        or "v2raytun" in user_agent_hint
-        or "hiddify" in user_agent_hint
-    )
-    if has_explicit_client_id and not allow_soft_match_with_client_id:
+    if has_explicit_client_id:
         return gate
     used = int(gate.get("devices_used") or 0)
     limit = int(gate.get("device_limit") or 0)
@@ -4160,7 +4172,7 @@ def open_app_bridge(
     client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
-    subscription_client_id = _subscription_cookie_value(request, active_token) if active_token else ""
+    subscription_client_id = _mint_subscription_client_id(request, active_token) if active_token else ""
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     tracked_subscription_url = None
     if subscription_url and subscription_client_id:
