@@ -581,8 +581,10 @@ def build_open_app_url(
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     if final_code:
         query["code"] = final_code
+        query["renew"] = "1"
     elif final_token:
         query["token"] = final_token
+        query["renew"] = "1"
     if lang:
         query["lang"] = lang
     if platform:
