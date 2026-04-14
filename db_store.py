@@ -231,6 +231,18 @@ CREATE TABLE IF NOT EXISTS user_location_credentials (
     UNIQUE(user_id, location_code)
 );
 
+CREATE TABLE IF NOT EXISTS revoked_device_fingerprints (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_fingerprint TEXT NOT NULL,
+    platform TEXT,
+    device_name TEXT,
+    revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, device_fingerprint)
+);
+
 CREATE TABLE IF NOT EXISTS virtual_location_assignments (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -319,8 +331,11 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
+    "CREATE TABLE IF NOT EXISTS revoked_device_fingerprints (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, platform TEXT, device_name TEXT, revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint))",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_user_id ON user_location_credentials(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_location_code ON user_location_credentials(location_code)",
+    "CREATE INDEX IF NOT EXISTS idx_revoked_device_fingerprints_user_id ON revoked_device_fingerprints(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_revoked_device_fingerprints_fingerprint ON revoked_device_fingerprints(device_fingerprint)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
 ]
@@ -345,6 +360,7 @@ POST_MIGRATION_SQL = [
     "UPDATE bot_notifications SET payload = '{}'::jsonb WHERE payload IS NULL",
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
+    "CREATE TABLE IF NOT EXISTS revoked_device_fingerprints (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, platform TEXT, device_name TEXT, revoked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint))",
     "UPDATE user_location_credentials SET status = 'active' WHERE status IS NULL OR status = ''",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
@@ -2052,84 +2068,6 @@ def ensure_user_subscription_token(user_id: int) -> str:
             raise RuntimeError("Failed to generate unique subscription token")
 
 
-
-def rotate_user_subscription_token(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> str:
-    def _rotate(active_conn: psycopg.Connection) -> str:
-        with active_conn.cursor() as cur:
-            cur.execute("SELECT id FROM users WHERE id = %s FOR UPDATE", (user_id,))
-            row = cur.fetchone()
-            if not row:
-                raise ValueError("User not found")
-            for _ in range(5):
-                token = _generate_subscription_token()
-                cur.execute(
-                    "UPDATE users SET subscription_token = %s, updated_at = NOW() WHERE id = %s RETURNING subscription_token",
-                    (token, user_id),
-                )
-                updated = cur.fetchone()
-                if updated and updated.get("subscription_token"):
-                    return str(updated["subscription_token"])
-            raise RuntimeError("Failed to rotate subscription token")
-
-    if conn is not None:
-        return _rotate(conn)
-    with db() as own_conn:
-        token = _rotate(own_conn)
-        own_conn.commit()
-        return token
-
-
-
-def rotate_user_location_credentials(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> int:
-    def _rotate(active_conn: psycopg.Connection) -> int:
-        with active_conn.cursor() as cur:
-            cur.execute(
-                "SELECT id FROM user_location_credentials WHERE user_id = %s FOR UPDATE",
-                (user_id,),
-            )
-            rows = cur.fetchall() or []
-            rotated = 0
-            for row in rows:
-                credential_id = int(row.get("id") or 0)
-                if credential_id <= 0:
-                    continue
-                cur.execute(
-                    """
-                    UPDATE user_location_credentials
-                    SET uuid = %s, status = 'active', updated_at = NOW()
-                    WHERE id = %s
-                    """,
-                    (str(uuid4()), credential_id),
-                )
-                rotated += 1
-            return rotated
-
-    if conn is not None:
-        return _rotate(conn)
-    with db() as own_conn:
-        rotated = _rotate(own_conn)
-        own_conn.commit()
-        return rotated
-
-
-
-def revoke_user_access_credentials(user_id: int, *, conn: Optional[psycopg.Connection] = None) -> Dict[str, Any]:
-    def _revoke(active_conn: psycopg.Connection) -> Dict[str, Any]:
-        new_token = rotate_user_subscription_token(user_id, conn=active_conn)
-        rotated_credentials = rotate_user_location_credentials(user_id, conn=active_conn)
-        return {
-            "subscription_token": new_token,
-            "rotated_credentials": rotated_credentials,
-        }
-
-    if conn is not None:
-        return _revoke(conn)
-    with db() as own_conn:
-        result = _revoke(own_conn)
-        own_conn.commit()
-        return result
-
-
 def get_user_by_active_auth_code(code: str) -> Optional[Dict[str, Any]]:
     normalized = (code or "").strip()
     if not normalized:
@@ -2150,6 +2088,91 @@ def get_user_by_active_auth_code(code: str) -> Optional[Dict[str, Any]]:
             )
             row = cur.fetchone()
     return _normalize_user(row) if row else None
+
+
+def rotate_user_access_credentials(user_id: int) -> Dict[str, Any]:
+    rotated_token = _generate_subscription_token()
+    rotated_credentials = 0
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE users
+                SET subscription_token = %s, updated_at = NOW()
+                WHERE id = %s
+                RETURNING id, subscription_token
+                """,
+                (rotated_token, int(user_id)),
+            )
+            user_row = cur.fetchone()
+            cur.execute("SELECT id FROM user_location_credentials WHERE user_id = %s", (int(user_id),))
+            credential_rows = cur.fetchall() or []
+            for credential_row in credential_rows:
+                cur.execute(
+                    """
+                    UPDATE user_location_credentials
+                    SET uuid = %s, status = 'active', updated_at = NOW()
+                    WHERE id = %s
+                    """,
+                    (str(uuid4()), int(credential_row["id"])),
+                )
+            rotated_credentials = len(credential_rows)
+        conn.commit()
+    if not user_row:
+        raise ValueError("User not found for access credential rotation")
+    return {
+        "user_id": int(user_row["id"]),
+        "subscription_token": str(user_row.get("subscription_token") or "").strip(),
+        "rotated_location_credentials": rotated_credentials,
+    }
+
+
+def is_revoked_device_fingerprint(user_id: int, device_fingerprint: str) -> bool:
+    fingerprint = str(device_fingerprint or "").strip()
+    if not fingerprint:
+        return False
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT 1 FROM revoked_device_fingerprints WHERE user_id = %s AND device_fingerprint = %s LIMIT 1",
+                (int(user_id), fingerprint),
+            )
+            row = cur.fetchone()
+    return bool(row)
+
+
+def revoke_device_fingerprint(user_id: int, device_fingerprint: str, platform: Optional[str] = None, device_name: Optional[str] = None) -> None:
+    fingerprint = str(device_fingerprint or "").strip()
+    if not fingerprint:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO revoked_device_fingerprints (user_id, device_fingerprint, platform, device_name, revoked_at, created_at, updated_at)
+                VALUES (%s, %s, %s, %s, NOW(), NOW(), NOW())
+                ON CONFLICT (user_id, device_fingerprint) DO UPDATE
+                SET platform = EXCLUDED.platform,
+                    device_name = EXCLUDED.device_name,
+                    revoked_at = NOW(),
+                    updated_at = NOW()
+                """,
+                (int(user_id), fingerprint, str(platform or "").strip() or None, str(device_name or "").strip() or None),
+            )
+        conn.commit()
+
+
+def clear_revoked_device_fingerprint(user_id: int, device_fingerprint: str) -> None:
+    fingerprint = str(device_fingerprint or "").strip()
+    if not fingerprint:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "DELETE FROM revoked_device_fingerprints WHERE user_id = %s AND device_fingerprint = %s",
+                (int(user_id), fingerprint),
+            )
+        conn.commit()
 
 
 def get_user_by_subscription_token(subscription_token: str) -> Optional[Dict[str, Any]]:
@@ -2763,6 +2786,7 @@ def _upsert_device_record(
 
 
 def register_device(user_id: int, platform: str, device_name: str, device_fingerprint: str) -> Dict[str, Any]:
+    clear_revoked_device_fingerprint(user_id, device_fingerprint)
     item = _upsert_device_record(user_id, platform, device_name, device_fingerprint, enforce_limit=True)
     if not item:
         raise PermissionError("Device registration failed")
@@ -2777,12 +2801,16 @@ def touch_subscription_device_by_token(subscription_token: str, platform: str, d
     user = get_user_by_subscription_token(token)
     if not user:
         return None
+    user_id = int(user["id"])
+    fingerprint = str(device_fingerprint or "").strip()
+    if is_revoked_device_fingerprint(user_id, fingerprint):
+        return None
     try:
         return _upsert_device_record(
-            int(user["id"]),
+            user_id,
             str(platform or "client").strip() or "client",
             str(device_name or "VPN client").strip() or "VPN client",
-            str(device_fingerprint or "").strip(),
+            fingerprint,
             enforce_limit=False,
         )
     except Exception:
@@ -2790,29 +2818,30 @@ def touch_subscription_device_by_token(subscription_token: str, platform: str, d
 
 
 def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
-    access_revoked: Optional[Dict[str, Any]] = None
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute("DELETE FROM devices WHERE user_id = %s AND id = %s RETURNING *", (user_id, device_id))
             row = cur.fetchone()
-        if row:
-            access_revoked = revoke_user_access_credentials(user_id, conn=conn)
         conn.commit()
     if row:
-        payload = {
-            "platform": row.get("platform"),
-            "device_name": row.get("device_name"),
-        }
-        if access_revoked:
-            payload["access_revoked"] = True
-            payload["rotated_credentials"] = int(access_revoked.get("rotated_credentials") or 0)
+        deleted = dict(row)
+        revoke_device_fingerprint(
+            int(user_id),
+            str(deleted.get("device_fingerprint") or "").strip(),
+            platform=deleted.get("platform"),
+            device_name=deleted.get("device_name"),
+        )
+        rotate_user_access_credentials(int(user_id))
         enqueue_notification(
             user_id=user_id,
             event_type="device_removed",
             unique_key=f"device_removed:{row['id']}:{int(datetime.now(timezone.utc).timestamp())}",
-            payload=payload,
+            payload={
+                "platform": row.get("platform"),
+                "device_name": row.get("device_name"),
+            },
         )
-        return dict(row)
+        return deleted
     return None
 
 
