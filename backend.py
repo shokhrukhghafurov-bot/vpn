@@ -3543,9 +3543,17 @@ def _build_subscription_device_fingerprint(request: Request, token: str, client_
 
 
 def _mint_subscription_client_id(request: Request, token: str) -> str:
-    ua = str(request.headers.get("user-agent") or "").strip()
-    platform, _ = _detect_device_platform_and_name(request)
-    seed = f"{token}|{platform}|{ua}|{uuid4().hex}"
+    # Keep the subscription source stable for the same physical device.
+    # V2RayTun/Happ treats different client_id values as separate imports,
+    # so a random client_id creates duplicate accounts/sources inside one app.
+    platform, device_name = _detect_device_platform_and_name(request)
+    fingerprint_source = _subscription_fingerprint_source(request, token)
+    if fingerprint_source:
+        source, source_kind = fingerprint_source
+        seed = f"stable-sub-cid:v2:{token}:{platform}:{device_name}:{source_kind}:{source}"
+    else:
+        ua = str(request.headers.get("user-agent") or "").strip()
+        seed = f"stable-sub-cid:v2:{token}:{platform}:{device_name}:{ua}"
     return "cid-" + hashlib.sha256(seed.encode("utf-8")).hexdigest()[:24]
 
 
@@ -4283,7 +4291,7 @@ def open_app_bridge(
       const userAgent = navigator.userAgent || '';
       const isAndroid = /Android/i.test(userAgent);
       const isIOS = /iPhone|iPad|iPod/i.test(userAgent);
-      const forceRenewClientId = /(?:[?&])renew=1(?:&|$)/.test(window.location.search);
+      const forceRenewClientId = false;
       let hiddenAt = 0;
 
       const markHidden = function () {{
