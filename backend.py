@@ -4064,6 +4064,9 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 )
                 return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
 
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
+
     if not head_only and not _subscription_browser_preview_request(request):
         _track_subscription_device_access(request, token, access)
 
@@ -4114,8 +4117,6 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         moved_permanently_to_url=moved_permanently_to_url,
         content_version=content_version,
     )
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
-    user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
     suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
     content = "\n".join(lines) + "\n" if suppress_inline_headers else "\n".join(inline_headers + lines) + "\n"
     response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
