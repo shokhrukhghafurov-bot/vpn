@@ -492,8 +492,87 @@ def _payload_probe_ready(payload: Dict[str, Any]) -> bool:
     return bool(_probe_runtime_uuid(payload))
 
 
+def _extract_probe_fields_from_raw_xray_config(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = payload.get("raw_xray_config") or payload.get("rawXrayConfig")
+    if not raw:
+        return {}
+    try:
+        parsed = json.loads(raw) if isinstance(raw, str) else dict(raw)
+    except Exception:
+        return {}
+    outbounds = parsed.get("outbounds") if isinstance(parsed, dict) else None
+    if not isinstance(outbounds, list):
+        return {}
+    proxy = None
+    for item in outbounds:
+        if isinstance(item, dict) and str(item.get("tag") or "").strip().lower() == "proxy":
+            proxy = item
+            break
+    if not isinstance(proxy, dict):
+        return {}
+    stream = proxy.get("streamSettings") if isinstance(proxy.get("streamSettings"), dict) else {}
+    security = str(stream.get("security") or "").strip().lower()
+    result: Dict[str, Any] = {}
+    settings = proxy.get("settings") if isinstance(proxy.get("settings"), dict) else {}
+    vnext = settings.get("vnext") if isinstance(settings.get("vnext"), list) else []
+    if vnext and isinstance(vnext[0], dict):
+        node = vnext[0]
+        if node.get("address"):
+            result["server"] = str(node.get("address") or "").strip()
+        if node.get("port"):
+            result["port"] = int(node.get("port") or 0)
+        users = node.get("users") if isinstance(node.get("users"), list) else []
+        if users and isinstance(users[0], dict):
+            user = users[0]
+            if user.get("id"):
+                result["uuid"] = str(user.get("id") or "").strip()
+            if user.get("flow"):
+                result["flow"] = str(user.get("flow") or "").strip()
+    if stream.get("network"):
+        result["transport"] = str(stream.get("network") or "").strip()
+    if security:
+        result["security"] = security
+    if security == "reality":
+        reality = stream.get("realitySettings") if isinstance(stream.get("realitySettings"), dict) else {}
+        if reality.get("serverName"):
+            result["server_name"] = str(reality.get("serverName") or "").strip()
+            result["sni"] = result["server_name"]
+        if reality.get("publicKey"):
+            result["public_key"] = str(reality.get("publicKey") or "").strip()
+            result["publicKey"] = result["public_key"]
+        if reality.get("shortId"):
+            result["short_id"] = str(reality.get("shortId") or "").strip()
+            result["shortId"] = result["short_id"]
+    elif security == "tls":
+        tls = stream.get("tlsSettings") if isinstance(stream.get("tlsSettings"), dict) else {}
+        if tls.get("serverName"):
+            result["server_name"] = str(tls.get("serverName") or "").strip()
+            result["sni"] = result["server_name"]
+    grpc = stream.get("grpcSettings") if isinstance(stream.get("grpcSettings"), dict) else {}
+    if grpc.get("serviceName"):
+        result["service_name"] = str(grpc.get("serviceName") or "").strip()
+        result["serviceName"] = result["service_name"]
+    ws = stream.get("wsSettings") if isinstance(stream.get("wsSettings"), dict) else {}
+    if ws.get("path"):
+        result["path"] = str(ws.get("path") or "").strip()
+    headers = ws.get("headers") if isinstance(ws.get("headers"), dict) else {}
+    if headers.get("Host"):
+        result["host"] = str(headers.get("Host") or "").strip()
+    xhttp = stream.get("xhttpSettings") if isinstance(stream.get("xhttpSettings"), dict) else {}
+    if xhttp.get("path") and not result.get("path"):
+        result["path"] = str(xhttp.get("path") or "").strip()
+    if xhttp.get("host") and not result.get("host"):
+        result["host"] = str(xhttp.get("host") or "").strip()
+    return result
+
+
 def _payload_for_real_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
+    raw_fields = _extract_probe_fields_from_raw_xray_config(normalized)
+    for key, value in raw_fields.items():
+        current = normalized.get(key)
+        if current in (None, "", [], {}):
+            normalized[key] = value
     runtime_uuid = _probe_runtime_uuid(normalized)
     if runtime_uuid:
         normalized["uuid"] = runtime_uuid
@@ -791,6 +870,86 @@ def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
     return code.startswith("ru-lte")
 
 
+def _probe_runner_geodata_paths() -> Dict[str, Optional[str]]:
+    runner_name, runner_bin = _resolve_probe_runner()
+    base_dir = str(Path(runner_bin).resolve().parent) if runner_bin else "/usr/local/bin"
+    if not base_dir:
+        base_dir = "/usr/local/bin"
+    geoip_path = str(getattr(settings, "VPN_REAL_PROBE_GEOIP_DAT", "") or "").strip()
+    geosite_path = str(getattr(settings, "VPN_REAL_PROBE_GEOSITE_DAT", "") or "").strip()
+    if not geoip_path:
+        geoip_path = str(Path(base_dir) / "geoip.dat")
+    if not geosite_path:
+        geosite_path = str(Path(base_dir) / "geosite.dat")
+    return {
+        "runner": runner_name,
+        "geoip": geoip_path if Path(geoip_path).is_file() else None,
+        "geosite": geosite_path if Path(geosite_path).is_file() else None,
+    }
+
+
+def _probe_private_ip_cidrs() -> List[str]:
+    return [
+        "127.0.0.0/8",
+        "10.0.0.0/8",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "169.254.0.0/16",
+        "100.64.0.0/10",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+    ]
+
+
+def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not _payload_direct_ru_enabled(payload):
+        return []
+    paths = _probe_runner_geodata_paths()
+    private_cidrs = _probe_private_ip_cidrs()
+    rules: List[Dict[str, Any]] = [
+        {
+            "type": "field",
+            "ip": private_cidrs,
+            "outboundTag": "direct",
+        },
+        {
+            "type": "field",
+            "domain": _ru_split_domain_patterns(payload),
+            "outboundTag": "direct",
+        },
+    ]
+    if paths.get("geoip"):
+        rules.insert(1, {
+            "type": "field",
+            "ip": ["geoip:ru"],
+            "outboundTag": "direct",
+        })
+    if paths.get("geosite"):
+        rules.insert(2 if paths.get("geoip") else 1, {
+            "type": "field",
+            "domain": ["geosite:ru"],
+            "outboundTag": "direct",
+        })
+    return rules
+
+
+def _singbox_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
+    if not _payload_direct_ru_enabled(payload):
+        return []
+    paths = _probe_runner_geodata_paths()
+    suffixes = [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()]
+    rules: List[Dict[str, Any]] = [
+        {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
+        {"domain_suffix": suffixes, "outbound": "direct"},
+    ]
+    if paths.get("geoip"):
+        rules.insert(1, {"geoip": ["ru"], "outbound": "direct"})
+    if paths.get("geosite"):
+        rules.insert(2 if paths.get("geoip") else 1, {"geosite": ["ru"], "outbound": "direct"})
+    return rules
+
+
 def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
     transport = _payload_transport(payload)
     security = _payload_security(payload)
@@ -909,18 +1068,7 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
         ],
         "routing": {
             "domainStrategy": "IPIfNonMatch",
-            "rules": ([
-                {
-                    "type": "field",
-                    "ip": ["geoip:private", "geoip:loopback", "geoip:ru"],
-                    "outboundTag": "direct",
-                },
-                {
-                    "type": "field",
-                    "domain": ["geosite:ru"] + _ru_split_domain_patterns(payload),
-                    "outboundTag": "direct",
-                },
-            ] if _payload_direct_ru_enabled(payload) else []),
+            "rules": _xray_ru_split_rules(payload),
         },
     }
 
@@ -1012,11 +1160,7 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
         ],
         "route": {
             "auto_detect_interface": True,
-            "rules": ([
-                {"geoip": ["private", "ru"], "outbound": "direct"},
-                {"geosite": ["ru"], "outbound": "direct"},
-                {"domain_suffix": [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()], "outbound": "direct"},
-            ] if _payload_direct_ru_enabled(payload) else []),
+            "rules": _singbox_ru_split_rules(payload),
             "final": "proxy",
         },
     }
