@@ -409,6 +409,8 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
         "dns_servers": ["1.1.1.1", "8.8.8.8"],
         "connect_mode": (query.get("connectMode") or query.get("connect_mode") or "tun").strip() or "tun",
         "full_tunnel": str(query.get("fullTunnel") or query.get("full_tunnel") or "1").strip().lower() not in {"0", "false", "no", "off"},
+        "route_mode": (query.get("routeMode") or query.get("route_mode") or "").strip(),
+        "direct_ru": str(query.get("directRu") or query.get("direct_ru") or "").strip().lower() in {"1", "true", "yes", "on"},
     }
     if query.get("mode"):
         payload["mode"] = query.get("mode")
@@ -416,7 +418,27 @@ def _parse_vless_subscription_line(line: str) -> Optional[Dict[str, Any]]:
         payload["host"] = query.get("host")
     if query.get("alpn"):
         payload["alpn"] = [item.strip() for item in str(query.get("alpn") or "").split(",") if item.strip()]
+    if query.get("directDomains") or query.get("direct_domains"):
+        payload["direct_domains"] = [
+            item.strip()
+            for item in str(query.get("directDomains") or query.get("direct_domains") or "").split(",")
+            if item.strip()
+        ]
     return _normalize_vpn_payload_keys(payload)
+
+
+def _subscription_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
 
 
 def _transport_allowed(payload: Dict[str, Any], allowed_values: List[str]) -> bool:
@@ -744,6 +766,31 @@ def _wait_for_local_socks_port(port: int, timeout_sec: float) -> bool:
     return False
 
 
+def _ru_split_domain_patterns(payload: Dict[str, Any]) -> List[str]:
+    raw_values = payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]
+    patterns: List[str] = []
+    for item in raw_values:
+        text = str(item or "").strip().lower()
+        if not text:
+            continue
+        if text.startswith("."):
+            escaped = text.replace(".", r"\.")
+            patterns.append(f"regexp:.*{escaped}$")
+        else:
+            patterns.append(text)
+    return patterns or [r"regexp:.*\.ru$", r"regexp:.*\.su$", r"regexp:.*\.xn--p1ai$"]
+
+
+def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
+    route_mode = str(payload.get("route_mode") or "").strip().lower()
+    if route_mode == "split":
+        return True
+    if payload.get("direct_ru") is True:
+        return True
+    code = str(payload.get("location_code") or payload.get("locationCode") or "").strip().lower()
+    return code.startswith("ru-lte")
+
+
 def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) -> Dict[str, Any]:
     transport = _payload_transport(payload)
     security = _payload_security(payload)
@@ -848,10 +895,32 @@ def _build_xray_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int) ->
                     ]
                 },
                 "streamSettings": stream_settings,
+            },
+            {
+                "tag": "direct",
+                "protocol": "freedom",
+                "settings": {},
+            },
+            {
+                "tag": "block",
+                "protocol": "blackhole",
+                "settings": {},
             }
         ],
         "routing": {
-            "domainStrategy": "AsIs",
+            "domainStrategy": "IPIfNonMatch",
+            "rules": ([
+                {
+                    "type": "field",
+                    "ip": ["geoip:private", "geoip:loopback", "geoip:ru"],
+                    "outboundTag": "direct",
+                },
+                {
+                    "type": "field",
+                    "domain": ["geosite:ru"] + _ru_split_domain_patterns(payload),
+                    "outboundTag": "direct",
+                },
+            ] if _payload_direct_ru_enabled(payload) else []),
         },
     }
 
@@ -943,6 +1012,11 @@ def _build_singbox_ru_lte_probe_config(payload: Dict[str, Any], socks_port: int)
         ],
         "route": {
             "auto_detect_interface": True,
+            "rules": ([
+                {"geoip": ["private", "ru"], "outbound": "direct"},
+                {"geosite": ["ru"], "outbound": "direct"},
+                {"domain_suffix": [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()], "outbound": "direct"},
+            ] if _payload_direct_ru_enabled(payload) else []),
             "final": "proxy",
         },
     }
@@ -2641,9 +2715,12 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append(f"connect_mode must be tun, got {connect_mode or 'empty'}")
         fixes.append("Set connect_mode=tun.")
 
-    if full_tunnel is False:
+    ru_split_profile = str(payload.get("route_mode") or "").strip().lower() == "split" and _diagnostic_bool(payload.get("direct_ru")) is True
+    if full_tunnel is False and not ru_split_profile:
         issues.append("full_tunnel is disabled")
         fixes.append("Set full_tunnel=true for full-device routing.")
+    elif full_tunnel is False and ru_split_profile:
+        fixes.append("RU LTE split profile detected: full_tunnel=false is acceptable because RU/private traffic should go direct and blocked external traffic should go via VPN.")
 
     if not dns_servers or any(_diagnostic_placeholder(item) for item in dns_servers):
         issues.append("dns_servers is empty or still contains placeholders")
@@ -3762,7 +3839,10 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
         "alpn": ",".join(str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()),
         "packetEncoding": normalized.get("packet_encoding") or normalized.get("packetEncoding"),
         "connectMode": normalized.get("connect_mode") or normalized.get("connectMode"),
-        "fullTunnel": "1" if bool(normalized.get("full_tunnel", True)) else "0",
+        "fullTunnel": "1" if _subscription_bool(normalized.get("full_tunnel", True), True) else "0",
+        "routeMode": normalized.get("route_mode"),
+        "directRu": "1" if _subscription_bool(normalized.get("direct_ru"), False) else "0" if normalized.get("direct_ru") is not None else None,
+        "directDomains": ",".join(str(item).strip() for item in (normalized.get("direct_domains") or []) if str(item).strip()),
     }
     for key, value in optional_keys.items():
         text = str(value or "").strip()
