@@ -901,6 +901,55 @@ def _probe_private_ip_cidrs() -> List[str]:
         "fe80::/10",
     ]
 
+def _probe_geo_assets_available() -> bool:
+    paths = _probe_runner_geodata_paths()
+    return bool(paths.get("geoip") and paths.get("geosite"))
+
+
+def _sanitize_probe_config_for_missing_geoassets(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Remove geoip/geosite-based routing rules when geodata files are unavailable."""
+    if _probe_geo_assets_available():
+        return config
+    try:
+        routing = config.get("routing") if isinstance(config, dict) else None
+        rules = routing.get("rules") if isinstance(routing, dict) else None
+        if isinstance(rules, list):
+            sanitized_rules = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    sanitized_rules.append(rule)
+                    continue
+                has_geo = False
+                for key in ("ip", "domain", "geoip", "geosite"):
+                    value = rule.get(key)
+                    if isinstance(value, list) and any(isinstance(item, str) and ("geoip:" in item or "geosite:" in item) for item in value):
+                        has_geo = True
+                        break
+                    if isinstance(value, str) and ("geoip:" in value or "geosite:" in value):
+                        has_geo = True
+                        break
+                    if key in {"geoip", "geosite"} and value:
+                        has_geo = True
+                        break
+                if not has_geo:
+                    sanitized_rules.append(rule)
+            routing["rules"] = sanitized_rules
+        route_obj = config.get("route") if isinstance(config, dict) else None
+        rules = route_obj.get("rules") if isinstance(route_obj, dict) else None
+        if isinstance(rules, list):
+            sanitized_rules = []
+            for rule in rules:
+                if not isinstance(rule, dict):
+                    sanitized_rules.append(rule)
+                    continue
+                if rule.get("geoip") or rule.get("geosite"):
+                    continue
+                sanitized_rules.append(rule)
+            route_obj["rules"] = sanitized_rules
+    except Exception:
+        return config
+    return config
+
 
 def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _payload_direct_ru_enabled(payload):
@@ -1337,20 +1386,22 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
     failures: List[str] = []
     with tempfile.TemporaryDirectory(prefix=f"inet_{pool}_probe_") as temp_dir:
         config_path = Path(temp_dir) / "config.json"
+        geo_assets_available = _probe_geo_assets_available()
         if runner_name == "singbox":
             config_payload = _build_singbox_ru_lte_probe_config(probe_payload, socks_port)
             command = [runner_bin, "run", "-c", str(config_path)]
         else:
             config_payload = _build_xray_ru_lte_probe_config(probe_payload, socks_port)
             command = [runner_bin, "-config", str(config_path)]
+        config_payload = _sanitize_probe_config_for_missing_geoassets(config_payload)
         config_path.write_text(json.dumps(config_payload, ensure_ascii=False, indent=2), encoding="utf-8")
         try:
             process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
             if not _wait_for_local_socks_port(socks_port, startup_timeout):
                 if process.poll() is not None:
                     stdout_tail = (process.stdout.read() if process.stdout else "").strip()[-700:]
-                    return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real"}
-                return {"ok": False, "latency_ms": None, "error": "socks_not_ready", "method": f"{runner_name}_real"}
+                    return {"ok": False, "latency_ms": None, "error": f"{runner_name}_exit:{process.returncode}:{stdout_tail or 'startup_failed'}", "method": f"{runner_name}_real", "geo_assets": geo_assets_available}
+                return {"ok": False, "latency_ms": None, "error": "socks_not_ready", "method": f"{runner_name}_real", "geo_assets": geo_assets_available}
             if warmup_ms > 0:
                 time.sleep(warmup_ms / 1000.0)
             for label, url in targets:
@@ -1368,6 +1419,7 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                             "probe_url": primary_url,
                             "probe_labels_ok": [item[0] for item in successes],
                             "probe_urls_ok": [item[1] for item in successes],
+                            "geo_assets": geo_assets_available,
                         }
                 else:
                     failures.append(f"{label}:{result.get('error') or 'probe_failed'}")
@@ -1379,11 +1431,12 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                 "method": f"{runner_name}_real",
                 "probe_labels_ok": [item[0] for item in successes],
                 "probe_urls_ok": [item[1] for item in successes],
+                "geo_assets": geo_assets_available,
             }
         except subprocess.TimeoutExpired:
-            return {"ok": False, "latency_ms": None, "error": "real_probe_timeout", "method": f"{runner_name}_real"}
+            return {"ok": False, "latency_ms": None, "error": "real_probe_timeout", "method": f"{runner_name}_real", "geo_assets": geo_assets_available}
         except Exception as exc:
-            return {"ok": False, "latency_ms": None, "error": f"real_probe_exception:{exc}", "method": f"{runner_name}_real"}
+            return {"ok": False, "latency_ms": None, "error": f"real_probe_exception:{exc}", "method": f"{runner_name}_real", "geo_assets": geo_assets_available}
         finally:
             if process is not None:
                 try:
