@@ -984,7 +984,7 @@ def _antiblock_sni_pool_for_code(code: str) -> List[str]:
     if not pool:
         pool = list(getattr(settings, "VLESS_ANTI_BLOCK_SNI_POOL", []) or [])
     cleaned = [str(item or "").strip() for item in pool if str(item or "").strip()]
-    return cleaned or ["www.cloudflare.com", "www.cloudflare-dns.com", "cp.cloudflare.com", "cdn.cloudflare.com"]
+    return cleaned
 
 
 def _choose_antiblock_sni(payload: Dict[str, Any], code: str) -> str:
@@ -1016,7 +1016,8 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized["transport"] = transport
     normalized["network"] = transport
 
-    selected_sni = _choose_antiblock_sni(normalized, code)
+    explicit_sni = str(normalized.get("server_name") or normalized.get("sni") or "").strip()
+    selected_sni = explicit_sni or _choose_antiblock_sni(normalized, code)
     normalized["server_name"] = selected_sni
     normalized["sni"] = selected_sni
     normalized.setdefault("fingerprint", "chrome")
@@ -1024,7 +1025,7 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized["domain_resolver"] = str(normalized.get("domain_resolver") or normalized.get("domainResolver") or "dns-remote").strip() or "dns-remote"
     normalized["packet_encoding"] = str(normalized.get("packet_encoding") or normalized.get("packetEncoding") or "xudp").strip() or "xudp"
     normalized["connect_mode"] = str(normalized.get("connect_mode") or normalized.get("connectMode") or "tun").strip() or "tun"
-    normalized["full_tunnel"] = True
+    normalized["full_tunnel"] = _coerce_runtime_bool(normalized.get("full_tunnel", normalized.get("fullTunnel", True)), True)
     normalized["dns_servers"] = [str(item or "").strip() for item in (normalized.get("dns_servers") or normalized.get("dnsServers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()] or ["1.1.1.1", "8.8.8.8"]
     normalized["dnsServers"] = list(normalized["dns_servers"])
 
@@ -1057,6 +1058,10 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
 
     if code.startswith("ru-lte"):
         normalized["anti_block_profile"] = "lte"
+        normalized["route_mode"] = str(normalized.get("route_mode") or "split").strip() or "split"
+        normalized["direct_ru"] = _coerce_runtime_bool(normalized.get("direct_ru", True), True)
+        normalized["direct_domains"] = [str(item or "").strip() for item in (normalized.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item or "").strip()] or [".ru", ".su", ".xn--p1ai"]
+        normalized["full_tunnel"] = False
     else:
         normalized["anti_block_profile"] = "global"
     normalized["location_code"] = normalized.get("location_code") or code
