@@ -3779,6 +3779,21 @@ def _hiddify_subscription_transport_allowed(payload: Dict[str, Any]) -> bool:
     return transport in allowed if allowed else True
 
 
+def _subscription_transport_allowed(payload: Dict[str, Any], client_hint: Optional[str] = None) -> bool:
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower()
+    client = str(client_hint or "").strip().lower()
+
+    if client == "hiddify":
+        return _hiddify_subscription_transport_allowed(payload)
+
+    allowed = {
+        item.strip().lower()
+        for item in (settings.BLACK_ALLOWED_TRANSPORTS or ["grpc", "tcp", "ws", "xhttp"])
+        if str(item or "").strip()
+    }
+    return transport in allowed if allowed else True
+
+
 def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     code = str(row.get("code") or "").strip()
     resolved_row = dict(row)
@@ -3814,20 +3829,21 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
 
 
 def _subscription_publish_dedupe_key(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
-    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
     row_code = str(row.get("code") or "").strip().lower()
-    resolved_code = str(
-        normalized.get("resolved_location_code")
+    if row_code:
+        return row_code
+
+    normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
+    return str(
+        normalized.get("location_code")
+        or normalized.get("resolved_location_code")
         or normalized.get("credential_location_code")
-        or normalized.get("location_code")
-        or row_code
         or ""
     ).strip().lower()
-    return resolved_code or row_code
 
 
 
-def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str, Any]]:
+def _subscription_location_rows(user_id: Optional[int] = None, client_hint: Optional[str] = None) -> List[Dict[str, Any]]:
     public_rows = _public_location_rows()
 
     def collect(*, strict_health: bool) -> List[Dict[str, Any]]:
@@ -3838,15 +3854,16 @@ def _subscription_location_rows(user_id: Optional[int] = None) -> List[Dict[str,
             if not _subscription_row_allowed_for_publish(base_row, user_id=user_id, strict_health=strict_health):
                 continue
             payload, _ = _subscription_payload_and_fallback_name(base_row, user_id=user_id)
-            if not payload or not _hiddify_subscription_transport_allowed(payload):
+            if not payload or not _subscription_transport_allowed(payload, client_hint):
                 continue
             publish_key = _subscription_publish_dedupe_key(base_row, payload)
             if publish_key and publish_key in seen_publish_keys:
                 logger.info(
-                    "[sub][dedupe] skip_duplicate_row code=%s resolved=%s user_id=%s",
+                    "[sub][dedupe] skip_duplicate_row code=%s publish_key=%s user_id=%s client=%s",
                     str(base_row.get("code") or "-") or "-",
                     publish_key,
                     user_id if user_id is not None else "-",
+                    str(client_hint or "-") or "-",
                 )
                 continue
             if publish_key:
@@ -4050,7 +4067,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     if not head_only and not _subscription_browser_preview_request(request):
         _track_subscription_device_access(request, token, access)
 
-    rows = _subscription_location_rows(subscription_user_id)
+    rows = _subscription_location_rows(subscription_user_id, client_hint=client_hint)
     lines: List[str] = []
     for row in rows:
         payload_for_subscription, fallback_name = _subscription_payload_and_fallback_name(dict(row), user_id=subscription_user_id)
