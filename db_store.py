@@ -1072,6 +1072,267 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
+    route_mode = str(payload.get("route_mode") or "").strip().lower()
+    if route_mode == "split":
+        return True
+    value = payload.get("direct_ru")
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    code = str(payload.get("location_code") or payload.get("locationCode") or payload.get("resolved_location_code") or "").strip().lower()
+    return code.startswith("ru-lte")
+
+
+def _default_direct_domains(payload: Dict[str, Any]) -> List[str]:
+    values = payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]
+    result = [str(item or "").strip() for item in values if str(item or "").strip()]
+    return result or [".ru", ".su", ".xn--p1ai"]
+
+
+def _default_xray_private_ip_rules() -> List[str]:
+    return ["geoip:private", "geoip:loopback"]
+
+
+def _xray_direct_domain_rules(payload: Dict[str, Any]) -> List[str]:
+    rules: List[str] = []
+    for suffix in _default_direct_domains(payload):
+        cleaned = str(suffix or "").strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("."):
+            cleaned = cleaned[1:]
+        if cleaned:
+            rules.append(f"domain:{cleaned}")
+    return rules
+
+
+def _extract_proxy_outbound_from_raw(payload: Dict[str, Any]) -> Dict[str, Any]:
+    raw = payload.get("raw_xray_config") or payload.get("rawXrayConfig")
+    parsed = _parse_json_object_if_possible(raw)
+    if not isinstance(parsed, dict):
+        return {}
+    outbounds = parsed.get("outbounds")
+    if not isinstance(outbounds, list):
+        return {}
+    for outbound in outbounds:
+        if isinstance(outbound, dict) and str(outbound.get("tag") or "").strip().lower() == "proxy":
+            return dict(outbound)
+    for outbound in outbounds:
+        if isinstance(outbound, dict) and str(outbound.get("protocol") or "").strip().lower() == "vless":
+            return dict(outbound)
+    return {}
+
+
+def _build_canonical_xray_stream_settings(payload: Dict[str, Any], *, existing_proxy: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower() or "tcp"
+    network = "ws" if transport == "websocket" else transport
+    security = str(payload.get("security") or "reality").strip().lower() or "reality"
+    server_name = str(payload.get("server_name") or payload.get("sni") or payload.get("host") or "").strip()
+    existing_stream = existing_proxy.get("streamSettings") if isinstance(existing_proxy, dict) and isinstance(existing_proxy.get("streamSettings"), dict) else {}
+    stream_settings: Dict[str, Any] = {"network": network}
+    if security == "reality":
+        reality = existing_stream.get("realitySettings") if isinstance(existing_stream.get("realitySettings"), dict) else {}
+        stream_settings["security"] = "reality"
+        stream_settings["realitySettings"] = {
+            "show": bool(reality.get("show", False)),
+            "serverName": server_name,
+            "fingerprint": str(payload.get("fingerprint") or reality.get("fingerprint") or "chrome").strip() or "chrome",
+            "publicKey": str(payload.get("public_key") or payload.get("publicKey") or reality.get("publicKey") or "").strip(),
+            "shortId": str(payload.get("short_id") or payload.get("shortId") or reality.get("shortId") or "").strip(),
+            "spiderX": str(payload.get("spider_x") or payload.get("spiderX") or reality.get("spiderX") or "").strip(),
+        }
+        if not stream_settings["realitySettings"]["spiderX"]:
+            if network in {"grpc", "xhttp", "ws"}:
+                stream_settings["realitySettings"]["spiderX"] = "/"
+            else:
+                fallback_path = str(payload.get("path") or "/").strip() or "/"
+                stream_settings["realitySettings"]["spiderX"] = fallback_path if fallback_path.startswith("/") else f"/{fallback_path.lstrip('/')}"
+    elif security == "tls":
+        tls = existing_stream.get("tlsSettings") if isinstance(existing_stream.get("tlsSettings"), dict) else {}
+        stream_settings["security"] = "tls"
+        tls_settings: Dict[str, Any] = {
+            "serverName": server_name,
+            "allowInsecure": bool(payload.get("allow_insecure") or payload.get("allowInsecure") or tls.get("allowInsecure") or False),
+        }
+        alpn = [str(item or "").strip() for item in (payload.get("alpn") or tls.get("alpn") or []) if str(item or "").strip()]
+        if alpn:
+            tls_settings["alpn"] = alpn
+        stream_settings["tlsSettings"] = tls_settings
+    else:
+        stream_settings["security"] = "none"
+
+    if network == "grpc":
+        grpc_existing = existing_stream.get("grpcSettings") if isinstance(existing_stream.get("grpcSettings"), dict) else {}
+        grpc_settings: Dict[str, Any] = {
+            "serviceName": str(payload.get("service_name") or payload.get("serviceName") or grpc_existing.get("serviceName") or "").strip(),
+            "multiMode": bool(grpc_existing.get("multiMode", False)),
+        }
+        authority = str(payload.get("authority") or grpc_existing.get("authority") or "").strip()
+        if authority:
+            grpc_settings["authority"] = authority
+        stream_settings["grpcSettings"] = grpc_settings
+    elif network == "ws":
+        ws_existing = existing_stream.get("wsSettings") if isinstance(existing_stream.get("wsSettings"), dict) else {}
+        ws_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or ws_existing.get("path") or "/").strip() or "/",
+        }
+        host = str(payload.get("host") or ws_existing.get("headers", {}).get("Host") or server_name or "").strip()
+        if host:
+            ws_settings["headers"] = {"Host": host}
+        stream_settings["wsSettings"] = ws_settings
+    elif network == "xhttp":
+        xhttp_existing = existing_stream.get("xhttpSettings") if isinstance(existing_stream.get("xhttpSettings"), dict) else {}
+        xhttp_settings: Dict[str, Any] = {
+            "path": str(payload.get("path") or xhttp_existing.get("path") or "/").strip() or "/",
+            "mode": str(payload.get("mode") or xhttp_existing.get("mode") or "auto").strip() or "auto",
+        }
+        host = str(payload.get("host") or xhttp_existing.get("host") or server_name or "").strip()
+        if host:
+            xhttp_settings["host"] = host
+        for key, value in xhttp_existing.items():
+            if key not in xhttp_settings and value not in (None, "", [], {}):
+                xhttp_settings[key] = value
+        stream_settings["xhttpSettings"] = xhttp_settings
+    return stream_settings
+
+
+def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    protocol = str(payload.get("protocol") or "vless").strip().lower() or "vless"
+    server = str(payload.get("server") or "").strip()
+    uuid = str(payload.get("uuid") or payload.get("id") or "").strip()
+    try:
+        port = int(payload.get("port") or payload.get("server_port") or 0)
+    except (TypeError, ValueError):
+        port = 0
+    if protocol != "vless" or not server or port <= 0 or not uuid:
+        return None
+
+    existing_proxy = _extract_proxy_outbound_from_raw(payload)
+    transport = str(payload.get("transport") or payload.get("network") or "tcp").strip().lower() or "tcp"
+    user: Dict[str, Any] = {
+        "id": uuid,
+        "encryption": str(payload.get("encryption") or "none").strip() or "none",
+    }
+    flow = str(payload.get("flow") or "").strip()
+    if flow:
+        user["flow"] = flow
+
+    dns_servers = [str(item or "").strip() for item in (payload.get("dns_servers") or payload.get("dnsServers") or ["1.1.1.1", "8.8.8.8"]) if str(item or "").strip()]
+    if not dns_servers:
+        dns_servers = ["1.1.1.1", "8.8.8.8"]
+
+    routing_rules: List[Dict[str, Any]] = [
+        {"type": "field", "ip": [server], "outboundTag": "direct"},
+        {"type": "field", "ip": _default_xray_private_ip_rules(), "outboundTag": "direct"},
+        {"type": "field", "domain": ["domain:localhost"], "outboundTag": "direct"},
+        {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
+    ]
+    if _payload_direct_ru_enabled(payload):
+        routing_rules.insert(1, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
+        domain_rules = ["geosite:ru"] + _xray_direct_domain_rules(payload)
+        routing_rules.insert(2, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
+
+    config: Dict[str, Any] = {
+        "dns": {"queryStrategy": "UseIP", "servers": dns_servers},
+        "inbounds": [
+            {
+                "listen": "127.0.0.1",
+                "port": 10808,
+                "protocol": "socks",
+                "settings": {"auth": "noauth", "udp": True},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False},
+                "tag": "socks",
+            },
+            {
+                "listen": "127.0.0.1",
+                "port": 10809,
+                "protocol": "http",
+                "settings": {"allowTransparent": False},
+                "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"], "routeOnly": False},
+                "tag": "http",
+            },
+            {
+                "listen": "::1",
+                "port": 1080,
+                "protocol": "socks",
+                "settings": {"udp": True},
+                "tag": "socks-internal",
+            },
+        ],
+        "meta": None,
+        "outbounds": [
+            {
+                "protocol": protocol,
+                "tag": "proxy",
+                "settings": {
+                    "vnext": [{
+                        "address": server,
+                        "port": port,
+                        "users": [user],
+                    }]
+                },
+                "streamSettings": _build_canonical_xray_stream_settings(payload, existing_proxy=existing_proxy),
+            },
+            {"protocol": "freedom", "tag": "direct", "settings": {"domainStrategy": "AsIs"}},
+            {"protocol": "blackhole", "tag": "block"},
+        ],
+        "remarks": str(payload.get("remark") or payload.get("display_name") or payload.get("location_code") or "").strip(),
+        "routing": {
+            "domainMatcher": "hybrid",
+            "domainStrategy": "IPIfNonMatch",
+            "rules": routing_rules,
+        },
+    }
+    return config
+
+
+def _canonicalize_payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    if not normalized:
+        return {}
+
+    canonical_code = str(
+        normalized.get("resolved_location_code")
+        or normalized.get("location_code")
+        or normalized.get("locationCode")
+        or normalized.get("code")
+        or ""
+    ).strip()
+    if canonical_code:
+        normalized["location_code"] = canonical_code
+        normalized["locationCode"] = canonical_code
+        normalized.setdefault("resolved_location_code", canonical_code)
+
+    canonical_country = str(
+        normalized.get("resolved_country_code")
+        or normalized.get("country_code")
+        or ""
+    ).strip().upper()
+    if canonical_country:
+        normalized["country_code"] = canonical_country
+        normalized["resolved_country_code"] = canonical_country
+
+    canonical_name = str(normalized.get("remark") or normalized.get("display_name") or "").strip()
+    if canonical_name:
+        normalized["display_name"] = canonical_name
+        normalized["remark"] = canonical_name
+
+    rebuilt_raw = _build_canonical_raw_xray_config(normalized)
+    if rebuilt_raw:
+        raw_text = json.dumps(rebuilt_raw, ensure_ascii=False)
+        normalized["raw_xray_config"] = raw_text
+        normalized["rawXrayConfig"] = raw_text
+
+    if isinstance(normalized.get("direct_domains"), list):
+        normalized["direct_domains"] = [str(item or "").strip() for item in normalized.get("direct_domains") if str(item or "").strip()]
+
+    return normalized
+
+
 def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
     if not normalized:
@@ -1163,7 +1424,8 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
     if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
         normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
-    return _apply_anti_block_profile(_apply_admin_mobile_defaults(normalized))
+    normalized = _apply_anti_block_profile(_apply_admin_mobile_defaults(normalized))
+    return _canonicalize_payload_metadata(normalized)
 
 
 def _normalize_location_access_mode(value: Any) -> str:
@@ -1267,13 +1529,20 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
         return {}
 
     payload = _apply_location_access_mode(payload, _extract_location_access_mode(row, payload))
-    payload.setdefault("location_code", requested_location_code or row.get("code"))
-    payload.setdefault("resolved_location_code", row.get("code"))
-    payload.setdefault("country_code", row.get("country_code"))
-    payload.setdefault("resolved_country_code", row.get("country_code"))
-    payload.setdefault("remark", row.get("name_en") or row.get("name_ru") or row.get("code"))
-    payload.setdefault("display_name", row.get("name_en") or row.get("name_ru") or row.get("code"))
-    return payload
+    canonical_code = str(requested_location_code or row.get("code") or payload.get("location_code") or payload.get("locationCode") or "").strip()
+    canonical_name = str(row.get("name_en") or row.get("name_ru") or canonical_code or payload.get("remark") or payload.get("display_name") or "").strip()
+    canonical_country = str(row.get("country_code") or payload.get("country_code") or payload.get("resolved_country_code") or "").strip().upper()
+    if canonical_code:
+        payload["location_code"] = canonical_code
+        payload["locationCode"] = canonical_code
+        payload["resolved_location_code"] = str(row.get("code") or canonical_code).strip()
+    if canonical_country:
+        payload["country_code"] = canonical_country
+        payload["resolved_country_code"] = canonical_country
+    if canonical_name:
+        payload["remark"] = canonical_name
+        payload["display_name"] = canonical_name
+    return _canonicalize_payload_metadata(payload)
 
 
 def _get_user_location_credential(cur: psycopg.Cursor, user_id: int, location_code: str) -> Optional[Dict[str, Any]]:
@@ -2812,11 +3081,17 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     access_mode = _extract_location_access_mode(data, vpn_payload)
     vpn_payload = _apply_location_access_mode(vpn_payload, access_mode)
-    if data["code"] and not vpn_payload.get("location_code"):
+    if data["code"]:
         vpn_payload["location_code"] = data["code"]
-    if data["name_en"] and not vpn_payload.get("remark"):
+        vpn_payload["locationCode"] = data["code"]
+        vpn_payload.setdefault("resolved_location_code", data["code"])
+    if data.get("country_code"):
+        vpn_payload["country_code"] = data["country_code"]
+        vpn_payload["resolved_country_code"] = data["country_code"]
+    if data["name_en"]:
         vpn_payload["remark"] = data["name_en"]
-    data["vpn_payload"] = vpn_payload
+        vpn_payload["display_name"] = data["name_en"]
+    data["vpn_payload"] = _canonicalize_payload_metadata(vpn_payload)
     return data
 
 
@@ -2940,9 +3215,20 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                         merged_payload.update(value or {})
                     merged_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(merged_payload or {})))
                     merged_payload = _apply_location_access_mode(merged_payload, _extract_location_access_mode(normalized_payload, merged_payload))
-                    if "name_en" in normalized_payload and normalized_payload.get("name_en") and not merged_payload.get("remark"):
-                        merged_payload["remark"] = str(normalized_payload.get("name_en") or "").strip()
-                    value = Jsonb(merged_payload)
+                    canonical_code = str(existing_row.get("code") or merged_payload.get("location_code") or merged_payload.get("locationCode") or "").strip()
+                    canonical_name = str(normalized_payload.get("name_en") or existing_row.get("name_en") or existing_row.get("name_ru") or canonical_code or merged_payload.get("remark") or merged_payload.get("display_name") or "").strip()
+                    canonical_country = str(normalized_payload.get("country_code") or existing_row.get("country_code") or merged_payload.get("country_code") or merged_payload.get("resolved_country_code") or "").strip().upper()
+                    if canonical_code:
+                        merged_payload["location_code"] = canonical_code
+                        merged_payload["locationCode"] = canonical_code
+                        merged_payload["resolved_location_code"] = canonical_code
+                    if canonical_name:
+                        merged_payload["remark"] = canonical_name
+                        merged_payload["display_name"] = canonical_name
+                    if canonical_country:
+                        merged_payload["country_code"] = canonical_country
+                        merged_payload["resolved_country_code"] = canonical_country
+                    value = Jsonb(_canonicalize_payload_metadata(merged_payload))
                 updates.append(f"{key} = %s")
                 values.append(value)
 
