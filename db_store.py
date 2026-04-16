@@ -1087,6 +1087,14 @@ def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
     return code.startswith("ru-lte")
 
 
+def _is_ip_literal(value: Any) -> bool:
+    try:
+        ipaddress.ip_address(str(value or "").strip())
+        return True
+    except ValueError:
+        return False
+
+
 def _default_direct_domains(payload: Dict[str, Any]) -> List[str]:
     values = payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]
     result = [str(item or "").strip() for item in values if str(item or "").strip()]
@@ -1225,8 +1233,14 @@ def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[s
     if not dns_servers:
         dns_servers = ["1.1.1.1", "8.8.8.8"]
 
+    first_direct_rule: Dict[str, Any]
+    if _is_ip_literal(server):
+        first_direct_rule = {"type": "field", "ip": [server], "outboundTag": "direct"}
+    else:
+        first_direct_rule = {"type": "field", "domain": [f"domain:{server}"], "outboundTag": "direct"}
+
     routing_rules: List[Dict[str, Any]] = [
-        {"type": "field", "ip": [server], "outboundTag": "direct"},
+        first_direct_rule,
         {"type": "field", "ip": _default_xray_private_ip_rules(), "outboundTag": "direct"},
         {"type": "field", "domain": ["domain:localhost"], "outboundTag": "direct"},
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
@@ -1296,20 +1310,20 @@ def _canonicalize_payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
         return {}
 
     canonical_code = str(
-        normalized.get("resolved_location_code")
-        or normalized.get("location_code")
+        normalized.get("location_code")
         or normalized.get("locationCode")
         or normalized.get("code")
+        or normalized.get("resolved_location_code")
         or ""
     ).strip()
     if canonical_code:
         normalized["location_code"] = canonical_code
         normalized["locationCode"] = canonical_code
-        normalized.setdefault("resolved_location_code", canonical_code)
+        normalized["resolved_location_code"] = canonical_code
 
     canonical_country = str(
-        normalized.get("resolved_country_code")
-        or normalized.get("country_code")
+        normalized.get("country_code")
+        or normalized.get("resolved_country_code")
         or ""
     ).strip().upper()
     if canonical_country:
@@ -1320,6 +1334,21 @@ def _canonicalize_payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     if canonical_name:
         normalized["display_name"] = canonical_name
         normalized["remark"] = canonical_name
+
+    canonical_server_name = str(normalized.get("server_name") or normalized.get("sni") or "").strip()
+    if canonical_server_name:
+        normalized["server_name"] = canonical_server_name
+        normalized["sni"] = canonical_server_name
+
+    canonical_public_key = str(normalized.get("public_key") or normalized.get("publicKey") or "").strip()
+    if canonical_public_key:
+        normalized["public_key"] = canonical_public_key
+        normalized["publicKey"] = canonical_public_key
+
+    canonical_short_id = str(normalized.get("short_id") or normalized.get("shortId") or "").strip()
+    if canonical_short_id:
+        normalized["short_id"] = canonical_short_id
+        normalized["shortId"] = canonical_short_id
 
     rebuilt_raw = _build_canonical_raw_xray_config(normalized)
     if rebuilt_raw:
