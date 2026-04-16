@@ -1209,6 +1209,64 @@ def _build_canonical_xray_stream_settings(payload: Dict[str, Any], *, existing_p
     return stream_settings
 
 
+def _payload_endpoint_identity(payload: Dict[str, Any]) -> str:
+    normalized = dict(payload or {})
+    parts = [
+        str(normalized.get("server") or "").strip().lower(),
+        str(normalized.get("port") or normalized.get("server_port") or "").strip(),
+        str(normalized.get("uuid") or normalized.get("id") or "").strip().lower(),
+        str(normalized.get("public_key") or normalized.get("publicKey") or "").strip(),
+        str(normalized.get("short_id") or normalized.get("shortId") or "").strip(),
+        str(normalized.get("server_name") or normalized.get("sni") or "").strip().lower(),
+        str(normalized.get("transport") or normalized.get("network") or "").strip().lower(),
+        str(normalized.get("path") or "").strip(),
+        str(normalized.get("service_name") or normalized.get("serviceName") or "").strip(),
+        str(normalized.get("host") or "").strip().lower(),
+        str(normalized.get("mode") or "").strip().lower(),
+        str(normalized.get("security") or "").strip().lower(),
+        str(normalized.get("flow") or "").strip(),
+    ]
+    return "|".join(parts)
+
+
+def _probe_debug_identity(debug: Dict[str, Any]) -> str:
+    if not isinstance(debug, dict):
+        return ""
+    parts = [
+        str(debug.get("server") or "").strip().lower(),
+        str(debug.get("port") or "").strip(),
+        str(debug.get("uuid") or debug.get("id") or "").strip().lower(),
+        str(debug.get("public_key") or debug.get("publicKey") or "").strip(),
+        str(debug.get("short_id") or debug.get("shortId") or "").strip(),
+        str(debug.get("server_name") or debug.get("sni") or "").strip().lower(),
+        str(debug.get("transport") or debug.get("network") or "").strip().lower(),
+        str(debug.get("path") or "").strip(),
+        str(debug.get("service_name") or debug.get("serviceName") or "").strip(),
+        str(debug.get("host") or "").strip().lower(),
+        str(debug.get("mode") or "").strip().lower(),
+        str(debug.get("security") or "").strip().lower(),
+        str(debug.get("flow") or "").strip(),
+    ]
+    return "|".join(parts)
+
+
+def _invalidate_stale_live_probe(payload: Dict[str, Any]) -> Dict[str, Any]:
+    normalized = dict(payload or {})
+    probe = normalized.get("_last_live_probe")
+    if not isinstance(probe, dict):
+        return normalized
+    payload_identity = _payload_endpoint_identity(normalized)
+    if not payload_identity:
+        return normalized
+    probe_identity = _probe_debug_identity(probe.get("debug") if isinstance(probe.get("debug"), dict) else {})
+    if not probe_identity:
+        return normalized
+    if payload_identity == probe_identity:
+        return normalized
+    normalized.pop("_last_live_probe", None)
+    return normalized
+
+
 def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     protocol = str(payload.get("protocol") or "vless").strip().lower() or "vless"
     server = str(payload.get("server") or "").strip()
@@ -1455,6 +1513,7 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
     if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
         normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
     normalized = _apply_anti_block_profile(_apply_admin_mobile_defaults(normalized))
+    normalized = _invalidate_stale_live_probe(normalized)
     return _canonicalize_payload_metadata(normalized)
 
 
@@ -1572,6 +1631,7 @@ def _compose_vpn_payload_for_location(row: Dict[str, Any], *, requested_location
     if canonical_name:
         payload["remark"] = canonical_name
         payload["display_name"] = canonical_name
+    payload = _invalidate_stale_live_probe(payload)
     return _canonicalize_payload_metadata(payload)
 
 
