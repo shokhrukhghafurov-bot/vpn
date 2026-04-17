@@ -203,7 +203,11 @@ CREATE TABLE IF NOT EXISTS bot_notifications (
     event_type TEXT NOT NULL,
     payload JSONB NOT NULL DEFAULT '{}'::jsonb,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
-    sent_at TIMESTAMPTZ
+    sent_at TIMESTAMPTZ,
+    failed_at TIMESTAMPTZ,
+    last_error TEXT,
+    attempt_count INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TIMESTAMPTZ
 );
 
 CREATE TABLE IF NOT EXISTS bot_error_log (
@@ -302,6 +306,10 @@ MIGRATION_SQL = [
     "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS payload JSONB NOT NULL DEFAULT '{}'::jsonb",
     "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS sent_at TIMESTAMPTZ",
+    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS failed_at TIMESTAMPTZ",
+    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS last_error TEXT",
+    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS attempt_count INTEGER NOT NULL DEFAULT 0",
+    "ALTER TABLE bot_notifications ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ",
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS context TEXT",
     "ALTER TABLE bot_error_log ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
@@ -318,7 +326,7 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
-    "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, created_at)",
+    "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, failed_at, next_retry_at, created_at)",
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_user_id ON user_location_credentials(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_location_code ON user_location_credentials(location_code)",
@@ -4101,6 +4109,8 @@ def list_pending_notifications(limit: int = 100) -> List[Dict[str, Any]]:
                 FROM bot_notifications n
                 JOIN users u ON u.id = n.user_id
                 WHERE n.sent_at IS NULL
+                  AND n.failed_at IS NULL
+                  AND (n.next_retry_at IS NULL OR n.next_retry_at <= NOW())
                 ORDER BY n.created_at ASC
                 LIMIT %s
                 """,
@@ -4113,7 +4123,41 @@ def list_pending_notifications(limit: int = 100) -> List[Dict[str, Any]]:
 def mark_notification_sent(notification_id: int) -> None:
     with db() as conn:
         with conn.cursor() as cur:
-            cur.execute("UPDATE bot_notifications SET sent_at = NOW() WHERE id = %s", (notification_id,))
+            cur.execute("UPDATE bot_notifications SET sent_at = NOW(), last_error = NULL, next_retry_at = NULL WHERE id = %s", (notification_id,))
+        conn.commit()
+
+
+def mark_notification_retry(notification_id: int, error_message: str, retry_after_seconds: int = 300) -> None:
+    retry_delay = max(30, int(retry_after_seconds or 300))
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bot_notifications
+                SET attempt_count = COALESCE(attempt_count, 0) + 1,
+                    last_error = %s,
+                    next_retry_at = NOW() + (%s * INTERVAL '1 second')
+                WHERE id = %s
+                """,
+                (str(error_message or "")[:4000], retry_delay, notification_id),
+            )
+        conn.commit()
+
+
+def mark_notification_failed(notification_id: int, error_message: str) -> None:
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE bot_notifications
+                SET attempt_count = COALESCE(attempt_count, 0) + 1,
+                    last_error = %s,
+                    failed_at = NOW(),
+                    next_retry_at = NULL
+                WHERE id = %s
+                """,
+                (str(error_message or "")[:4000], notification_id),
+            )
         conn.commit()
 
 
