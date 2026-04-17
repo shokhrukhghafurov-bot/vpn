@@ -22,6 +22,8 @@ from config import settings
 from db_store import (
     enqueue_subscription_notifications,
     list_pending_notifications,
+    mark_notification_failed,
+    mark_notification_retry,
     mark_notification_sent,
     record_bot_error,
 )
@@ -581,10 +583,8 @@ def build_open_app_url(
     query = dict(parse_qsl(parts.query, keep_blank_values=True))
     if final_code:
         query["code"] = final_code
-        query["renew"] = "1"
     elif final_token:
         query["token"] = final_token
-        query["renew"] = "1"
     if lang:
         query["lang"] = lang
     if platform:
@@ -1382,6 +1382,20 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
     return t["main_menu"], back_inline(lang)
 
 
+def _notification_error_is_permanent(error_message: str) -> bool:
+    raw = str(error_message or "").strip().lower()
+    if not raw:
+        return False
+    permanent_markers = (
+        "chat not found",
+        "bot was blocked by the user",
+        "user is deactivated",
+        "forbidden: bot was blocked",
+        "forbidden: user is deactivated",
+    )
+    return any(marker in raw for marker in permanent_markers)
+
+
 async def notification_loop() -> None:
     await asyncio.sleep(3)
     while True:
@@ -1394,7 +1408,12 @@ async def notification_loop() -> None:
                     await require_bot().send_message(int(item["telegram_id"]), text, reply_markup=markup)
                     mark_notification_sent(int(item["id"]))
                 except Exception as exc:
-                    record_bot_error("bot-notification", str(item.get("unique_key") or item.get("id")), str(exc))
+                    error_message = str(exc)
+                    record_bot_error("bot-notification", str(item.get("unique_key") or item.get("id")), error_message)
+                    if _notification_error_is_permanent(error_message):
+                        mark_notification_failed(int(item["id"]), error_message)
+                    else:
+                        mark_notification_retry(int(item["id"]), error_message, int(getattr(settings, "BOT_NOTIFICATION_RETRY_BACKOFF_SEC", 300) or 300))
             await asyncio.sleep(max(15, settings.BOT_NOTIFICATION_POLL_SEC))
         except asyncio.CancelledError:
             raise
