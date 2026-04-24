@@ -90,20 +90,8 @@ from db_store import (
 )
 
 
-def _configure_app_logging() -> None:
-    level_name = str(getattr(settings, "LOG_LEVEL", "ERROR") or "ERROR").upper()
-    level = getattr(logging, level_name, logging.ERROR)
-    logging.basicConfig(level=level, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
-    for name in ("inet.vpn", "uvicorn", "uvicorn.error", "uvicorn.access", "fastapi"):
-        logging.getLogger(name).setLevel(level)
-    if not bool(getattr(settings, "UVICORN_ACCESS_LOG", False)):
-        logging.getLogger("uvicorn.access").disabled = True
-
-
-_configure_app_logging()
 app = FastAPI(title=f"{settings.APP_NAME} VPN API")
 logger = logging.getLogger("inet.vpn")
-_probe_error_log_seen: Dict[str, float] = {}
 
 security = HTTPBearer(auto_error=False)
 basic_security = HTTPBasic()
@@ -5678,24 +5666,29 @@ def _log_location_probe_result(row: Dict[str, Any], probe: Dict[str, Any], *, so
     probe_url = str(probe.get("probe_url") or "")
     debug_summary = _probe_debug_summary(debug_fields)
     if probe.get("ok"):
-        if bool(getattr(settings, "VPN_PROBE_LOG_OK", False)):
-            logger.info(
-                "[vpn][probe] source=%s code=%s result=ok method=%s latency_ms=%s labels=%s probe_url=%s urls=%s %s",
-                source, code, method, latency_ms, labels or "-", probe_url or "-", urls or "-", debug_summary,
-            )
+        logger.info(
+            "[vpn][probe] source=%s code=%s result=ok method=%s latency_ms=%s labels=%s probe_url=%s urls=%s %s",
+            source,
+            code,
+            method,
+            latency_ms,
+            labels or "-",
+            probe_url or "-",
+            urls or "-",
+            debug_summary,
+        )
     else:
-        if not bool(getattr(settings, "VPN_PROBE_LOG_ERRORS", True)):
-            return
-        key = f"{source}|{code}|{method}|{reason or 'unknown'}|{real_probe_error or '-'}"
-        cooldown = max(0, int(getattr(settings, "VPN_PROBE_ERROR_LOG_COOLDOWN_SEC", 900) or 0))
-        now_ts = time.time()
-        last_ts = _probe_error_log_seen.get(key, 0.0)
-        if cooldown and (now_ts - last_ts) < cooldown:
-            return
-        _probe_error_log_seen[key] = now_ts
-        logger.error(
+        logger.warning(
             "[vpn][probe] source=%s code=%s result=error method=%s reason=%s real_probe_error=%s labels=%s probe_url=%s urls=%s %s",
-            source, code, method, reason or "unknown", real_probe_error or "-", labels or "-", probe_url or "-", urls or "-", debug_summary,
+            source,
+            code,
+            method,
+            reason or "unknown",
+            real_probe_error or "-",
+            labels or "-",
+            probe_url or "-",
+            urls or "-",
+            debug_summary,
         )
 
 
