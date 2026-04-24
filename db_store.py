@@ -1916,6 +1916,86 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
     return counts
 
 
+
+
+def get_location_connected_user_counts(location_codes: Optional[List[str]] = None) -> Dict[str, int]:
+    """Return current connected/imported users per VPN location code for admin UI.
+
+    Meaning in admin:
+    - concrete location rows: users directly using this location + users whose Auto location
+      is currently assigned to this concrete location;
+    - virtual rows like auto-fastest/auto-reserve: users assigned to that virtual location.
+
+    Example: 47 means 47 unique non-blocked users currently have active usable
+    access/assignment for this location.
+    """
+    runtime = get_runtime_settings_payload()
+    access_mode = str(runtime.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid") or "paid").strip().lower()
+    free_mode = access_mode == "free"
+
+    clean_codes = [str(code or "").strip() for code in (location_codes or []) if str(code or "").strip()]
+    code_filter_sql = ""
+    params: List[Any] = []
+    if clean_codes:
+        placeholders = ", ".join(["%s"] * len(clean_codes))
+        code_filter_sql = f"WHERE usage_edges.code IN ({placeholders})"
+        params.extend(clean_codes)
+
+    if free_mode:
+        access_sql = "TRUE"
+    else:
+        access_sql = """
+            EXISTS (
+                SELECT 1
+                FROM subscriptions s
+                WHERE s.user_id = u.id
+                  AND COALESCE(s.status, 'active') = 'active'
+                  AND s.starts_at <= NOW()
+                  AND s.expires_at >= NOW()
+            )
+        """
+
+    query = f"""
+        WITH usage_edges AS (
+            SELECT ulc.location_code AS code, ulc.user_id
+            FROM user_location_credentials ulc
+            JOIN users u ON u.id = ulc.user_id
+            WHERE COALESCE(ulc.status, 'active') = 'active'
+              AND COALESCE(u.status, 'active') <> 'blocked'
+              AND {access_sql}
+
+            UNION ALL
+
+            SELECT vla.virtual_code AS code, vla.user_id
+            FROM virtual_location_assignments vla
+            JOIN users u ON u.id = vla.user_id
+            WHERE COALESCE(u.status, 'active') <> 'blocked'
+              AND {access_sql}
+
+            UNION ALL
+
+            SELECT vla.concrete_code AS code, vla.user_id
+            FROM virtual_location_assignments vla
+            JOIN users u ON u.id = vla.user_id
+            WHERE COALESCE(u.status, 'active') <> 'blocked'
+              AND {access_sql}
+        )
+        SELECT usage_edges.code AS code, COUNT(DISTINCT usage_edges.user_id) AS connected_users
+        FROM usage_edges
+        {code_filter_sql}
+        GROUP BY usage_edges.code
+    """
+
+    counts: Dict[str, int] = {code: 0 for code in clean_codes}
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(params))
+            for row in cur.fetchall():
+                code = str(row.get("code") or "").strip()
+                if code:
+                    counts[code] = int(row.get("connected_users") or 0)
+    return counts
+
 def _virtual_role_order(code: str) -> List[bool]:
     # False -> primary/manual/LTE rows, True -> reserve rows.
     # Auto | Fastest should strongly prefer primary rows across *all* health
