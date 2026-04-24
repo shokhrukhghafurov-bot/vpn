@@ -131,14 +131,6 @@ class Settings:
     JWT_SECRET: str = os.getenv("JWT_SECRET", "replace_me")
     CORS_ORIGINS: List[str] = None
 
-    # Quiet logs by default to reduce Railway log volume.
-    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "ERROR").upper()
-    UVICORN_LOG_LEVEL: str = os.getenv("UVICORN_LOG_LEVEL", os.getenv("LOG_LEVEL", "error")).lower()
-    UVICORN_ACCESS_LOG: bool = _env_bool("UVICORN_ACCESS_LOG", False)
-    VPN_PROBE_LOG_OK: bool = _env_bool("VPN_PROBE_LOG_OK", False)
-    VPN_PROBE_LOG_ERRORS: bool = _env_bool("VPN_PROBE_LOG_ERRORS", True)
-    VPN_PROBE_ERROR_LOG_COOLDOWN_SEC: int = _env_int("VPN_PROBE_ERROR_LOG_COOLDOWN_SEC", 900)
-
     ADMIN_BASIC_USER: str = os.getenv("ADMIN_BASIC_USER", "admin")
     ADMIN_BASIC_PASS: str = os.getenv("ADMIN_BASIC_PASS", "change_me")
 
