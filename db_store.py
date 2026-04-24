@@ -245,6 +245,21 @@ CREATE TABLE IF NOT EXISTS virtual_location_assignments (
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(user_id, virtual_code)
 );
+
+CREATE TABLE IF NOT EXISTS vpn_location_sessions (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_fingerprint TEXT NOT NULL,
+    location_code TEXT NOT NULL,
+    client TEXT,
+    platform TEXT,
+    device_name TEXT,
+    subscription_token TEXT,
+    last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(user_id, device_fingerprint, location_code)
+);
 """
 
 MIGRATION_SQL = [
@@ -332,6 +347,16 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_location_code ON user_location_credentials(location_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
+    "CREATE TABLE IF NOT EXISTS vpn_location_sessions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, location_code TEXT NOT NULL, client TEXT, platform TEXT, device_name TEXT, subscription_token TEXT, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint, location_code))",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS client TEXT",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS platform TEXT",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS device_name TEXT",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS subscription_token TEXT",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE vpn_location_sessions ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+    "CREATE INDEX IF NOT EXISTS idx_vpn_location_sessions_location_seen ON vpn_location_sessions(location_code, last_seen_at)",
+    "CREATE INDEX IF NOT EXISTS idx_vpn_location_sessions_user_device ON vpn_location_sessions(user_id, device_fingerprint)",
 ]
 
 POST_MIGRATION_SQL = [
@@ -356,6 +381,7 @@ POST_MIGRATION_SQL = [
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
     "UPDATE user_location_credentials SET status = 'active' WHERE status IS NULL OR status = ''",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
+    "CREATE TABLE IF NOT EXISTS vpn_location_sessions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, location_code TEXT NOT NULL, client TEXT, platform TEXT, device_name TEXT, subscription_token TEXT, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint, location_code))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
     "UPDATE locations SET name_en = 'Auto | Fastest' WHERE code = 'auto-fastest' AND (name_en IS NULL OR BTRIM(name_en) = '' OR name_en IN ('Auto | Fastest', '★ Auto | Fastest'))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый резерв' WHERE code = 'auto-reserve' AND (name_ru IS NULL OR BTRIM(name_ru) = '')",
@@ -1918,36 +1944,63 @@ def get_virtual_location_assignment_counts(concrete_codes: List[str]) -> Dict[st
 
 
 
-def get_location_connected_user_counts(location_codes: Optional[List[str]] = None) -> Dict[str, int]:
-    """Return current connected/imported users per VPN location code for admin UI.
+def record_vpn_location_session(*, user_id: int, device_fingerprint: str, location_codes: List[str], subscription_token: str = "", client: str = "", platform: str = "", device_name: str = "") -> None:
+    """Record a recent real VPN subscription refresh for CONNECTED NOW."""
+    uid = int(user_id or 0)
+    fp = str(device_fingerprint or "").strip()
+    codes = sorted({str(code or "").strip() for code in (location_codes or []) if str(code or "").strip()})
+    if uid <= 0 or not fp or not codes:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            for code in codes:
+                cur.execute(
+                    """
+                    INSERT INTO vpn_location_sessions (user_id, device_fingerprint, location_code, client, platform, device_name, subscription_token, last_seen_at, updated_at)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, NOW(), NOW())
+                    ON CONFLICT (user_id, device_fingerprint, location_code) DO UPDATE SET
+                        client = EXCLUDED.client, platform = EXCLUDED.platform, device_name = EXCLUDED.device_name,
+                        subscription_token = EXCLUDED.subscription_token, last_seen_at = NOW(), updated_at = NOW()
+                    """,
+                    (uid, fp, code, str(client or "").strip()[:80], str(platform or "").strip()[:80], str(device_name or "").strip()[:160], str(subscription_token or "").strip()[:256]),
+                )
+            cur.execute(
+                """
+                DELETE FROM vpn_location_sessions
+                WHERE user_id = %s AND device_fingerprint = %s AND NOT (location_code = ANY(%s))
+                """,
+                (uid, fp, codes),
+            )
+        conn.commit()
 
-    Meaning in admin:
-    - concrete location rows: users directly using this location + users whose Auto location
-      is currently assigned to this concrete location;
-    - virtual rows like auto-fastest/auto-reserve: users assigned to that virtual location.
 
-    Example: 47 means 47 unique non-blocked users currently have active usable
-    access/assignment for this location.
+def get_location_connected_user_counts(location_codes: Optional[List[str]] = None, *, online_window_minutes: Optional[int] = None) -> Dict[str, int]:
+    """Return honest real-time CONNECTED users per VPN location.
+
+    Counted only when a non-blocked user with active access refreshed /sub/{token}
+    from a real VPN client recently. Default online window: 30 minutes
+    (env/settings VPN_CONNECTED_ONLINE_MINUTES).
     """
     runtime = get_runtime_settings_payload()
     access_mode = str(runtime.get("access_mode") or getattr(settings, "VPN_ACCESS_MODE", "paid") or "paid").strip().lower()
     free_mode = access_mode == "free"
+    try:
+        window_minutes = int(online_window_minutes or getattr(settings, "VPN_CONNECTED_ONLINE_MINUTES", 30) or 30)
+    except Exception:
+        window_minutes = 30
+    window_minutes = max(1, min(window_minutes, 1440))
 
     clean_codes = [str(code or "").strip() for code in (location_codes or []) if str(code or "").strip()]
+    params: List[Any] = [window_minutes]
     code_filter_sql = ""
-    params: List[Any] = []
     if clean_codes:
         placeholders = ", ".join(["%s"] * len(clean_codes))
-        code_filter_sql = f"WHERE usage_edges.code IN ({placeholders})"
+        code_filter_sql = f"AND vls.location_code IN ({placeholders})"
         params.extend(clean_codes)
 
-    if free_mode:
-        access_sql = "TRUE"
-    else:
-        access_sql = """
+    access_sql = "TRUE" if free_mode else """
             EXISTS (
-                SELECT 1
-                FROM subscriptions s
+                SELECT 1 FROM subscriptions s
                 WHERE s.user_id = u.id
                   AND COALESCE(s.status, 'active') = 'active'
                   AND s.starts_at <= NOW()
@@ -1956,34 +2009,14 @@ def get_location_connected_user_counts(location_codes: Optional[List[str]] = Non
         """
 
     query = f"""
-        WITH usage_edges AS (
-            SELECT ulc.location_code AS code, ulc.user_id
-            FROM user_location_credentials ulc
-            JOIN users u ON u.id = ulc.user_id
-            WHERE COALESCE(ulc.status, 'active') = 'active'
-              AND COALESCE(u.status, 'active') <> 'blocked'
-              AND {access_sql}
-
-            UNION ALL
-
-            SELECT vla.virtual_code AS code, vla.user_id
-            FROM virtual_location_assignments vla
-            JOIN users u ON u.id = vla.user_id
-            WHERE COALESCE(u.status, 'active') <> 'blocked'
-              AND {access_sql}
-
-            UNION ALL
-
-            SELECT vla.concrete_code AS code, vla.user_id
-            FROM virtual_location_assignments vla
-            JOIN users u ON u.id = vla.user_id
-            WHERE COALESCE(u.status, 'active') <> 'blocked'
-              AND {access_sql}
-        )
-        SELECT usage_edges.code AS code, COUNT(DISTINCT usage_edges.user_id) AS connected_users
-        FROM usage_edges
-        {code_filter_sql}
-        GROUP BY usage_edges.code
+        SELECT vls.location_code AS code, COUNT(DISTINCT vls.user_id) AS connected_users
+        FROM vpn_location_sessions vls
+        JOIN users u ON u.id = vls.user_id
+        WHERE COALESCE(u.status, 'active') <> 'blocked'
+          AND {access_sql}
+          AND vls.last_seen_at >= NOW() - (%s::int * INTERVAL '1 minute')
+          {code_filter_sql}
+        GROUP BY vls.location_code
     """
 
     counts: Dict[str, int] = {code: 0 for code in clean_codes}
