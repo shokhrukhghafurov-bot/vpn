@@ -29,12 +29,8 @@ from db_store import (
 )
 
 
-_LOG_LEVEL_NAME = str(getattr(settings, "LOG_LEVEL", "ERROR") or "ERROR").upper()
-_LOG_LEVEL = getattr(logging, _LOG_LEVEL_NAME, logging.ERROR)
-logging.basicConfig(level=_LOG_LEVEL, format="%(asctime)s %(levelname)s %(name)s: %(message)s", force=True)
-logging.getLogger("uvicorn.access").disabled = True
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
-logger.setLevel(_LOG_LEVEL)
 
 
 TEXT: Dict[str, Dict[str, str]] = {
