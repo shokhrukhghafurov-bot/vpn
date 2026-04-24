@@ -53,6 +53,7 @@ from db_store import (
     get_plan_by_code,
     get_vpn_config_for_user,
     get_location_connected_user_counts,
+    record_vpn_location_session,
     get_user_by_id,
     get_user_by_subscription_token,
     get_user_by_active_auth_code,
@@ -3961,22 +3962,66 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
 
 
 
-def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> None:
+def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[str]:
     if not access or access.get("kind") != "user":
-        return
+        return None
     user = access.get("user") or {}
     if not user or user.get("status") == "blocked":
-        return
+        return None
     client_id = _subscription_client_id_from_request(request)
     fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
     if not fingerprint:
-        return
+        return None
     platform, device_name = _detect_device_platform_and_name(request)
     try:
         touch_subscription_device_by_token(token, platform=platform, device_name=device_name, device_fingerprint=fingerprint)
     except Exception:
         pass
+    return fingerprint
 
+
+def _record_real_connected_locations(
+    request: Request,
+    token: str,
+    access: Optional[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+    *,
+    fingerprint: Optional[str] = None,
+) -> None:
+    if not access or access.get("kind") != "user":
+        return
+    user = access.get("user") or {}
+    user_id = int(user.get("id") or 0)
+    if user_id <= 0 or user.get("status") == "blocked":
+        return
+    fp = fingerprint or _track_subscription_device_access(request, token, access)
+    if not fp:
+        return
+    codes = [str(row.get("code") or "").strip() for row in (rows or []) if str(row.get("code") or "").strip()]
+    if not codes:
+        return
+    platform, device_name = _detect_device_platform_and_name(request)
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    if not client_hint:
+        ua = str(request.headers.get("user-agent") or "").strip().lower()
+        if "hiddify" in ua:
+            client_hint = "hiddify"
+        elif "v2raytun" in ua:
+            client_hint = "v2raytun"
+        elif "happ" in ua:
+            client_hint = "happ"
+    try:
+        record_vpn_location_session(
+            user_id=user_id,
+            device_fingerprint=fp,
+            location_codes=codes,
+            subscription_token=token,
+            client=client_hint,
+            platform=platform,
+            device_name=device_name,
+        )
+    except Exception as exc:
+        logger.warning("[vpn][connected] failed to record session user_id=%s err=%s", user_id, exc)
 
 
 def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -4345,8 +4390,10 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     client_hint = str(request.query_params.get("client") or "").strip().lower()
     user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
 
-    if not head_only and not _subscription_browser_preview_request(request):
-        _track_subscription_device_access(request, token, access)
+    session_fingerprint = None
+    should_track_real_connected = bool(not head_only and not _subscription_browser_preview_request(request))
+    if should_track_real_connected:
+        session_fingerprint = _track_subscription_device_access(request, token, access)
 
     rows = _subscription_location_rows(subscription_user_id, client_hint=client_hint)
     lines: List[str] = []
@@ -4361,6 +4408,9 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
 
     if not lines:
         raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
+
+    if should_track_real_connected:
+        _record_real_connected_locations(request, token, access, rows, fingerprint=session_fingerprint)
 
     content = "\n".join(lines) + "\n"
     content_version = hashlib.sha256(content.encode("utf-8")).hexdigest()
