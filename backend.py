@@ -52,6 +52,7 @@ from db_store import (
     get_payment_for_user,
     get_plan_by_code,
     get_vpn_config_for_user,
+    get_location_connected_user_counts,
     get_user_by_id,
     get_user_by_subscription_token,
     get_user_by_active_auth_code,
@@ -5751,9 +5752,17 @@ def admin_refresh_black(admin_name: str = Depends(require_admin)) -> Dict[str, A
 @app.get("/api/infra/admin/vpn/locations")
 def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
+    rows = list_locations(active_only=False)
+    usage = get_location_connected_user_counts([str(row.get("code") or "") for row in rows])
+    items = []
+    for row in rows:
+        item = serialize_location(row, include_payload=True)
+        item["connected_users"] = int(usage.get(str(row.get("code") or "").strip(), 0) or 0)
+        items.append(item)
     return {
         "ok": True,
-        "items": [serialize_location(row, include_payload=True) for row in list_locations(active_only=False)],
+        "items": items,
+        "location_usage": usage,
         "ru_lte_refresh": dict(_ru_lte_refresh_state),
         "ru_lte_auto_refresh_enabled": bool(settings.RU_LTE_AUTO_REFRESH_ENABLED),
         "ru_lte_auto_refresh_minutes": max(1, int(settings.RU_LTE_AUTO_REFRESH_MINUTES or 30)),
