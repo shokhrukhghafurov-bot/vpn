@@ -66,6 +66,7 @@ from db_store import (
     get_user_by_telegram_id,
     get_user_snapshot_by_telegram,
     get_user_subscription_view,
+    cleanup_expired_pending_device_slots,
     get_subscription_device_gate_by_token,
     ensure_user_subscription_token,
     issue_auth_code,
@@ -536,6 +537,19 @@ def _trigger_xray_sync(reason: str, *, user_id: Optional[int] = None, device_id:
     except Exception as exc:
         logger.warning("[xray-sync] failed reason=%s user_id=%s device_id=%s err=%s", reason, user_id, device_id, exc)
         return {"ok": bool(xui_sync.get("ok")), "error": str(exc), "xui_sync": xui_sync, "payload": payload}
+
+
+def _cleanup_expired_pending_slots_and_sync(user_id: Optional[int] = None) -> Dict[str, Any]:
+    """Release expired pending slots and sync active UUIDs to 3X-UI/Xray."""
+    try:
+        removed = int(cleanup_expired_pending_device_slots(int(user_id)) if user_id else cleanup_expired_pending_device_slots(None) or 0)
+    except Exception as exc:
+        logger.warning("[devices][pending-cleanup] failed user_id=%s err=%s", user_id if user_id is not None else "-", exc)
+        return {"ok": False, "removed": 0, "error": str(exc)[:300]}
+    if removed <= 0:
+        return {"ok": True, "removed": 0}
+    sync = _trigger_xray_sync("pending_slots_expired", user_id=int(user_id or 0) or None)
+    return {"ok": bool(sync.get("ok") or sync.get("skipped")), "removed": removed, "xray_sync": sync}
 
 
 security = HTTPBearer(auto_error=False)
@@ -5031,7 +5045,20 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not user or user.get("status") == "blocked":
             raise HTTPException(status_code=404, detail="Subscription not found")
 
+        _cleanup_expired_pending_slots_and_sync(int(user["id"]))
+
         if access["kind"] == "device":
+            refreshed_device_token = get_device_subscription_token(token)
+            if not refreshed_device_token or not bool(refreshed_device_token.get("is_active")):
+                return _subscription_empty_response(
+                    request,
+                    token,
+                    head_only=head_only,
+                    expires_ts=int(time.time()) - 300,
+                    state="empty",
+                    profile_suffix=_bot_profile_title_label(),
+                )
+            access["device_token"] = refreshed_device_token
             device_token = access.get("device_token") or {}
             if not bool(device_token.get("is_active")):
                 return _subscription_empty_response(
@@ -5127,7 +5154,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             bound_fp = str(device_token.get("device_fingerprint") or "").strip().lower()
             bound_device_id = int(device_token.get("device_id") or 0)
             already_bound = bool(bound_device_id > 0 and bound_fp and not bound_fp.startswith("pending:"))
-            if bool(getattr(settings, "DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", True)) and already_bound:
+            if bool(getattr(settings, "DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", False)) and already_bound:
                 # Happ/v2RayTun can drop ?subcid=... on manual refresh after the
                 # first successful import. The dt_ token is already tied to a
                 # real device slot, so keep refresh working and preserve the
@@ -5338,6 +5365,7 @@ def open_app_bridge(
             bridge_access = _subscription_access_context(active_token)
             if bridge_access and bridge_access.get("kind") == "user":
                 bridge_user = bridge_access.get("user") or {}
+                _cleanup_expired_pending_slots_and_sync(int(bridge_user["id"]))
                 ttl_hours = int(getattr(settings, "DEVICE_TOKEN_TTL_HOURS", 0) or 0)
                 device_token_row = create_device_subscription_token_for_user(
                     int(bridge_user["id"]),
@@ -5823,6 +5851,7 @@ def plans() -> Dict[str, Any]:
 
 @app.get("/subscriptions/me")
 def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _cleanup_expired_pending_slots_and_sync(int(user["id"]))
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
     if view.get("is_active"):
@@ -5836,6 +5865,7 @@ def subscription_me(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[st
 
 @app.get("/devices")
 def devices(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    _cleanup_expired_pending_slots_and_sync(int(user["id"]))
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
     return {"ok": True, "items": view["devices"], "devices_used": view["devices_used"], "device_limit": view["device_limit"]}
@@ -5858,6 +5888,7 @@ def issue_device_subscription_token(
         client_mode = _client_mode_for_platform(target_platform)
     client_name = str(payload.device_name or "").strip() or _client_name_for_platform(target_platform)
     norm_lang = "en" if str(payload.language or "").strip().lower() == "en" else "ru"
+    _cleanup_expired_pending_slots_and_sync(int(user["id"]))
     try:
         ttl_hours = int(getattr(settings, "DEVICE_TOKEN_TTL_HOURS", 0) or 0)
         device_token_row = create_device_subscription_token_for_user(
