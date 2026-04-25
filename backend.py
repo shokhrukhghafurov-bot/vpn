@@ -338,12 +338,15 @@ def _xui_location_sync_configs() -> Dict[str, Dict[str, Any]]:
             continue
         if managed_by and managed_by not in {"3x-ui", "3xui", "xui", "x-ui", "three-x-ui"}:
             continue
-        server_key = str(
+        server_key_raw = str(
             payload.get("xui_server_key")
             or payload.get("xuiServerKey")
             or payload.get("server_key")
             or default_server_key
         ).strip() or default_server_key
+        # Use the same normalization as the server registry. This prevents a saved
+        # key like "RU 1" / "ru1" mismatch from silently skipping UUID sync.
+        server_key = _xui_server_key(server_key_raw) or _xui_server_key(default_server_key) or "default"
         configs[code] = {
             "code": code,
             "server_key": server_key,
@@ -6229,7 +6232,14 @@ def admin_xui_servers(admin_name: str = Depends(require_admin)) -> Dict[str, Any
             "timeout_sec": cfg.timeout_sec,
             "verify_ssl": cfg.verify_ssl,
         })
-    return {"ok": True, "items": runtime_items, "effective": effective_items}
+    return {
+        "ok": True,
+        "items": runtime_items,
+        "effective": effective_items,
+        "xui_sync_enabled": bool(getattr(settings, "XUI_SYNC_ENABLED", False)),
+        "xui_dry_run": bool(getattr(settings, "XUI_DRY_RUN", False)),
+        "xui_default_server_key": str(getattr(settings, "XUI_DEFAULT_SERVER_KEY", "default") or "default"),
+    }
 
 
 @app.post("/api/infra/admin/vpn/xui/servers")
