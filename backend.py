@@ -4147,7 +4147,26 @@ def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str
     return base_name
 
 
-def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS") -> str:
+def _subscription_client_hint(request: Request) -> str:
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    if client_hint:
+        return client_hint
+    ua = str(request.headers.get("user-agent") or "").strip().lower()
+    if "hiddify" in ua:
+        return "hiddify"
+    if "v2raytun" in ua:
+        return "v2raytun"
+    if "happ" in ua:
+        return "happ"
+    return ""
+
+
+def _subscription_minimal_url_for_client(client_hint: Optional[str]) -> bool:
+    client = str(client_hint or "").strip().lower()
+    return client == "happ" and bool(getattr(settings, "HAPP_SUBSCRIPTION_MINIMAL", True))
+
+
+def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS", client_hint: Optional[str] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload)
     if not normalized or not _config_is_complete(normalized):
         raise ValueError("VLESS payload is incomplete")
@@ -4163,6 +4182,9 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
         "encryption": str(normalized.get("encryption") or "none").strip() or "none",
     }
     transport = str(normalized.get("transport") or normalized.get("network") or "tcp").strip().lower() or "tcp"
+
+    # Connection-critical VLESS/Reality fields. These cannot be hidden from a
+    # third-party VPN client because the client must know them to connect.
     optional_keys = {
         "flow": normalized.get("flow"),
         "sni": normalized.get("sni") or normalized.get("server_name"),
@@ -4175,12 +4197,20 @@ def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: st
         "fp": normalized.get("fingerprint"),
         "alpn": ",".join(str(item).strip() for item in (normalized.get("alpn") or []) if str(item).strip()),
         "packetEncoding": normalized.get("packet_encoding") or normalized.get("packetEncoding"),
-        "connectMode": normalized.get("connect_mode") or normalized.get("connectMode"),
-        "fullTunnel": "1" if _subscription_bool(normalized.get("full_tunnel", True), True) else "0",
-        "routeMode": normalized.get("route_mode"),
-        "directRu": "1" if _subscription_bool(normalized.get("direct_ru"), False) else "0" if normalized.get("direct_ru") is not None else None,
-        "directDomains": ",".join(str(item).strip() for item in (normalized.get("direct_domains") or []) if str(item).strip()),
     }
+
+    # Non-standard INET route/profile hints. Happ converts the link to its own
+    # local JSON and shows that JSON to the user. In minimal Happ mode we do not
+    # add these extra internal hints to the subscription URL.
+    if not _subscription_minimal_url_for_client(client_hint):
+        optional_keys.update({
+            "connectMode": normalized.get("connect_mode") or normalized.get("connectMode"),
+            "fullTunnel": "1" if _subscription_bool(normalized.get("full_tunnel", True), True) else "0",
+            "routeMode": normalized.get("route_mode"),
+            "directRu": "1" if _subscription_bool(normalized.get("direct_ru"), False) else "0" if normalized.get("direct_ru") is not None else None,
+            "directDomains": ",".join(str(item).strip() for item in (normalized.get("direct_domains") or []) if str(item).strip()),
+        })
+
     for key, value in optional_keys.items():
         text = str(value or "").strip()
         if text:
@@ -4498,7 +4528,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 )
                 return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
 
-    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    client_hint = _subscription_client_hint(request)
     user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
 
     session_fingerprint = None
@@ -4513,7 +4543,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         if not payload_for_subscription:
             continue
         try:
-            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=fallback_name))
+            lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=fallback_name, client_hint=client_hint))
         except Exception:
             continue
 
@@ -4564,7 +4594,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         moved_permanently_to_url=moved_permanently_to_url,
         content_version=content_version,
     )
-    suppress_inline_headers = client_hint == "v2raytun" or "v2raytun" in user_agent_hint
+    suppress_inline_headers = client_hint in {"v2raytun", "happ"} or "v2raytun" in user_agent_hint or "happ" in user_agent_hint
     content = "\n".join(lines) + "\n" if suppress_inline_headers else "\n".join(inline_headers + lines) + "\n"
     response_etag = hashlib.sha256(content.encode("utf-8")).hexdigest()
     headers = {
