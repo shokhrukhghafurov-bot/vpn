@@ -193,7 +193,17 @@ class Settings:
     # Security: user-wide /sub token is only for bot/open-app bridge.
     # Real VPN clients receive a one-device token that binds on first import.
     DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION: bool = _env_bool("DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True)
+    # Compatibility for profiles that were imported before the one-device dt_ token flow.
+    # When enabled, old /sub/<user_token> profiles are still passed through the
+    # device gate and are automatically recorded as one real device instead of
+    # returning HTTP 403 in VPN clients.
+    DEVICE_TOKEN_AUTO_MIGRATE_USER_TOKEN: bool = _env_bool("DEVICE_TOKEN_AUTO_MIGRATE_USER_TOKEN", True)
     DEVICE_TOKEN_STRICT_BINDING: bool = _env_bool("DEVICE_TOKEN_STRICT_BINDING", True)
+    # Some VPN apps keep /sub/dt_... but drop query params like subcid on manual
+    # refresh. If the dt_ token is already bound to a reserved device slot, allow
+    # the refresh to continue instead of returning HTTP 403. First import still
+    # requires the original bot/open-app link with subcid.
+    DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID: bool = _env_bool("DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", True)
     DEVICE_TOKEN_BIND_IP_ENABLED: bool = _env_bool("DEVICE_TOKEN_BIND_IP_ENABLED", False)
     DEVICE_TOKEN_TTL_HOURS: int = _env_int("DEVICE_TOKEN_TTL_HOURS", 0)
     SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT: bool = _env_bool("SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)
