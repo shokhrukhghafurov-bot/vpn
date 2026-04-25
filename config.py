@@ -193,6 +193,12 @@ class Settings:
     # Security: user-wide /sub token is only for bot/open-app bridge.
     # Real VPN clients receive a one-device token that binds on first import.
     DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION: bool = _env_bool("DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True)
+    # Temporary migration mode for old profiles imported before the dt_
+    # per-device token flow. When enabled, /sub/<user_token> keeps returning
+    # the template/shared UUID from the location payload, while new /sub/dt_...
+    # profiles still receive personal per-device UUIDs. Use only for a short
+    # migration window, then switch it off and remove legacy UUIDs from 3X-UI.
+    LEGACY_USER_TOKEN_GRACE_ENABLED: bool = _env_bool("LEGACY_USER_TOKEN_GRACE_ENABLED", False)
     # Compatibility for profiles that were imported before the one-device dt_ token flow.
     # When enabled, old /sub/<user_token> profiles are still passed through the
     # device gate and are automatically recorded as one real device instead of
