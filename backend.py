@@ -5025,20 +5025,45 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                 subscription_device_id = None
 
         is_browser_preview = _subscription_browser_preview_request(request)
-        if access.get("kind") == "user" and bool(getattr(settings, "DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True)):
-            content = (
-                "Direct user subscription token is disabled. Open the connection from the bot to create a one-device link.\n"
-                "Прямой общий токен отключён. Откройте подключение из бота, чтобы создать ссылку только для этого устройства.\n"
+        direct_user_token_disabled = (
+            access.get("kind") == "user"
+            and bool(getattr(settings, "DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True))
+        )
+        if direct_user_token_disabled and not bool(getattr(settings, "DEVICE_TOKEN_AUTO_MIGRATE_USER_TOKEN", True)):
+            # Avoid HTTP 403 in VPN clients. A 200/empty subscription cleanly
+            # disables the profile and tells the user to open the bot again.
+            return _subscription_empty_response(
+                request,
+                token,
+                head_only=head_only,
+                expires_ts=int(time.time()) - 300,
+                state="device_token_required",
+                profile_suffix="open bot again",
             )
-            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+
+        skip_device_gate_for_bound_refresh = False
         if access.get("kind") == "device" and bool(getattr(settings, "DEVICE_TOKEN_STRICT_BINDING", True)) and not _subscription_client_id_from_request(request):
-            content = (
-                "Device token requires the original app link with subcid. Open the connection from the bot again.\n"
-                "Токен устройства требует исходную ссылку приложения с subcid. Откройте подключение из бота ещё раз.\n"
-            )
-            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+            device_token = access.get("device_token") or {}
+            bound_fp = str(device_token.get("device_fingerprint") or "").strip().lower()
+            bound_device_id = int(device_token.get("device_id") or 0)
+            already_bound = bool(bound_device_id > 0 and bound_fp and not bound_fp.startswith("pending:"))
+            if bool(getattr(settings, "DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", True)) and already_bound:
+                # Happ/v2RayTun can drop ?subcid=... on manual refresh after the
+                # first successful import. The dt_ token is already tied to a
+                # real device slot, so keep refresh working and preserve the
+                # per-device UUID instead of returning HTTP 403.
+                skip_device_gate_for_bound_refresh = True
+            else:
+                return _subscription_empty_response(
+                    request,
+                    token,
+                    head_only=head_only,
+                    expires_ts=int(time.time()) - 300,
+                    state="device_token_missing_subcid",
+                    profile_suffix="open bot again",
+                )
         if not is_browser_preview:
-            gate = _subscription_device_gate(request, token, access)
+            gate = None if skip_device_gate_for_bound_refresh else _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
                 reason = str(gate.get("reason") or "").strip()
                 if reason in {"device_removed", "token_bound_to_other_device", "token_revoked", "token_expired"}:
