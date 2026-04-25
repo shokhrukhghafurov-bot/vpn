@@ -92,6 +92,9 @@ from db_store import (
 
 app = FastAPI(title=f"{settings.APP_NAME} VPN API")
 logger = logging.getLogger("inet.vpn")
+_LOG_LEVEL_NAME = str(getattr(settings, "LOG_LEVEL", "ERROR") or "ERROR").upper()
+logger.setLevel(getattr(logging, _LOG_LEVEL_NAME, logging.ERROR))
+
 
 security = HTTPBearer(auto_error=False)
 basic_security = HTTPBasic()
@@ -1523,7 +1526,8 @@ def _generic_probe_candidate(payload: Dict[str, Any], *, pool: str, tcp_timeout:
                 "real_probe_timeout",
             )
             if allow_tcp_fallback_on_runner_error and real_probe_error.startswith(runner_error_prefixes):
-                logger.warning("[vpn][probe] pool=%s strict_real_probe=1 runner_error=%s tcp_fallback_allowed=1", pool, real_probe_error or "-")
+                if bool(getattr(settings, "VPN_PROBE_ERROR_LOGS", False)):
+                    logger.warning("[vpn][probe] pool=%s strict_real_probe=1 runner_error=%s tcp_fallback_allowed=1", pool, real_probe_error or "-")
             else:
                 return real_probe
     elif require_real_probe:
