@@ -134,6 +134,14 @@ class Settings:
     ADMIN_BASIC_USER: str = os.getenv("ADMIN_BASIC_USER", "admin")
     ADMIN_BASIC_PASS: str = os.getenv("ADMIN_BASIC_PASS", "change_me")
 
+    # Railway cost-safe logging. Default: show only real errors, hide HTTP access/probe spam.
+    LOG_LEVEL: str = os.getenv("LOG_LEVEL", "ERROR").strip().upper()
+    UVICORN_ACCESS_LOG: bool = _env_bool("UVICORN_ACCESS_LOG", False)
+    STARTUP_PROBE_LOG: bool = _env_bool("STARTUP_PROBE_LOG", False)
+    VPN_VERBOSE_PROBE_LOGS: bool = _env_bool("VPN_VERBOSE_PROBE_LOGS", False)
+    VPN_PROBE_ERROR_LOGS: bool = _env_bool("VPN_PROBE_ERROR_LOGS", False)
+    SUBSCRIPTION_VERBOSE_LOGS: bool = _env_bool("SUBSCRIPTION_VERBOSE_LOGS", False)
+
     APP_NAME: str = os.getenv("APP_NAME", "INET")
     APP_ENV: str = os.getenv("APP_ENV", "production")
     APP_LANGS: List[str] = None
