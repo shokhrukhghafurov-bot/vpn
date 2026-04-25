@@ -133,6 +133,24 @@ CREATE TABLE IF NOT EXISTS devices (
     UNIQUE(user_id, device_fingerprint)
 );
 
+CREATE TABLE IF NOT EXISTS device_subscription_tokens (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL,
+    token TEXT NOT NULL UNIQUE,
+    device_fingerprint TEXT,
+    platform TEXT,
+    device_name TEXT,
+    client TEXT,
+    client_id TEXT,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    first_seen_at TIMESTAMPTZ,
+    last_seen_at TIMESTAMPTZ,
+    expires_at TIMESTAMPTZ,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS locations (
     id SERIAL PRIMARY KEY,
     code TEXT NOT NULL UNIQUE,
@@ -236,6 +254,18 @@ CREATE TABLE IF NOT EXISTS user_location_credentials (
     UNIQUE(user_id, location_code)
 );
 
+CREATE TABLE IF NOT EXISTS user_device_location_credentials (
+    id SERIAL PRIMARY KEY,
+    user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE,
+    location_code TEXT NOT NULL,
+    uuid TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE(device_id, location_code)
+);
+
 CREATE TABLE IF NOT EXISTS virtual_location_assignments (
     id SERIAL PRIMARY KEY,
     user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -292,6 +322,21 @@ MIGRATION_SQL = [
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ DEFAULT NOW()",
     "ALTER TABLE devices ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
 
+    # per-device subscription tokens: one import link = one device slot
+    "CREATE TABLE IF NOT EXISTS device_subscription_tokens (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL, token TEXT NOT NULL UNIQUE, device_fingerprint TEXT, platform TEXT, device_name TEXT, client TEXT, client_id TEXT, is_active BOOLEAN NOT NULL DEFAULT TRUE, first_seen_at TIMESTAMPTZ, last_seen_at TIMESTAMPTZ, expires_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW())",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS device_id INTEGER REFERENCES devices(id) ON DELETE SET NULL",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS device_fingerprint TEXT",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS platform TEXT",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS device_name TEXT",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS client TEXT",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS client_id TEXT",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS first_seen_at TIMESTAMPTZ",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS last_seen_at TIMESTAMPTZ",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS expires_at TIMESTAMPTZ",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ DEFAULT NOW()",
+    "ALTER TABLE device_subscription_tokens ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()",
+
     # locations
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS country_code TEXT",
     "ALTER TABLE locations ADD COLUMN IF NOT EXISTS is_recommended BOOLEAN DEFAULT FALSE",
@@ -339,12 +384,19 @@ MIGRATION_SQL = [
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_user_id ON subscriptions(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_subscriptions_status ON subscriptions(status)",
     "CREATE INDEX IF NOT EXISTS idx_devices_user_id ON devices(user_id)",
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_device_subscription_tokens_token ON device_subscription_tokens(token)",
+    "CREATE INDEX IF NOT EXISTS idx_device_subscription_tokens_user_id ON device_subscription_tokens(user_id)",
+    "CREATE INDEX IF NOT EXISTS idx_device_subscription_tokens_device_id ON device_subscription_tokens(device_id)",
+    "CREATE INDEX IF NOT EXISTS idx_device_subscription_tokens_fingerprint ON device_subscription_tokens(user_id, device_fingerprint)",
     "CREATE INDEX IF NOT EXISTS idx_payments_user_id ON payments(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_payments_status ON payments(status)",
     "CREATE INDEX IF NOT EXISTS idx_bot_notifications_unsent ON bot_notifications(sent_at, failed_at, next_retry_at, created_at)",
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_user_id ON user_location_credentials(user_id)",
     "CREATE INDEX IF NOT EXISTS idx_user_location_credentials_location_code ON user_location_credentials(location_code)",
+    "CREATE TABLE IF NOT EXISTS user_device_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(device_id, location_code))",
+    "CREATE INDEX IF NOT EXISTS idx_user_device_location_credentials_user_device ON user_device_location_credentials(user_id, device_id)",
+    "CREATE INDEX IF NOT EXISTS idx_user_device_location_credentials_location_code ON user_device_location_credentials(location_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_virtual_code ON virtual_location_assignments(virtual_code)",
     "CREATE INDEX IF NOT EXISTS idx_virtual_location_assignments_concrete_code ON virtual_location_assignments(concrete_code)",
     "CREATE TABLE IF NOT EXISTS vpn_location_sessions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, location_code TEXT NOT NULL, client TEXT, platform TEXT, device_name TEXT, subscription_token TEXT, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint, location_code))",
@@ -363,6 +415,9 @@ POST_MIGRATION_SQL = [
     "UPDATE users SET language = 'ru' WHERE language IS NULL OR language = ''",
     "UPDATE users SET status = 'active' WHERE status IS NULL OR status = ''",
     "UPDATE users SET device_limit_override = NULL WHERE device_limit_override IS NOT NULL AND device_limit_override <= 0",
+    "UPDATE device_subscription_tokens SET is_active = TRUE WHERE is_active IS NULL",
+    "UPDATE device_subscription_tokens SET created_at = NOW() WHERE created_at IS NULL",
+    "UPDATE device_subscription_tokens SET updated_at = NOW() WHERE updated_at IS NULL",
     f"UPDATE plans SET device_limit = {int(settings.VPN_DEFAULT_DEVICE_LIMIT)} WHERE device_limit IS NULL OR device_limit <= 0",
     "UPDATE plans SET is_active = TRUE WHERE is_active IS NULL",
     "UPDATE plans SET source_env_key = code WHERE source_env_key IS NULL OR source_env_key = ''",
@@ -380,6 +435,8 @@ POST_MIGRATION_SQL = [
     "INSERT INTO vpn_runtime_settings (id, payload) VALUES (1, '{}'::jsonb) ON CONFLICT (id) DO NOTHING",
     "CREATE TABLE IF NOT EXISTS user_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, location_code))",
     "UPDATE user_location_credentials SET status = 'active' WHERE status IS NULL OR status = ''",
+    "CREATE TABLE IF NOT EXISTS user_device_location_credentials (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_id INTEGER NOT NULL REFERENCES devices(id) ON DELETE CASCADE, location_code TEXT NOT NULL, uuid TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'active', created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(device_id, location_code))",
+    "UPDATE user_device_location_credentials SET status = 'active' WHERE status IS NULL OR status = ''",
     "CREATE TABLE IF NOT EXISTS virtual_location_assignments (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, virtual_code TEXT NOT NULL, concrete_code TEXT NOT NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, virtual_code))",
     "CREATE TABLE IF NOT EXISTS vpn_location_sessions (id SERIAL PRIMARY KEY, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, device_fingerprint TEXT NOT NULL, location_code TEXT NOT NULL, client TEXT, platform TEXT, device_name TEXT, subscription_token TEXT, last_seen_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(), UNIQUE(user_id, device_fingerprint, location_code))",
     "UPDATE locations SET name_ru = 'Авто | Самый быстрый' WHERE code = 'auto-fastest' AND (name_ru IS NULL OR BTRIM(name_ru) = '' OR name_ru IN ('Авто | Самый быстрый', '★ Авто | Самый быстрый'))",
@@ -393,8 +450,10 @@ SERIAL_SEQUENCE_TARGETS = (
     ("plans", "id"),
     ("subscriptions", "id"),
     ("devices", "id"),
+    ("device_subscription_tokens", "id"),
     ("locations", "id"),
     ("user_location_credentials", "id"),
+    ("user_device_location_credentials", "id"),
     ("admin_notes", "id"),
     ("manual_extensions", "id"),
     ("bot_notifications", "id"),
@@ -792,6 +851,15 @@ def save_runtime_settings_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
             "is_active": _coerce_runtime_bool(raw_plan.get("is_active"), base_active),
         })
     normalized["plans"] = normalized_plans
+
+    # Preserve admin-managed 3X-UI server registry across normal VPN settings saves.
+    # This lets operators add new 3X-UI servers from the admin panel without
+    # changing code or Railway ENV every time a new node is created.
+    if isinstance(payload.get("xui_servers"), list):
+        normalized["xui_servers"] = payload.get("xui_servers")
+    elif isinstance(previous.get("xui_servers"), list):
+        normalized["xui_servers"] = previous.get("xui_servers")
+
     if prev_mode == "free" and next_mode == "paid":
         normalized["paid_grace_started_at"] = now_iso
     elif next_mode == "free":
@@ -1725,20 +1793,108 @@ def ensure_user_location_credential(user_id: int, location_code: str) -> Dict[st
 
 
 
-def build_user_vpn_payload_for_location(user_id: int, row: Dict[str, Any], *, requested_location_code: Optional[str] = None) -> Dict[str, Any]:
+
+def _get_user_device_location_credential(cur: psycopg.Cursor, user_id: int, device_id: int, location_code: str) -> Optional[Dict[str, Any]]:
+    cur.execute(
+        """
+        SELECT *
+        FROM user_device_location_credentials
+        WHERE user_id = %s AND device_id = %s AND location_code = %s
+        LIMIT 1
+        """,
+        (int(user_id), int(device_id), str(location_code or "").strip()),
+    )
+    row = cur.fetchone()
+    return dict(row) if row else None
+
+
+def ensure_user_device_location_credential(user_id: int, device_id: int, location_code: str) -> Dict[str, Any]:
+    resolved_code = str(location_code or "").strip()
+    if not resolved_code:
+        raise ValueError("location_code is required for per-device credential")
+    if int(device_id or 0) <= 0:
+        return ensure_user_location_credential(user_id, resolved_code)
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, is_active FROM devices WHERE id = %s AND user_id = %s LIMIT 1",
+                (int(device_id), int(user_id)),
+            )
+            device_row = cur.fetchone()
+            if not device_row or not bool(device_row.get("is_active")):
+                raise PermissionError("Device is removed")
+            existing = _get_user_device_location_credential(cur, user_id, device_id, resolved_code)
+            if existing:
+                if str(existing.get("status") or "").strip().lower() != "active":
+                    cur.execute(
+                        """
+                        UPDATE user_device_location_credentials
+                        SET status = 'active', updated_at = NOW()
+                        WHERE id = %s
+                        RETURNING *
+                        """,
+                        (existing["id"],),
+                    )
+                    row = cur.fetchone()
+                    conn.commit()
+                    return dict(row) if row else existing
+                return existing
+            generated_uuid = str(uuid4())
+            cur.execute(
+                """
+                INSERT INTO user_device_location_credentials (user_id, device_id, location_code, uuid, status)
+                VALUES (%s, %s, %s, %s, 'active')
+                ON CONFLICT (device_id, location_code) DO UPDATE
+                    SET updated_at = NOW()
+                RETURNING *
+                """,
+                (int(user_id), int(device_id), resolved_code, generated_uuid),
+            )
+            row = cur.fetchone()
+        conn.commit()
+    if not row:
+        raise ValueError("Failed to create per-device credential")
+    return dict(row)
+
+
+def revoke_device_location_credentials(user_id: int, device_id: int) -> None:
+    if int(device_id or 0) <= 0:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE user_device_location_credentials
+                SET status = 'revoked', updated_at = NOW()
+                WHERE user_id = %s AND device_id = %s AND status <> 'revoked'
+                """,
+                (int(user_id), int(device_id)),
+            )
+        conn.commit()
+
+
+def build_user_vpn_payload_for_location(user_id: int, row: Dict[str, Any], *, requested_location_code: Optional[str] = None, device_id: Optional[int] = None) -> Dict[str, Any]:
     payload = _compose_vpn_payload_for_location(row, requested_location_code=requested_location_code)
     if not payload:
         return {}
-    if not _location_requires_user_credential(row=row, payload=payload):
+    force_per_device_uuid = bool(getattr(settings, "DEVICE_UUID_REQUIRED_FOR_SUBSCRIPTION", True)) and int(device_id or 0) > 0
+    if not force_per_device_uuid and not _location_requires_user_credential(row=row, payload=payload):
         return payload
     resolved_location_code = str(row.get("code") or requested_location_code or "").strip()
-    credential = ensure_user_location_credential(int(user_id), resolved_location_code)
+    if int(device_id or 0) > 0:
+        credential = ensure_user_device_location_credential(int(user_id), int(device_id or 0), resolved_location_code)
+    else:
+        credential = ensure_user_location_credential(int(user_id), resolved_location_code)
     payload = dict(payload)
     template_uuid = str(payload.get("uuid") or "").strip()
     payload["uuid"] = str(credential.get("uuid") or "").strip()
     payload["id"] = payload["uuid"]
     payload["credential_status"] = str(credential.get("status") or "active").strip() or "active"
     payload["credential_location_code"] = resolved_location_code
+    if int(device_id or 0) > 0:
+        payload["credential_mode"] = "per_device"
+        payload["access_mode"] = "owned_per_user"
+        payload["credential_device_id"] = int(device_id or 0)
     if template_uuid and template_uuid != payload["uuid"]:
         payload["template_uuid"] = template_uuid
     return payload
@@ -2705,6 +2861,456 @@ def get_current_subscription(user_id: int) -> Optional[Dict[str, Any]]:
             return dict(row) if row else None
 
 
+
+def _generate_device_subscription_token() -> str:
+    return "dt_" + secrets.token_urlsafe(32).rstrip("=")
+
+
+def _generate_subscription_client_id() -> str:
+    return "cid-" + secrets.token_urlsafe(18).rstrip("=").replace("/", "-").replace(".", "-")[:36]
+
+
+def _normalize_subscription_client_id(value: Any) -> str:
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    cleaned = ''.join(ch for ch in raw if ch.isalnum() or ch in {'-', '_', '.', ':', '@'})
+    return cleaned[:120]
+
+
+def _pending_device_fingerprint_for_token(token: str) -> str:
+    normalized = str(token or "").strip()
+    digest = hashlib.sha256(f"pending-device-token:{normalized}".encode("utf-8")).hexdigest()
+    return f"pending:{digest}"
+
+
+def _is_pending_device_fingerprint(value: Any) -> bool:
+    return str(value or "").strip().lower().startswith("pending:")
+
+
+def create_device_subscription_token_for_user(
+    user_id: int,
+    *,
+    platform: str = "",
+    device_name: str = "",
+    client: str = "",
+    ttl_hours: Optional[int] = None,
+) -> Dict[str, Any]:
+    """Create a one-device subscription token and reserve one device slot immediately.
+
+    The bot/open-app flow uses the user subscription token only as a bridge. This
+    function creates an active pending device row first, then creates dt_... bound
+    to that pending row. On the first real /sub/dt_... request the pending
+    fingerprint is replaced by the real subscription-client fingerprint.
+
+    Result: pressing "Connect/Add device" consumes exactly one slot, the token is
+    not user-wide, and deleting the device disables that token too.
+    """
+    user = get_user_by_id(int(user_id))
+    if not user:
+        raise ValueError("User not found")
+    if user.get("status") == "blocked":
+        raise PermissionError("User is blocked")
+    access_view = get_user_subscription_view(int(user_id))
+    if not bool(access_view.get("is_active")):
+        raise PermissionError("Active subscription required")
+    device_limit = max(1, int(access_view.get("device_limit") or 1))
+    expires_at = None
+    if ttl_hours is not None and int(ttl_hours or 0) > 0:
+        expires_at = now_utc() + timedelta(hours=int(ttl_hours))
+
+    normalized_platform = str(platform or "client").strip()[:80] or "client"
+    normalized_device_name = str(device_name or "VPN client").strip()[:160] or "VPN client"
+    normalized_client = str(client or "").strip()[:80]
+
+    # Reuse an existing unbound pending token for the same platform/client. This
+    # prevents repeated clicks on “Open connection” from consuming all slots.
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dst.*, d.id AS pending_device_id
+                FROM device_subscription_tokens dst
+                JOIN devices d ON d.id = dst.device_id AND d.user_id = dst.user_id
+                WHERE dst.user_id = %s
+                  AND dst.is_active = TRUE
+                  AND d.is_active = TRUE
+                  AND COALESCE(dst.device_fingerprint, '') LIKE 'pending:%%'
+                  AND COALESCE(dst.platform, '') = %s
+                  AND COALESCE(dst.client, '') = %s
+                  AND (dst.expires_at IS NULL OR dst.expires_at > NOW())
+                ORDER BY dst.created_at DESC
+                LIMIT 1
+                """,
+                (int(user_id), normalized_platform, normalized_client),
+            )
+            pending = cur.fetchone()
+            if pending:
+                return dict(pending)
+
+    devices_used = int(access_view.get("devices_used") or 0)
+    if devices_used >= device_limit:
+        raise PermissionError(f"Device limit reached ({devices_used}/{device_limit})")
+
+    for _ in range(6):
+        token = _generate_device_subscription_token()
+        client_id = _generate_subscription_client_id()
+        pending_fingerprint = _pending_device_fingerprint_for_token(token)
+        try:
+            with db() as conn:
+                with conn.cursor() as cur:
+                    # Re-check inside the transaction so quick repeated button taps
+                    # cannot reserve more active slots than the plan allows.
+                    cur.execute(
+                        "SELECT COUNT(*) AS cnt FROM devices WHERE user_id = %s AND is_active = TRUE",
+                        (int(user_id),),
+                    )
+                    count_row = cur.fetchone() or {"cnt": 0}
+                    current_used = int(count_row.get("cnt") or 0)
+                    if current_used >= device_limit:
+                        raise PermissionError(f"Device limit reached ({current_used}/{device_limit})")
+                    cur.execute(
+                        """
+                        INSERT INTO devices (user_id, platform, device_name, device_fingerprint)
+                        VALUES (%s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (int(user_id), normalized_platform, normalized_device_name, pending_fingerprint),
+                    )
+                    device_row = cur.fetchone()
+                    cur.execute(
+                        """
+                        INSERT INTO device_subscription_tokens
+                            (user_id, device_id, token, device_fingerprint, platform, device_name, client, client_id, expires_at)
+                        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+                        RETURNING *
+                        """,
+                        (
+                            int(user_id),
+                            int(device_row["id"]),
+                            token,
+                            pending_fingerprint,
+                            normalized_platform,
+                            normalized_device_name,
+                            normalized_client,
+                            client_id,
+                            expires_at,
+                        ),
+                    )
+                    row = cur.fetchone()
+                conn.commit()
+                result = dict(row)
+                result["device"] = dict(device_row)
+                return result
+        except psycopg.errors.UniqueViolation:
+            continue
+    raise ValueError("Failed to create device subscription token")
+
+
+def get_device_subscription_token(subscription_token: str) -> Optional[Dict[str, Any]]:
+    token = str(subscription_token or "").strip()
+    if not token:
+        return None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dst.*, u.telegram_id, u.username, u.first_name, u.last_name, u.language, u.status AS user_status,
+                       u.device_limit_override, u.subscription_token AS user_subscription_token
+                FROM device_subscription_tokens dst
+                JOIN users u ON u.id = dst.user_id
+                WHERE dst.token = %s
+                LIMIT 1
+                """,
+                (token,),
+            )
+            row = cur.fetchone()
+            return dict(row) if row else None
+
+
+def user_from_device_subscription_token(row: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not row:
+        return None
+    return {
+        "id": row.get("user_id"),
+        "telegram_id": row.get("telegram_id"),
+        "username": row.get("username"),
+        "first_name": row.get("first_name"),
+        "last_name": row.get("last_name"),
+        "language": row.get("language") or "ru",
+        "status": row.get("user_status") or "active",
+        "device_limit_override": row.get("device_limit_override"),
+        "subscription_token": row.get("user_subscription_token"),
+    }
+
+
+def bind_device_subscription_token(
+    subscription_token: str,
+    *,
+    platform: str,
+    device_name: str,
+    device_fingerprint: str,
+    client: str = "",
+    client_id: str = "",
+) -> Dict[str, Any]:
+    token = str(subscription_token or "").strip()
+    fingerprint = str(device_fingerprint or "").strip()
+    request_client_id = _normalize_subscription_client_id(client_id)
+    if not token or not fingerprint:
+        return {"allowed": False, "reason": "device_fingerprint_required", "detail": "Device fingerprint is required"}
+
+    normalized_platform = str(platform or "client").strip()[:80] or "client"
+    normalized_device_name = str(device_name or "VPN client").strip()[:160] or "VPN client"
+    normalized_client = str(client or "").strip()[:80]
+
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT dst.*, u.status AS user_status
+                FROM device_subscription_tokens dst
+                JOIN users u ON u.id = dst.user_id
+                WHERE dst.token = %s
+                FOR UPDATE
+                """,
+                (token,),
+            )
+            raw_token_row = cur.fetchone()
+            if not raw_token_row:
+                return {"allowed": False, "reason": "token_not_found", "detail": "Device subscription token not found"}
+            token_row = dict(raw_token_row)
+            user_id = int(token_row.get("user_id") or 0)
+            token_id = int(token_row.get("id") or 0)
+            token_device_id = int(token_row.get("device_id") or 0)
+
+            if not bool(token_row.get("is_active")):
+                return {"allowed": False, "reason": "token_revoked", "detail": "Device subscription token is revoked", "user_id": user_id}
+            expires_at = token_row.get("expires_at")
+            if expires_at:
+                exp = expires_at if isinstance(expires_at, datetime) else _normalize_optional_timestamp(expires_at)
+                if exp and exp.astimezone(timezone.utc) < now_utc():
+                    cur.execute("UPDATE device_subscription_tokens SET is_active = FALSE, updated_at = NOW() WHERE id = %s", (token_id,))
+                    conn.commit()
+                    return {"allowed": False, "reason": "token_expired", "detail": "Device subscription token expired", "user_id": user_id}
+            if str(token_row.get("user_status") or "").strip().lower() == "blocked":
+                return {"allowed": False, "reason": "user_blocked", "detail": "Access blocked", "user_id": user_id}
+
+            expected_client_id = _normalize_subscription_client_id(token_row.get("client_id"))
+            if expected_client_id and request_client_id != expected_client_id:
+                return {
+                    "allowed": False,
+                    "reason": "token_bound_to_other_device",
+                    "detail": "This device token must be used with its original subcid/client_id",
+                    "user_id": user_id,
+                    "known_device": False,
+                }
+
+            bound_fp = str(token_row.get("device_fingerprint") or "").strip()
+            pending_bound = _is_pending_device_fingerprint(bound_fp)
+
+            if token_device_id > 0:
+                cur.execute("SELECT * FROM devices WHERE user_id = %s AND id = %s LIMIT 1", (user_id, token_device_id))
+                linked_device = cur.fetchone()
+                if linked_device and not bool(linked_device.get("is_active")):
+                    cur.execute("UPDATE device_subscription_tokens SET is_active = FALSE, updated_at = NOW() WHERE id = %s", (token_id,))
+                    conn.commit()
+                    return {"allowed": False, "reason": "device_removed", "detail": "Device was removed", "user_id": user_id, "known_device": False}
+
+            if bound_fp and not pending_bound and bound_fp != fingerprint:
+                return {
+                    "allowed": False,
+                    "reason": "token_bound_to_other_device",
+                    "detail": "This subscription token is already bound to another device",
+                    "user_id": user_id,
+                    "known_device": False,
+                }
+
+            if bound_fp == fingerprint and not pending_bound:
+                cur.execute(
+                    """
+                    SELECT * FROM devices
+                    WHERE user_id = %s AND device_fingerprint = %s
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (user_id, fingerprint),
+                )
+                device_row = cur.fetchone()
+                if device_row and not bool(device_row.get("is_active")):
+                    cur.execute("UPDATE device_subscription_tokens SET is_active = FALSE, updated_at = NOW() WHERE id = %s", (token_id,))
+                    conn.commit()
+                    return {"allowed": False, "reason": "device_removed", "detail": "Device was removed", "user_id": user_id, "known_device": False}
+                cur.execute(
+                    """
+                    UPDATE device_subscription_tokens
+                    SET platform = COALESCE(NULLIF(%s, ''), platform),
+                        device_name = COALESCE(NULLIF(%s, ''), device_name),
+                        client = COALESCE(NULLIF(%s, ''), client),
+                        client_id = COALESCE(NULLIF(%s, ''), client_id),
+                        last_seen_at = NOW(), updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (normalized_platform, normalized_device_name, normalized_client, request_client_id, token_id),
+                )
+                updated = cur.fetchone()
+                if device_row:
+                    cur.execute(
+                        "UPDATE devices SET platform = %s, device_name = %s, last_seen_at = NOW() WHERE id = %s",
+                        (normalized_platform, normalized_device_name, device_row["id"]),
+                    )
+                conn.commit()
+                return {"allowed": True, "reason": "ok", "detail": "OK", "user_id": user_id, "known_device": True, "device_token": dict(updated or token_row), "device": dict(device_row) if device_row else None}
+
+            # New dt_ token: replace the pending fingerprint by the real one on
+            # the already-reserved device slot. If the same real device already
+            # exists, reuse it and release the pending slot so one phone does not
+            # accidentally consume two slots.
+            cur.execute(
+                """
+                SELECT * FROM devices
+                WHERE user_id = %s AND device_fingerprint = %s AND is_active = TRUE
+                ORDER BY id DESC LIMIT 1
+                """,
+                (user_id, fingerprint),
+            )
+            existing_real_device = cur.fetchone()
+            if existing_real_device:
+                real_device_id = int(existing_real_device["id"])
+                if token_device_id and token_device_id != real_device_id:
+                    cur.execute("UPDATE devices SET is_active = FALSE, last_seen_at = NOW() WHERE user_id = %s AND id = %s", (user_id, token_device_id))
+                cur.execute(
+                    """
+                    UPDATE device_subscription_tokens
+                    SET device_id = %s,
+                        device_fingerprint = %s,
+                        platform = %s,
+                        device_name = %s,
+                        client = %s,
+                        client_id = COALESCE(NULLIF(%s, ''), client_id),
+                        first_seen_at = COALESCE(first_seen_at, NOW()),
+                        last_seen_at = NOW(),
+                        updated_at = NOW()
+                    WHERE id = %s
+                    RETURNING *
+                    """,
+                    (real_device_id, fingerprint, normalized_platform, normalized_device_name, normalized_client, request_client_id, token_id),
+                )
+                updated = cur.fetchone()
+                cur.execute(
+                    "UPDATE devices SET platform = %s, device_name = %s, last_seen_at = NOW() WHERE id = %s",
+                    (normalized_platform, normalized_device_name, real_device_id),
+                )
+                conn.commit()
+                return {"allowed": True, "reason": "ok", "detail": "OK", "user_id": user_id, "known_device": True, "device": dict(existing_real_device), "device_token": dict(updated)}
+
+            if token_device_id <= 0:
+                # Legacy token row without a reserved slot: keep compatibility but
+                # still enforce the plan limit before creating a device.
+                try:
+                    conn.commit()
+                    device = _upsert_device_record(
+                        user_id,
+                        normalized_platform,
+                        normalized_device_name,
+                        fingerprint,
+                        enforce_limit=True,
+                    )
+                except PermissionError as exc:
+                    view = get_user_subscription_view(user_id)
+                    return {
+                        "allowed": False,
+                        "reason": "device_limit_reached" if "limit" in str(exc).lower() else "device_bind_failed",
+                        "detail": str(exc),
+                        "user_id": user_id,
+                        "devices_used": int(view.get("devices_used") or 0),
+                        "device_limit": int(view.get("device_limit") or 0),
+                        "known_device": False,
+                    }
+                except Exception as exc:
+                    return {"allowed": False, "reason": "device_bind_failed", "detail": str(exc), "user_id": user_id, "known_device": False}
+                with db() as conn2:
+                    with conn2.cursor() as cur2:
+                        cur2.execute(
+                            """
+                            UPDATE device_subscription_tokens
+                            SET device_id = %s, device_fingerprint = %s, platform = %s, device_name = %s,
+                                client = %s, client_id = COALESCE(NULLIF(%s, ''), client_id),
+                                first_seen_at = COALESCE(first_seen_at, NOW()), last_seen_at = NOW(), updated_at = NOW()
+                            WHERE token = %s AND (device_fingerprint IS NULL OR device_fingerprint = '')
+                            RETURNING *
+                            """,
+                            (int(device["id"]), fingerprint, normalized_platform, normalized_device_name, normalized_client, request_client_id, token),
+                        )
+                        updated = cur2.fetchone()
+                    conn2.commit()
+                if not updated:
+                    return {"allowed": False, "reason": "token_bind_race", "detail": "Token was bound by another request", "user_id": user_id, "known_device": False}
+                return {"allowed": True, "reason": "ok", "detail": "OK", "user_id": user_id, "known_device": False, "device": device, "device_token": dict(updated)}
+
+            # Normal new pending slot path.
+            try:
+                cur.execute(
+                    """
+                    UPDATE devices
+                    SET device_fingerprint = %s,
+                        platform = %s,
+                        device_name = %s,
+                        is_active = TRUE,
+                        last_seen_at = NOW()
+                    WHERE user_id = %s AND id = %s AND is_active = TRUE
+                    RETURNING *
+                    """,
+                    (fingerprint, normalized_platform, normalized_device_name, user_id, token_device_id),
+                )
+                device = cur.fetchone()
+            except psycopg.errors.UniqueViolation:
+                conn.rollback()
+                return {"allowed": False, "reason": "token_bind_race", "detail": "Device fingerprint was already bound", "user_id": user_id, "known_device": False}
+            if not device:
+                conn.commit()
+                return {"allowed": False, "reason": "device_removed", "detail": "Device was removed", "user_id": user_id, "known_device": False}
+            cur.execute(
+                """
+                UPDATE device_subscription_tokens
+                SET device_id = %s,
+                    device_fingerprint = %s,
+                    platform = %s,
+                    device_name = %s,
+                    client = %s,
+                    client_id = COALESCE(NULLIF(%s, ''), client_id),
+                    first_seen_at = COALESCE(first_seen_at, NOW()),
+                    last_seen_at = NOW(),
+                    updated_at = NOW()
+                WHERE id = %s AND (device_fingerprint = %s OR device_fingerprint IS NULL OR device_fingerprint = '')
+                RETURNING *
+                """,
+                (int(device["id"]), fingerprint, normalized_platform, normalized_device_name, normalized_client, request_client_id, token_id, bound_fp),
+            )
+            updated = cur.fetchone()
+            if not updated:
+                conn.commit()
+                return {"allowed": False, "reason": "token_bind_race", "detail": "Token was bound by another request", "user_id": user_id, "known_device": False}
+            conn.commit()
+            return {"allowed": True, "reason": "ok", "detail": "OK", "user_id": user_id, "known_device": False, "device": dict(device), "device_token": dict(updated)}
+
+
+def touch_device_subscription_token(subscription_token: str, device_fingerprint: str) -> None:
+    token = str(subscription_token or "").strip()
+    fingerprint = str(device_fingerprint or "").strip()
+    if not token or not fingerprint:
+        return
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE device_subscription_tokens
+                SET last_seen_at = NOW(), updated_at = NOW()
+                WHERE token = %s AND device_fingerprint = %s AND is_active = TRUE
+                """,
+                (token, fingerprint),
+            )
+        conn.commit()
+
 def get_subscription_device_gate_by_token(subscription_token: str, device_fingerprint: str) -> Optional[Dict[str, Any]]:
     token = str(subscription_token or "").strip()
     fingerprint = str(device_fingerprint or "").strip()
@@ -3239,24 +3845,53 @@ def delete_device(user_id: int, device_id: int) -> Optional[Dict[str, Any]]:
                 WHERE user_id = %s AND id = %s AND is_active = TRUE
                 RETURNING *
                 """,
-                (user_id, device_id),
+                (int(user_id), int(device_id)),
             )
             row = cur.fetchone()
+            if row:
+                fingerprint = str(row.get("device_fingerprint") or "").strip()
+                cur.execute(
+                    """
+                    UPDATE device_subscription_tokens
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE user_id = %s
+                      AND (
+                            device_id = %s
+                         OR (device_fingerprint IS NOT NULL AND device_fingerprint <> '' AND device_fingerprint = %s)
+                      )
+                    """,
+                    (int(user_id), int(device_id), fingerprint),
+                )
+                cur.execute(
+                    """
+                    UPDATE user_device_location_credentials
+                    SET status = 'revoked', updated_at = NOW()
+                    WHERE user_id = %s AND device_id = %s AND status <> 'revoked'
+                    """,
+                    (int(user_id), int(device_id)),
+                )
+                cur.execute(
+                    """
+                    DELETE FROM vpn_location_sessions
+                    WHERE user_id = %s AND device_fingerprint = %s
+                    """,
+                    (int(user_id), fingerprint),
+                )
         conn.commit()
     if row:
         enqueue_notification(
-            user_id=user_id,
+            user_id=int(user_id),
             event_type="device_removed",
             unique_key=f"device_removed:{row['id']}:{int(datetime.now(timezone.utc).timestamp())}",
             payload={
                 "platform": row.get("platform"),
                 "device_name": row.get("device_name"),
+                "device_id": row.get("id"),
+                "uuid_scope": "per_device",
             },
         )
         return dict(row)
     return None
-
-
 def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
     query = "SELECT * FROM locations WHERE is_deleted = FALSE"
     if active_only:
@@ -3855,6 +4490,28 @@ def set_user_device_limit_override_by_telegram(telegram_id: int, device_limit_ov
     return get_user_snapshot_by_telegram(telegram_id)
 
 
+def list_active_device_location_credentials(*, user_id: Optional[int] = None, device_id: Optional[int] = None) -> List[Dict[str, Any]]:
+    query = """
+        SELECT c.*, d.platform, d.device_name, d.device_fingerprint, u.telegram_id
+        FROM user_device_location_credentials c
+        JOIN devices d ON d.id = c.device_id AND d.user_id = c.user_id
+        JOIN users u ON u.id = c.user_id
+        WHERE c.status = 'active' AND d.is_active = TRUE
+    """
+    args: List[Any] = []
+    if user_id is not None:
+        query += " AND c.user_id = %s"
+        args.append(int(user_id))
+    if device_id is not None:
+        query += " AND c.device_id = %s"
+        args.append(int(device_id))
+    query += " ORDER BY c.location_code ASC, c.user_id ASC, c.device_id ASC"
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(query, tuple(args))
+            return [dict(row) for row in cur.fetchall()]
+
+
 def reset_user_devices_by_telegram(telegram_id: int, admin_name: str) -> Dict[str, Any]:
     user = get_user_by_telegram_id(telegram_id)
     if not user:
@@ -3863,6 +4520,15 @@ def reset_user_devices_by_telegram(telegram_id: int, admin_name: str) -> Dict[st
         with conn.cursor() as cur:
             cur.execute("SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE", (user["id"],))
             devices = [dict(row) for row in cur.fetchall()]
+            cur.execute(
+                "UPDATE device_subscription_tokens SET is_active = FALSE, updated_at = NOW() WHERE user_id = %s",
+                (user["id"],),
+            )
+            cur.execute(
+                "UPDATE user_device_location_credentials SET status = 'revoked', updated_at = NOW() WHERE user_id = %s",
+                (user["id"],),
+            )
+            cur.execute("DELETE FROM vpn_location_sessions WHERE user_id = %s", (user["id"],))
             cur.execute("DELETE FROM devices WHERE user_id = %s", (user["id"],))
             cur.execute(
                 "INSERT INTO admin_notes (user_id, admin_name, note) VALUES (%s, %s, %s)",
