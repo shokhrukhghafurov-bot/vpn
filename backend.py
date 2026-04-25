@@ -1634,6 +1634,33 @@ def _patch_location_by_code(code: str, updates: Dict[str, Any]) -> Optional[Dict
     return create_location(payload)
 
 
+
+
+def _location_is_admin_disabled(row: Optional[Dict[str, Any]]) -> bool:
+    """Existing location was switched off in admin; refresh must not enable it."""
+    if not row:
+        return False
+    return not bool(row.get("is_active"))
+
+
+def _skip_admin_disabled_refresh(code: str, existing_by_code: Dict[str, Dict[str, Any]], assigned: List[Dict[str, Any]]) -> bool:
+    existing = existing_by_code.get(code) or {}
+    if not _location_is_admin_disabled(existing):
+        return False
+    assigned.append({
+        "code": code,
+        "server": None,
+        "transport": None,
+        "remark": None,
+        "latency_ms": None,
+        "updated": False,
+        "kept_old": False,
+        "skipped": True,
+        "reason": "admin_disabled",
+    })
+    return True
+
+
 def refresh_ru_lte_locations() -> Dict[str, Any]:
     sources = [item for item in (settings.RU_LTE_SOURCE_URLS or []) if str(item or "").strip()]
     candidates: List[Dict[str, Any]] = []
@@ -1759,6 +1786,8 @@ def refresh_ru_lte_locations() -> Dict[str, Any]:
     }
 
     for idx, code in enumerate(RU_LTE_RESERVE_LOCATION_CODES):
+        if _skip_admin_disabled_refresh(code, existing_by_code, assigned):
+            continue
         payload = dict(top[idx]) if idx < len(top) else {}
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
@@ -2013,6 +2042,8 @@ def refresh_black_locations() -> Dict[str, Any]:
     }
 
     for idx, code in enumerate(BLACK_RESERVE_LOCATION_CODES):
+        if _skip_admin_disabled_refresh(code, existing_by_code, assigned):
+            continue
         payload = dict(top[idx]) if idx < len(top) else {}
         if payload:
             for key in ["_score", "_source", "_probe_ok"]:
@@ -2470,6 +2501,8 @@ def _row_has_ready_payload(row: Dict[str, Any]) -> bool:
 def _public_concrete_location_allowed(row: Dict[str, Any]) -> bool:
     code = str(row.get("code") or "").strip()
     if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        return False
+    if not bool(row.get("is_active")):
         return False
     if not _location_status_is_online(row):
         return False
