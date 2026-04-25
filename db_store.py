@@ -2945,6 +2945,97 @@ def _is_pending_device_fingerprint(value: Any) -> bool:
     return str(value or "").strip().lower().startswith("pending:")
 
 
+def _pending_slot_ttl_hours() -> int:
+    try:
+        value = int(getattr(settings, "DEVICE_PENDING_SLOT_TTL_HOURS", 24) or 0)
+    except Exception:
+        value = 24
+    return max(0, value)
+
+
+def cleanup_expired_pending_device_slots(user_id: Optional[int] = None) -> int:
+    """Release old pending device slots that never completed first import.
+
+    A pending slot is created when the bot issues a one-device /sub/dt_... URL.
+    It must count against the plan limit immediately, but it should not stay
+    forever if the child/second phone never imports the subscription.
+    """
+    ttl_hours = _pending_slot_ttl_hours()
+    if ttl_hours <= 0:
+        return 0
+    uid = int(user_id or 0) or None
+    with db() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                WITH expired AS (
+                    SELECT d.id
+                    FROM devices d
+                    LEFT JOIN LATERAL (
+                        SELECT dst.id, dst.created_at, dst.expires_at
+                        FROM device_subscription_tokens dst
+                        WHERE dst.user_id = d.user_id
+                          AND dst.device_id = d.id
+                          AND dst.is_active = TRUE
+                        ORDER BY dst.created_at DESC, dst.id DESC
+                        LIMIT 1
+                    ) dst ON TRUE
+                    WHERE d.is_active = TRUE
+                      AND COALESCE(d.device_fingerprint, '') LIKE 'pending:%%'
+                      AND (%s::integer IS NULL OR d.user_id = %s::integer)
+                      AND (
+                            (dst.expires_at IS NOT NULL AND dst.expires_at <= NOW())
+                         OR (COALESCE(dst.created_at, d.created_at) <= NOW() - (%s * INTERVAL '1 hour'))
+                      )
+                )
+                UPDATE devices d
+                SET is_active = FALSE, last_seen_at = NOW()
+                WHERE d.id IN (SELECT id FROM expired)
+                RETURNING d.id
+                """,
+                (uid, uid, ttl_hours),
+            )
+            expired_ids = [int(row["id"]) for row in cur.fetchall()]
+            if expired_ids:
+                cur.execute(
+                    """
+                    UPDATE device_subscription_tokens
+                    SET is_active = FALSE, updated_at = NOW()
+                    WHERE device_id = ANY(%s)
+                       OR (COALESCE(device_fingerprint, '') LIKE 'pending:%%'
+                           AND (%s::integer IS NULL OR user_id = %s::integer)
+                           AND (
+                                (expires_at IS NOT NULL AND expires_at <= NOW())
+                             OR (created_at <= NOW() - (%s * INTERVAL '1 hour'))
+                           ))
+                    """,
+                    (expired_ids, uid, uid, ttl_hours),
+                )
+                cur.execute(
+                    """
+                    UPDATE user_device_location_credentials
+                    SET status = 'revoked', updated_at = NOW()
+                    WHERE device_id = ANY(%s) AND status <> 'revoked'
+                    """,
+                    (expired_ids,),
+                )
+        conn.commit()
+    return len(expired_ids)
+
+
+def _decorate_device_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    item = dict(row or {})
+    is_pending = _is_pending_device_fingerprint(item.get("device_fingerprint"))
+    item["is_pending"] = bool(is_pending)
+    if is_pending:
+        item["device_status"] = "pending"
+    elif bool(item.get("is_active", True)):
+        item["device_status"] = "active"
+    else:
+        item["device_status"] = "inactive"
+    return item
+
+
 def create_device_subscription_token_for_user(
     user_id: int,
     *,
@@ -2968,6 +3059,7 @@ def create_device_subscription_token_for_user(
         raise ValueError("User not found")
     if user.get("status") == "blocked":
         raise PermissionError("User is blocked")
+    cleanup_expired_pending_device_slots(int(user_id))
     access_view = get_user_subscription_view(int(user_id))
     if not bool(access_view.get("is_active")):
         raise PermissionError("Active subscription required")
@@ -3445,13 +3537,34 @@ def get_latest_subscription(user_id: int) -> Optional[Dict[str, Any]]:
 
 
 def get_user_devices(user_id: int) -> List[Dict[str, Any]]:
+    cleanup_expired_pending_device_slots(int(user_id))
     with db() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
-                (user_id,),
+                """
+                SELECT
+                    d.*,
+                    pending_token.created_at AS pending_created_at,
+                    pending_token.expires_at AS pending_expires_at
+                FROM devices d
+                LEFT JOIN LATERAL (
+                    SELECT dst.created_at, dst.expires_at
+                    FROM device_subscription_tokens dst
+                    WHERE dst.user_id = d.user_id
+                      AND dst.device_id = d.id
+                      AND dst.is_active = TRUE
+                    ORDER BY dst.created_at DESC, dst.id DESC
+                    LIMIT 1
+                ) pending_token ON TRUE
+                WHERE d.user_id = %s AND d.is_active = TRUE
+                ORDER BY
+                    CASE WHEN COALESCE(d.device_fingerprint, '') LIKE 'pending:%%' THEN 1 ELSE 0 END DESC,
+                    d.last_seen_at DESC,
+                    d.created_at DESC
+                """,
+                (int(user_id),),
             )
-            return [dict(row) for row in cur.fetchall()]
+            return [_decorate_device_row(dict(row)) for row in cur.fetchall()]
 
 
 def _get_user_subscription_view_with_conn(conn: psycopg.Connection, user_id: int) -> Dict[str, Any]:
@@ -3471,11 +3584,9 @@ def _get_user_subscription_view_with_conn(conn: psycopg.Connection, user_id: int
             latest_row = cur.fetchone()
             latest = dict(latest_row) if latest_row else None
 
-        cur.execute(
-            "SELECT * FROM devices WHERE user_id = %s AND is_active = TRUE ORDER BY last_seen_at DESC, created_at DESC",
-            (user_id,),
-        )
-        devices = [dict(row) for row in cur.fetchall()]
+        # Pending slots are cleaned/decorated by get_user_devices(). They count
+        # as used until imported or deleted/expired.
+        devices = get_user_devices(int(user_id))
 
     access_state = _resolve_user_access_state(user, subscription)
     subscription_token = ensure_user_subscription_token(user_id) if user and access_state.get("is_active") else None
