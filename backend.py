@@ -4291,11 +4291,28 @@ def _subscription_location_rows(user_id: Optional[int] = None, client_hint: Opti
     strict_rows = collect(strict_health=True)
     if strict_rows:
         return strict_rows
-    if bool(getattr(settings, "SUBSCRIPTION_ALLOW_READY_FALLBACK", False)):
-        return collect(strict_health=False)
-    logger.warning("[sub][publish] strict_live_only=1 fallback_ready_disabled=1 published=0 user_id=%s", user_id if user_id is not None else "-")
-    return []
 
+    # Desktop Happ/V2RayTun/Hiddify must not receive HTTP 503 just because
+    # the last live-probe timestamp is stale. We still respect admin OFF and
+    # status=offline, but fall back to active rows with a complete VLESS payload.
+    if bool(getattr(settings, "SUBSCRIPTION_ALLOW_READY_FALLBACK", True)):
+        fallback_rows = collect(strict_health=False)
+        if fallback_rows:
+            logger.info(
+                "[sub][publish] using_ready_fallback published=%s user_id=%s client=%s",
+                len(fallback_rows),
+                user_id if user_id is not None else "-",
+                str(client_hint or "-") or "-",
+            )
+            return fallback_rows
+
+    logger.warning(
+        "[sub][publish] no_publishable_rows strict=0 ready=0 user_id=%s client=%s public_rows=%s",
+        user_id if user_id is not None else "-",
+        str(client_hint or "-") or "-",
+        len(public_rows),
+    )
+    return []
 
 def _hiddify_profile_update_interval_header_value() -> str:
     raw_value = getattr(settings, "HIDDIFY_PROFILE_UPDATE_INTERVAL_HOURS", 1.0)
@@ -4501,7 +4518,15 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             continue
 
     if not lines:
-        raise HTTPException(status_code=503, detail="No ready VLESS locations found for subscription")
+        logger.warning("[sub][publish] returning_empty_subscription_no_503 user_id=%s", subscription_user_id if subscription_user_id is not None else "-")
+        return _subscription_empty_response(
+            request,
+            token,
+            head_only=head_only,
+            expires_ts=expires_ts,
+            state="empty",
+            profile_suffix="no ready locations",
+        )
 
     if should_track_real_connected:
         _record_real_connected_locations(request, token, access, rows, fingerprint=session_fingerprint)
