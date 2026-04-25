@@ -212,6 +212,10 @@ class Settings:
     DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID: bool = _env_bool("DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", True)
     DEVICE_TOKEN_BIND_IP_ENABLED: bool = _env_bool("DEVICE_TOKEN_BIND_IP_ENABLED", False)
     DEVICE_TOKEN_TTL_HOURS: int = _env_int("DEVICE_TOKEN_TTL_HOURS", 0)
+    # Pending slots are created when the bot shows /sub/dt_... buttons, before
+    # the VPN app imports the link. Keep the slot reserved so users cannot
+    # generate many unused links, but automatically release old pending slots.
+    DEVICE_PENDING_SLOT_TTL_HOURS: int = _env_int("DEVICE_PENDING_SLOT_TTL_HOURS", 24)
     SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT: bool = _env_bool("SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)
     # When a /sub/dt_... link is used, replace template/static UUIDs with a UUID
     # that belongs to this exact device slot. This is required if old imported
