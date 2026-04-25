@@ -162,6 +162,10 @@ class Settings:
     HIDDIFY_MACOS_APP_URL: str = os.getenv("HIDDIFY_MACOS_APP_URL", "https://app.hiddify.com/mac")
     HAPP_WINDOWS_APP_URL: str = os.getenv("HAPP_WINDOWS_APP_URL", os.getenv("WINDOWS_APP_URL", "https://www.happ.su/main"))
     HAPP_MACOS_APP_URL: str = os.getenv("HAPP_MACOS_APP_URL", os.getenv("MACOS_APP_URL", "https://www.happ.su/main"))
+    # Happ can always show the final local Xray JSON inside the app.
+    # This flag only keeps our subscription feed cleaner for Happ: no inline
+    # subscription comments and no non-standard internal route hints in the URL.
+    HAPP_SUBSCRIPTION_MINIMAL: bool = _env_bool("HAPP_SUBSCRIPTION_MINIMAL", True)
     V2RAYTUN_ANDROID_APP_URL: str = os.getenv("V2RAYTUN_ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.v2raytun.android")
     V2RAYTUN_ANDROID_APP_PACKAGE: str = os.getenv("V2RAYTUN_ANDROID_APP_PACKAGE", "com.v2raytun.android")
     V2RAYTUN_IOS_APP_URL: str = os.getenv("V2RAYTUN_IOS_APP_URL", "https://v2raytun.com/")
@@ -186,6 +190,37 @@ class Settings:
     SUBSCRIPTION_WARNING_HOURS: int = _env_int("SUBSCRIPTION_WARNING_HOURS", 12)
     SUBSCRIPTION_TOKEN: str = os.getenv("SUBSCRIPTION_TOKEN", "")
     LEGACY_GLOBAL_SUBSCRIPTION_TOKEN_ENABLED: bool = _env_bool("LEGACY_GLOBAL_SUBSCRIPTION_TOKEN_ENABLED", False)
+    # Security: user-wide /sub token is only for bot/open-app bridge.
+    # Real VPN clients receive a one-device token that binds on first import.
+    DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION: bool = _env_bool("DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True)
+    DEVICE_TOKEN_STRICT_BINDING: bool = _env_bool("DEVICE_TOKEN_STRICT_BINDING", True)
+    DEVICE_TOKEN_BIND_IP_ENABLED: bool = _env_bool("DEVICE_TOKEN_BIND_IP_ENABLED", False)
+    DEVICE_TOKEN_TTL_HOURS: int = _env_int("DEVICE_TOKEN_TTL_HOURS", 0)
+    SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT: bool = _env_bool("SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)
+    # When a /sub/dt_... link is used, replace template/static UUIDs with a UUID
+    # that belongs to this exact device slot. This is required if old imported
+    # configs must stop after 🗑 Delete device. Your Xray side must sync these UUIDs.
+    DEVICE_UUID_REQUIRED_FOR_SUBSCRIPTION: bool = _env_bool("DEVICE_UUID_REQUIRED_FOR_SUBSCRIPTION", True)
+    XRAY_SYNC_WEBHOOK_URL: str = os.getenv("XRAY_SYNC_WEBHOOK_URL", "").strip()
+    XRAY_SYNC_WEBHOOK_TOKEN: str = os.getenv("XRAY_SYNC_WEBHOOK_TOKEN", "").strip()
+    XRAY_SYNC_TIMEOUT_SEC: int = _env_int("XRAY_SYNC_TIMEOUT_SEC", 8)
+    XRAY_SYNC_ON_SUBSCRIPTION: bool = _env_bool("XRAY_SYNC_ON_SUBSCRIPTION", True)
+    XRAY_SYNC_MIN_INTERVAL_SEC: int = _env_int("XRAY_SYNC_MIN_INTERVAL_SEC", 60)
+    # Direct 3X-UI API sync. Use this when locations are created in 3X-UI and
+    # added to the admin panel as templates with xui_inbound_id. Backend adds
+    # one managed 3X-UI client per device UUID and removes it when the device
+    # is deleted, so raw imported VLESS links stop working too.
+    XUI_SYNC_ENABLED: bool = _env_bool("XUI_SYNC_ENABLED", False)
+    XUI_BASE_URL: str = os.getenv("XUI_BASE_URL", "").strip()
+    XUI_USERNAME: str = os.getenv("XUI_USERNAME", os.getenv("XUI_ADMIN_USER", "")).strip()
+    XUI_PASSWORD: str = os.getenv("XUI_PASSWORD", os.getenv("XUI_ADMIN_PASS", "")).strip()
+    XUI_TOKEN: str = os.getenv("XUI_TOKEN", "").strip()
+    XUI_SERVERS_JSON: str = os.getenv("XUI_SERVERS_JSON", "").strip()
+    XUI_DEFAULT_SERVER_KEY: str = os.getenv("XUI_DEFAULT_SERVER_KEY", "default").strip() or "default"
+    XUI_CLIENT_EMAIL_PREFIX: str = os.getenv("XUI_CLIENT_EMAIL_PREFIX", "inet:").strip() or "inet:"
+    XUI_TIMEOUT_SEC: int = _env_int("XUI_TIMEOUT_SEC", 8)
+    XUI_VERIFY_SSL: bool = _env_bool("XUI_VERIFY_SSL", True)
+    XUI_DRY_RUN: bool = _env_bool("XUI_DRY_RUN", False)
 
     AUTH_DEV_LOGIN_CODE: str = os.getenv("AUTH_DEV_LOGIN_CODE", "111111")
     AUTH_ALLOW_DEV_CODE: bool = _env_bool("AUTH_ALLOW_DEV_CODE", True)
