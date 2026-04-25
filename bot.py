@@ -5,7 +5,7 @@ import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit, unquote
 
 import httpx
 from aiogram import Bot, Dispatcher, F
@@ -59,7 +59,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "main_menu": "🏠 Главное меню",
         "choose_language": "🌐 Выберите язык",
         "language_saved": "Язык сохранён.",
-        "instructions_text": "📘 Инструкция\n\n1. Нажмите «📱 Подключить это устройство».\n2. Выберите вашу платформу.\n3. Скопируйте вашу персональную ссылку подписки.\n4. Windows/macOS: установите Happ и добавьте ссылку вручную как Subscription / URL.\n5. Android/iPhone: установите выбранный мобильный клиент и импортируйте подписку.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
+        "instructions_text": "📘 Инструкция\n\n1. Нажмите «📱 Подключить это устройство».\n2. Выберите вашу платформу.\n3. Нажмите «🚀 Открыть подключение» — приложение должно импортировать профиль автоматически.\n4. Если авто-импорт не сработал, нажмите «📋 Скопировать ссылку подписки» и вставьте её в приложении как Subscription / URL.\n5. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n6. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям. Бот показывает только subscription-ссылку /sub/dt_..., не сырой VLESS.",
         "choose_plan": "💼 Выберите тариф:",
         "plan": "Тариф",
         "price": "Цена",
@@ -90,8 +90,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "ios": "🍎 iPhone / iPad",
         "windows": "🪟 Windows",
         "macos": "💻 macOS",
-        "download_android": "Android: установите Hiddify, затем нажмите кнопку ниже для импорта вашей подписки.",
-        "download_ios": "iPhone / iPad: установите Hiddify, затем нажмите кнопку ниже для импорта вашей подписки.",
+        "download_android": "Android: установите Hiddify, затем нажмите «🚀 Открыть подключение». Если авто-импорт не сработал — нажмите «📋 Скопировать ссылку подписки» и импортируйте её в приложении вручную.",
+        "download_ios": "iPhone / iPad: установите Hiddify, затем нажмите «🚀 Открыть подключение». Если авто-импорт не сработал — нажмите «📋 Скопировать ссылку подписки» и импортируйте её в приложении вручную.",
         "support_text": "🛟 Связаться с поддержкой",
         "faq": "FAQ",
         "write_support": "✉️ Написать в поддержку",
@@ -111,10 +111,10 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Доступно устройств",
         "token_label": "Код входа",
         "copy_token": "📋 Скопировать код",
-        "download_windows": "Windows: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
-        "download_macos": "macOS: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
+        "download_windows": "Windows: установите Happ, затем нажмите «📋 Скопировать ссылку подписки» и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
+        "download_macos": "macOS: установите Happ, затем нажмите «📋 Скопировать ссылку подписки» и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
         "copy_subscription": "📋 Скопировать ссылку подписки",
-        "manual_import_hint": "Нажмите «📱 Подключить это устройство» и откройте ссылку на том устройстве, где будет VPN. Не пересылайте ссылку на другой телефон. На Windows для TUN запустите Happ от имени администратора.",
+        "manual_import_hint": "Нажмите «📱 Подключить это устройство», выберите платформу и используйте «🚀 Открыть подключение». Если авто-импорт не сработал — используйте «📋 Скопировать ссылку подписки». Не пересылайте ссылку на другой телефон. На Windows для TUN запустите Happ от имени администратора.",
         "subscription_buy_prompt": "Чтобы подключиться, купите или продлите подписку.",
         "free_mode_label": "Бесплатный режим",
         "free_mode_access": "Сейчас для всех включён бесплатный режим доступа.",
@@ -146,7 +146,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "main_menu": "🏠 Main menu",
         "choose_language": "🌐 Choose language",
         "language_saved": "Language saved.",
-        "instructions_text": "📘 Instructions\n\n1. Tap \"Apps / Connect\".\n2. Choose your platform.\n3. Copy your personal subscription link.\n4. On Windows/macOS install Happ and add the link manually as Subscription / URL.\n5. On Android/iPhone install the selected mobile client and import the subscription.\n6. Tap \"Refresh\" to load fresh locations and configs.\n7. Connect to VPN.\n\nIf any location or LTE does not work:\n• tap the \"Refresh\" button\n• wait until the profile updates\n• try another location or a reserve server\n\nIf part of the internet does not work after an air raid alert or blocking:\n• connect to an LTE location\n• then tap \"Refresh\" again\n• if the problem remains, try a reserve LTE\n\nImportant: do not share your personal subscription link with other people.",
+        "instructions_text": "📘 Instructions\n\n1. Tap \"Apps / Connect\".\n2. Choose your platform.\n3. Tap “🚀 Open connection” — the app should import the profile automatically.\n4. If auto-import does not work, tap “📋 Copy subscription link” and add it in the app as Subscription / URL.\n5. Tap \"Refresh\" to load fresh locations and configs.\n6. Connect to VPN.\n\nIf any location or LTE does not work:\n• tap the \"Refresh\" button\n• wait until the profile updates\n• try another location or a reserve server\n\nIf part of the internet does not work after an air raid alert or blocking:\n• connect to an LTE location\n• then tap \"Refresh\" again\n• if the problem remains, try a reserve LTE\n\nImportant: do not share your personal subscription link with other people. The bot shows only a subscription URL /sub/dt_..., never a raw VLESS link.",
         "choose_plan": "💼 Choose a plan:",
         "plan": "Plan",
         "price": "Price",
@@ -177,8 +177,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "ios": "🍎 iPhone / iPad",
         "windows": "🪟 Windows",
         "macos": "💻 macOS",
-        "download_android": "Android: install Hiddify, then use the button below to import your subscription.",
-        "download_ios": "iPhone / iPad: install Hiddify, then use the button below to import your subscription.",
+        "download_android": "Android: install Hiddify, then tap “🚀 Open connection”. If auto-import does not work, tap “📋 Copy subscription link” and import it manually in the app.",
+        "download_ios": "iPhone / iPad: install Hiddify, then tap “🚀 Open connection”. If auto-import does not work, tap “📋 Copy subscription link” and import it manually in the app.",
         "support_text": "🛟 Contact support",
         "faq": "FAQ",
         "write_support": "✉️ Write to support",
@@ -198,10 +198,10 @@ TEXT: Dict[str, Dict[str, str]] = {
         "available_devices": "Devices available",
         "token_label": "Login code",
         "copy_token": "📋 Copy code",
-        "download_windows": "Windows: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
-        "download_macos": "macOS: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
+        "download_windows": "Windows: install Happ, then tap “📋 Copy subscription link” and add it in Happ manually as Subscription / URL. The token is already inside the link.",
+        "download_macos": "macOS: install Happ, then tap “📋 Copy subscription link” and add it in Happ manually as Subscription / URL. The token is already inside the link.",
         "copy_subscription": "📋 Copy subscription link",
-        "manual_import_hint": "Tap “Connect this device” and open the link on the device that will use VPN. Do not forward the link to another phone. On Windows run Happ as administrator for TUN mode.",
+        "manual_import_hint": "Tap “Connect this device”, choose your platform and use “🚀 Open connection”. If auto-import does not work, use “📋 Copy subscription link”. Do not forward the link to another phone. On Windows run Happ as administrator for TUN mode.",
         "subscription_buy_prompt": "To connect, buy or renew a subscription.",
         "free_mode_label": "Free mode",
         "free_mode_access": "Free access for all users is enabled right now.",
@@ -423,11 +423,34 @@ def build_subscription_url(subscription_token: Optional[str] = None, subscriptio
     return _append_subscription_client_hint(f"{base}/sub/{token}", platform=platform)
 
 
-def subscription_copy_rows(lang: str, subscription_url: Optional[str] = None, platform: Optional[str] = None) -> List[List[InlineKeyboardButton]]:
-    if not bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)):
-        return []
+def _is_device_subscription_url(url: Optional[str]) -> bool:
+    clean_url = str(url or "").strip()
+    if not clean_url:
+        return False
+    try:
+        parts = urlsplit(clean_url)
+        token_part = unquote((parts.path or "").rstrip("/").rsplit("/", 1)[-1])
+        return token_part.startswith("dt_")
+    except Exception:
+        return "/sub/dt_" in clean_url
+
+
+def subscription_copy_rows(
+    lang: str,
+    subscription_url: Optional[str] = None,
+    platform: Optional[str] = None,
+    *,
+    force: bool = False,
+) -> List[List[InlineKeyboardButton]]:
     final_url = build_subscription_url(subscription_url=subscription_url, platform=platform)
     if not final_url:
+        return []
+    # Never put raw VLESS or old user-wide /sub/<user_token> into Telegram copy buttons.
+    # Forced copy is allowed only for one-device dt_ subscription URLs.
+    if force:
+        if not _is_device_subscription_url(final_url):
+            return []
+    elif not bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)):
         return []
     return [[InlineKeyboardButton(text=TEXT[lang]["copy_subscription"], copy_text=CopyTextButton(text=final_url))]]
 
@@ -705,11 +728,11 @@ def platform_open_inline(
     t = TEXT[lang]
     url = platform_store_url(platform)
     rows: List[List[InlineKeyboardButton]] = [[InlineKeyboardButton(text=platform_download_button_text(lang, platform), url=url)]]
-    final_open_url = build_open_app_url(lang=lang, token=subscription_token, platform=platform) if subscription_token else (open_app_url or build_open_app_url(lang=lang, platform=platform))
+    final_open_url = open_app_url or (build_open_app_url(lang=lang, token=subscription_token, platform=platform) if subscription_token else build_open_app_url(lang=lang, platform=platform))
     if is_supported_telegram_url(final_open_url):
         rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=final_open_url)])
     platform_subscription_url = build_subscription_url(subscription_url=subscription_url, subscription_token=subscription_token, platform=platform)
-    rows.extend(subscription_copy_rows(lang, platform_subscription_url, platform=platform))
+    rows.extend(subscription_copy_rows(lang, platform_subscription_url, platform=platform, force=True))
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:download")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -775,6 +798,32 @@ async def fetch_subscription_access(token: str) -> Dict[str, Optional[str]]:
         "subscription_url": (data.get("subscription_url") or "").strip() or None,
         "subscription_token": clean_token,
         "open_app_url": build_open_app_url(lang=None, token=clean_token) if clean_token else None,
+    }
+
+
+async def fetch_platform_subscription_access(token: str, platform: str, lang: str) -> Dict[str, Optional[str]]:
+    """Create/reuse a one-device dt_ token for this platform before showing buttons.
+
+    The copy button must contain only /sub/dt_... (device-scoped subscription),
+    never raw VLESS and never the old user-wide subscription token.
+    """
+    client_hint = _client_hint_for_platform(platform)
+    data = await api_request(
+        "POST",
+        "/devices/subscription-token",
+        token=token,
+        json_body={
+            "platform": platform,
+            "client": client_hint,
+            "device_name": "Happ" if client_hint == "happ" else selected_client_name(),
+            "language": "en" if lang == "en" else "ru",
+        },
+    )
+    clean_token = (data.get("subscription_token") or "").strip() or None
+    return {
+        "subscription_url": (data.get("subscription_url") or "").strip() or None,
+        "subscription_token": clean_token,
+        "open_app_url": (data.get("open_app_url") or "").strip() or (build_open_app_url(lang=lang, token=clean_token, platform=platform) if clean_token else None),
     }
 
 
@@ -1124,7 +1173,7 @@ async def download_android_from_text(message: Message) -> None:
             text, markup = inactive
             await message.answer(text, reply_markup=markup)
             return
-        access = await fetch_subscription_access(_ctx["token"])
+        access = await fetch_platform_subscription_access(_ctx["token"], "android", lang)
         await message.answer(tx(lang, "download_android"), reply_markup=platform_open_inline(lang, "android", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
@@ -1138,7 +1187,7 @@ async def download_ios_from_text(message: Message) -> None:
             text, markup = inactive
             await message.answer(text, reply_markup=markup)
             return
-        access = await fetch_subscription_access(_ctx["token"])
+        access = await fetch_platform_subscription_access(_ctx["token"], "ios", lang)
         await message.answer(tx(lang, "download_ios"), reply_markup=platform_open_inline(lang, "ios", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
@@ -1152,7 +1201,7 @@ async def download_windows_from_text(message: Message) -> None:
             text, markup = inactive
             await message.answer(text, reply_markup=markup)
             return
-        access = await fetch_subscription_access(_ctx["token"])
+        access = await fetch_platform_subscription_access(_ctx["token"], "windows", lang)
         await message.answer(tx(lang, "download_windows"), reply_markup=platform_open_inline(lang, "windows", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
@@ -1166,7 +1215,7 @@ async def download_macos_from_text(message: Message) -> None:
             text, markup = inactive
             await message.answer(text, reply_markup=markup)
             return
-        access = await fetch_subscription_access(_ctx["token"])
+        access = await fetch_platform_subscription_access(_ctx["token"], "macos", lang)
         await message.answer(tx(lang, "download_macos"), reply_markup=platform_open_inline(lang, "macos", access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
 
     await with_user_guard(message, _handler)
@@ -1356,7 +1405,7 @@ async def cb_download_platform(callback: CallbackQuery) -> None:
             text = tx(lang, "download_windows")
         else:
             text = tx(lang, "download_macos")
-        access = await fetch_subscription_access(_ctx["token"])
+        access = await fetch_platform_subscription_access(_ctx["token"], platform, lang)
         await safe_edit(callback, text, platform_open_inline(lang, platform, access.get("open_app_url"), subscription_url=access.get("subscription_url"), subscription_token=access.get("subscription_token")))
         await callback.answer()
 
