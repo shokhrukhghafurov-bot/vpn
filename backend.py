@@ -4712,7 +4712,13 @@ def _subscription_transport_allowed(payload: Dict[str, Any], client_hint: Option
     return transport in allowed if allowed else True
 
 
-def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None, device_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+def _subscription_payload_and_fallback_name(
+    row: Dict[str, Any],
+    *,
+    user_id: Optional[int] = None,
+    device_id: Optional[int] = None,
+    legacy_static_uuid: bool = False,
+) -> Tuple[Optional[Dict[str, Any]], str]:
     code = str(row.get("code") or "").strip()
     resolved_row = dict(row)
     if code in PUBLIC_VIRTUAL_LOCATION_CODES:
@@ -4721,7 +4727,13 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
             return None, str(row.get("name_en") or row.get("name_ru") or code or "VLESS")
         resolved_row = dict(picked)
 
-    if user_id is not None:
+    if legacy_static_uuid:
+        # Migration grace for old /sub/<user_token> profiles: keep returning
+        # the template/shared UUID that already exists in 3X-UI, so old Happ/
+        # Hiddify subscriptions keep working while users reconnect with dt_
+        # per-device profiles. New /sub/dt_... profiles still use personal UUIDs.
+        payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
+    elif user_id is not None:
         payload = build_user_vpn_payload_for_location(
             int(user_id),
             resolved_row,
@@ -5029,7 +5041,12 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             access.get("kind") == "user"
             and bool(getattr(settings, "DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True))
         )
-        if direct_user_token_disabled and not bool(getattr(settings, "DEVICE_TOKEN_AUTO_MIGRATE_USER_TOKEN", True)):
+        legacy_user_token_grace = bool(
+            access.get("kind") == "user"
+            and direct_user_token_disabled
+            and getattr(settings, "LEGACY_USER_TOKEN_GRACE_ENABLED", False)
+        )
+        if direct_user_token_disabled and not legacy_user_token_grace and not bool(getattr(settings, "DEVICE_TOKEN_AUTO_MIGRATE_USER_TOKEN", True)):
             # Avoid HTTP 403 in VPN clients. A 200/empty subscription cleanly
             # disables the profile and tells the user to open the bot again.
             return _subscription_empty_response(
@@ -5063,7 +5080,10 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                     profile_suffix="open bot again",
                 )
         if not is_browser_preview:
-            gate = None if skip_device_gate_for_bound_refresh else _subscription_device_gate(request, token, access)
+            # During migration, old /sub/<user_token> profiles are allowed as
+            # legacy shared-UUID profiles and must not consume/block device slots.
+            # The strict device gate remains active for new /sub/dt_... links.
+            gate = None if (skip_device_gate_for_bound_refresh or legacy_user_token_grace) else _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
                 reason = str(gate.get("reason") or "").strip()
                 if reason in {"device_removed", "token_bound_to_other_device", "token_revoked", "token_expired"}:
@@ -5110,6 +5130,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             dict(row),
             user_id=subscription_user_id,
             device_id=subscription_device_id,
+            legacy_static_uuid=bool(legacy_user_token_grace),
         )
         if not payload_for_subscription:
             continue
