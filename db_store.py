@@ -1621,7 +1621,20 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 def _normalize_location_access_mode(value: Any) -> str:
     text = str(value or "").strip().lower()
-    if text in {"owned_per_user", "per_user", "owned", "template", "template_per_user", "user_uuid", "user-specific", "user_specific"}:
+    if text in {
+        "owned_per_user",
+        "per_user",
+        "per_device",
+        "owned",
+        "template",
+        "template_per_user",
+        "user_uuid",
+        "device_uuid",
+        "user-specific",
+        "user_specific",
+        "device-specific",
+        "device_specific",
+    }:
         return "owned_per_user"
     return "external_static"
 
@@ -1642,11 +1655,55 @@ def _extract_location_access_mode(row: Optional[Dict[str, Any]] = None, payload:
     return "external_static"
 
 
+def _location_is_3xui_managed(payload: Optional[Dict[str, Any]]) -> bool:
+    data = payload or {}
+    managed_by = str(
+        data.get("managed_by")
+        or data.get("managedBy")
+        or data.get("provider")
+        or data.get("runtime_provider")
+        or ""
+    ).strip().lower()
+    if managed_by in {"3x-ui", "3xui", "xui", "x-ui", "three-x-ui"}:
+        return True
+    return bool(data.get("xui_inbound_id") or data.get("xuiInboundId"))
+
+
 def _apply_location_access_mode(payload: Dict[str, Any], access_mode: str) -> Dict[str, Any]:
     normalized = dict(payload or {})
     mode = _normalize_location_access_mode(access_mode)
     normalized["access_mode"] = mode
-    normalized["credential_mode"] = "per_user" if mode == "owned_per_user" else "static"
+
+    requested_credential_mode = str(
+        normalized.get("credential_mode")
+        or normalized.get("credentialMode")
+        or ""
+    ).strip().lower()
+    requested_uuid_mode = str(
+        normalized.get("uuid_mode")
+        or normalized.get("uuidMode")
+        or ""
+    ).strip().lower()
+
+    if mode == "owned_per_user":
+        # 3X-UI locations must stay per_device. The previous implementation
+        # rewrote every owned_per_user location to credential_mode=per_user,
+        # so the admin dropdown became blank and per-device UUID sync was not
+        # obvious/safe in the UI. Preserve/force per_device for managed 3X-UI
+        # templates and device-UUID locations.
+        if (
+            requested_credential_mode == "per_device"
+            or requested_uuid_mode == "per_device"
+            or _location_is_3xui_managed(normalized)
+        ):
+            normalized["credential_mode"] = "per_device"
+            normalized["uuid_mode"] = "per_device"
+        else:
+            normalized["credential_mode"] = "per_user"
+    else:
+        normalized["credential_mode"] = "static"
+        if requested_uuid_mode != "per_device":
+            normalized["uuid_mode"] = "static"
     return normalized
 
 
