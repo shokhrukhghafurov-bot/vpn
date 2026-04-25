@@ -269,8 +269,12 @@ def sync_inbound_managed_clients(
     }
 
     if dry_run:
+        # Dry-run is a successful connectivity/state calculation, not a failed sync.
+        # The caller can safely use this for first setup: Test/Load inbounds, then
+        # inspect would_add/would_delete before switching XUI_DRY_RUN=false.
         result["would_add"] = len(to_add)
         result["would_delete"] = len(to_delete)
+        result["ok"] = True
         return result
 
     for client in to_add:
