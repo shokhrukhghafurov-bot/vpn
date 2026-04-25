@@ -548,6 +548,13 @@ class DeviceRegisterIn(BaseModel):
     device_fingerprint: str
 
 
+class DeviceSubscriptionIssueIn(BaseModel):
+    platform: str = "client"
+    device_name: Optional[str] = None
+    client: Optional[str] = None
+    language: str = "ru"
+
+
 class PaymentCreateIn(BaseModel):
     plan_code: str
     method: str = "telegram"
@@ -3750,6 +3757,29 @@ def _subscription_public_url_from_base(base_url: str, token: Optional[str]) -> O
     return f"{base}/sub/{quote(clean_token, safe='')}"
 
 
+def _subscription_url_with_tracking(
+    subscription_url: Optional[str],
+    *,
+    client_id: Optional[str] = None,
+    client: Optional[str] = None,
+) -> Optional[str]:
+    clean_url = str(subscription_url or "").strip()
+    if not clean_url:
+        return None
+    try:
+        parts = urlsplit(clean_url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
+        normalized_client = str(client or "").strip().lower()
+        if normalized_client:
+            query.setdefault("client", normalized_client)
+        if normalized_client_id:
+            query.setdefault("subcid", normalized_client_id)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    except Exception:
+        return clean_url
+
+
 def _resolve_subscription_token(*, token: Optional[str] = None, code: Optional[str] = None) -> Optional[str]:
     clean_token = str(token or "").strip()
     if clean_token:
@@ -5304,18 +5334,11 @@ def open_app_bridge(
     if active_token and not subscription_client_id:
         subscription_client_id = _subscription_cookie_value(request, active_token)
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
-    tracked_subscription_url = None
-    if subscription_url:
-        try:
-            parts = urlsplit(subscription_url)
-            query = dict(parse_qsl(parts.query, keep_blank_values=True))
-            if client_mode:
-                query["client"] = client_mode
-            if subscription_client_id:
-                query["subcid"] = subscription_client_id
-            tracked_subscription_url = urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
-        except Exception:
-            tracked_subscription_url = subscription_url
+    tracked_subscription_url = _subscription_url_with_tracking(
+        subscription_url,
+        client_id=subscription_client_id,
+        client=client_mode,
+    )
     native_url = _build_native_import_url(tracked_subscription_url, platform=target_platform) if tracked_subscription_url else ""
     supports_native_launch = bool(native_url)
     bot_url = _bot_public_url()
@@ -5783,6 +5806,54 @@ def devices(user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     with psycopg.connect(settings.DATABASE_URL, row_factory=dict_row) as conn:
         view = _get_user_subscription_view_with_conn(conn, user["id"])
     return {"ok": True, "items": view["devices"], "devices_used": view["devices_used"], "device_limit": view["device_limit"]}
+
+
+@app.post("/devices/subscription-token")
+def issue_device_subscription_token(
+    request: Request,
+    payload: DeviceSubscriptionIssueIn,
+    user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    """Create/reuse a one-device dt_ subscription token for bot buttons.
+
+    This endpoint is used when the user selects Android/iOS/Windows/macOS in the
+    bot. It returns only a subscription URL (/sub/dt_...), never a raw VLESS URL.
+    """
+    target_platform = _normalize_target_platform(payload.platform)
+    client_mode = str(payload.client or "").strip().lower() or _client_mode_for_platform(target_platform)
+    if client_mode not in {"hiddify", "v2raytun", "happ"}:
+        client_mode = _client_mode_for_platform(target_platform)
+    client_name = str(payload.device_name or "").strip() or _client_name_for_platform(target_platform)
+    norm_lang = "en" if str(payload.language or "").strip().lower() == "en" else "ru"
+    try:
+        ttl_hours = int(getattr(settings, "DEVICE_TOKEN_TTL_HOURS", 0) or 0)
+        device_token_row = create_device_subscription_token_for_user(
+            int(user["id"]),
+            platform=target_platform,
+            device_name=client_name,
+            client=client_mode,
+            ttl_hours=ttl_hours if ttl_hours > 0 else None,
+        )
+    except PermissionError as exc:
+        raise HTTPException(status_code=403, detail=str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    device_token = str(device_token_row.get("token") or "").strip()
+    client_id = str(device_token_row.get("client_id") or "").strip()
+    base_subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, device_token)
+    subscription_url = _subscription_url_with_tracking(base_subscription_url, client_id=client_id, client=client_mode)
+    open_app_url = _build_open_app_bridge_url(request, token=device_token, lang=norm_lang, platform=target_platform)
+    return {
+        "ok": True,
+        "subscription_token": device_token,
+        "subscription_url": subscription_url,
+        "open_app_url": open_app_url,
+        "client_id": client_id,
+        "client": client_mode,
+        "platform": target_platform,
+        "device_id": device_token_row.get("device_id"),
+    }
 
 
 @app.post("/devices/register")
