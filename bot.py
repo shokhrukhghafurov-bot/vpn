@@ -43,6 +43,13 @@ TEXT: Dict[str, Dict[str, str]] = {
         "sub": "📄 Моя подписка",
         "devices": "📱 Мои устройства",
         "download": "⬇️ Приложение / Подключение",
+        "connect_this_device": "📱 Подключить это устройство",
+        "add_second_device": "➕ Добавить второе устройство",
+        "add_device": "➕ Добавить устройство",
+        "delete_device": "🗑 Удалить устройство",
+        "reset_device": "🔄 Сбросить устройство",
+        "device_reset_done": "Устройство удалено. Старый token и UUID отключены. Слот освобождён. Теперь можно подключить другой телефон.",
+        "devices_hint": "Нажмите «Подключить это устройство» на том телефоне, где хотите использовать VPN. Если меняете телефон — удалите старое устройство, потом подключите новый телефон.",
         "support": "🛟 Поддержка",
         "instructions": "📘 Инструкция",
         "renew": "🔄 Продлить",
@@ -52,7 +59,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "main_menu": "🏠 Главное меню",
         "choose_language": "🌐 Выберите язык",
         "language_saved": "Язык сохранён.",
-        "instructions_text": "📘 Инструкция\n\n1. Нажмите «Приложение / Подключение».\n2. Выберите вашу платформу.\n3. Скопируйте вашу персональную ссылку подписки.\n4. Windows/macOS: установите Happ и добавьте ссылку вручную как Subscription / URL.\n5. Android/iPhone: установите выбранный мобильный клиент и импортируйте подписку.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
+        "instructions_text": "📘 Инструкция\n\n1. Нажмите «📱 Подключить это устройство».\n2. Выберите вашу платформу.\n3. Скопируйте вашу персональную ссылку подписки.\n4. Windows/macOS: установите Happ и добавьте ссылку вручную как Subscription / URL.\n5. Android/iPhone: установите выбранный мобильный клиент и импортируйте подписку.\n6. Нажмите «Обновить», чтобы загрузить свежие локации и конфиги.\n7. Подключитесь к VPN.\n\nЕсли какая-то локация или LTE не работает:\n• нажмите кнопку «Обновить»\n• подождите, пока профиль обновится\n• попробуйте другую локацию или резервный сервер\n\nЕсли после воздушной тревоги или блокировки часть интернета не работает:\n• подключите LTE-локацию\n• затем снова нажмите «Обновить»\n• если проблема осталась — попробуйте резервный LTE\n\nВажно: не передавайте вашу ссылку подписки другим людям.",
         "choose_plan": "💼 Выберите тариф:",
         "plan": "Тариф",
         "price": "Цена",
@@ -77,7 +84,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "connected_now": "Подключено",
         "limit_reached": "Лимит устройств достигнут",
         "devices_none": "Устройств пока нет.",
-        "device_removed": "Устройство удалено. Слот освобождён.",
+        "device_removed": "Устройство удалено. Старый token и UUID отключены. Слот освобождён. Теперь можно подключить другой телефон.",
         "choose_platform": "Выберите платформу для подключения:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
@@ -107,7 +114,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "download_windows": "Windows: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
         "download_macos": "macOS: установите Happ, затем скопируйте персональную ссылку подписки и добавьте её в Happ вручную как Subscription / URL. Токен уже внутри ссылки.",
         "copy_subscription": "📋 Скопировать ссылку подписки",
-        "manual_import_hint": "Если Hiddify не открылся автоматически, скопируйте ссылку подписки и импортируйте её вручную в Hiddify. На Windows для TUN запустите клиент от имени администратора.",
+        "manual_import_hint": "Нажмите «📱 Подключить это устройство» и откройте ссылку на том устройстве, где будет VPN. Не пересылайте ссылку на другой телефон. На Windows для TUN запустите Happ от имени администратора.",
         "subscription_buy_prompt": "Чтобы подключиться, купите или продлите подписку.",
         "free_mode_label": "Бесплатный режим",
         "free_mode_access": "Сейчас для всех включён бесплатный режим доступа.",
@@ -123,6 +130,13 @@ TEXT: Dict[str, Dict[str, str]] = {
         "sub": "📄 My subscription",
         "devices": "📱 My devices",
         "download": "⬇️ Apps / Connect",
+        "connect_this_device": "📱 Connect this device",
+        "add_second_device": "➕ Add second device",
+        "add_device": "➕ Add device",
+        "delete_device": "🗑 Delete device",
+        "reset_device": "🔄 Reset device",
+        "device_reset_done": "Device removed. The old token and UUID are disabled. The slot is free. You can now connect another phone.",
+        "devices_hint": "Tap “Connect this device” on the phone where you want to use VPN. If you are changing phones, delete the old device first, then connect the new phone.",
         "support": "🛟 Support",
         "instructions": "📘 Instructions",
         "renew": "🔄 Renew",
@@ -157,7 +171,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "connected_now": "Connected",
         "limit_reached": "Device limit reached",
         "devices_none": "No devices yet.",
-        "device_removed": "Device removed. Slot released.",
+        "device_removed": "Device removed. The old token and UUID are disabled. The slot is free. You can now connect another phone.",
         "choose_platform": "Choose a platform to connect:",
         "android": "🤖 Android",
         "ios": "🍎 iPhone / iPad",
@@ -187,7 +201,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "download_windows": "Windows: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
         "download_macos": "macOS: install Happ, then copy your personal subscription link and add it in Happ manually as Subscription / URL. The token is already inside the link.",
         "copy_subscription": "📋 Copy subscription link",
-        "manual_import_hint": "If Hiddify does not open automatically, copy the subscription link and import it manually in Hiddify. On Windows, run the client as Administrator before enabling TUN.",
+        "manual_import_hint": "Tap “Connect this device” and open the link on the device that will use VPN. Do not forward the link to another phone. On Windows run Happ as administrator for TUN mode.",
         "subscription_buy_prompt": "To connect, buy or renew a subscription.",
         "free_mode_label": "Free mode",
         "free_mode_access": "Free access for all users is enabled right now.",
@@ -374,19 +388,45 @@ def append_token_details(text: str, lang: str, token: Optional[str], device_limi
     return "\n".join(lines)
 
 
-def build_subscription_url(subscription_token: Optional[str] = None, subscription_url: Optional[str] = None) -> Optional[str]:
+def _client_hint_for_platform(platform: Optional[str]) -> str:
+    key = (platform or "").strip().lower()
+    if key in {"windows", "win", "macos", "mac", "osx", "darwin"}:
+        return "happ"
+    if key in {"android", "ios", "iphone", "ipad"}:
+        return "v2raytun" if selected_client_mode() == "v2raytun" else "hiddify"
+    return ""
+
+
+def _append_subscription_client_hint(url: str, platform: Optional[str] = None) -> str:
+    clean_url = str(url or "").strip()
+    client_hint = _client_hint_for_platform(platform)
+    if not clean_url or not client_hint:
+        return clean_url
+    try:
+        parts = urlsplit(clean_url)
+        query = dict(parse_qsl(parts.query, keep_blank_values=True))
+        query.setdefault("client", client_hint)
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, urlencode(query), parts.fragment))
+    except Exception:
+        joiner = "&" if "?" in clean_url else "?"
+        return f"{clean_url}{joiner}client={client_hint}"
+
+
+def build_subscription_url(subscription_token: Optional[str] = None, subscription_url: Optional[str] = None, platform: Optional[str] = None) -> Optional[str]:
     explicit_url = str(subscription_url or "").strip()
     if explicit_url:
-        return explicit_url
+        return _append_subscription_client_hint(explicit_url, platform=platform)
     token = str(subscription_token or "").strip()
     base = str(settings.BACKEND_BASE_URL or "").strip().rstrip("/")
     if not token or not base:
         return None
-    return f"{base}/sub/{token}"
+    return _append_subscription_client_hint(f"{base}/sub/{token}", platform=platform)
 
 
-def subscription_copy_rows(lang: str, subscription_url: Optional[str] = None) -> List[List[InlineKeyboardButton]]:
-    final_url = build_subscription_url(subscription_url=subscription_url)
+def subscription_copy_rows(lang: str, subscription_url: Optional[str] = None, platform: Optional[str] = None) -> List[List[InlineKeyboardButton]]:
+    if not bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)):
+        return []
+    final_url = build_subscription_url(subscription_url=subscription_url, platform=platform)
     if not final_url:
         return []
     return [[InlineKeyboardButton(text=TEXT[lang]["copy_subscription"], copy_text=CopyTextButton(text=final_url))]]
@@ -511,27 +551,31 @@ async def _fetch_access_state(token: Optional[str]) -> Dict[str, Any]:
 async def build_main_menu_inline(lang: str, token: Optional[str] = None) -> InlineKeyboardMarkup:
     t = TEXT[lang]
     show_buy = True
+    used = 0
+    limit = int(getattr(settings, "VPN_DEFAULT_DEVICE_LIMIT", 1) or 1)
+    is_active = False
     if token:
         with contextlib.suppress(Exception):
             access = await api_request("GET", "/subscriptions/me", token=token)
             show_buy = _show_buy_button_from_access(access)
-    top_row = []
-    if show_buy:
-        top_row.append(InlineKeyboardButton(text=t["buy"], callback_data="menu:buy"))
-    top_row.append(InlineKeyboardButton(text=t["sub"], callback_data="menu:sub"))
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            top_row,
-            [
-                InlineKeyboardButton(text=t["devices"], callback_data="menu:devices"),
-                InlineKeyboardButton(text=tx(lang, "download"), callback_data="menu:download"),
-            ],
-            [
-                InlineKeyboardButton(text=t["support"], callback_data="menu:support"),
-                InlineKeyboardButton(text=t["instructions"], callback_data="menu:instructions"),
-            ],
-        ]
-    )
+            used = int(access.get("devices_used") or 0)
+            limit = int(access.get("device_limit") or limit)
+            is_active = bool(access.get("is_active"))
+    connect_text = t["connect_this_device"]
+    if is_active and used > 0 and used < limit:
+        connect_text = t["add_second_device"] if used == 1 and limit >= 2 else t["add_device"]
+
+    rows: List[List[InlineKeyboardButton]] = []
+    if not is_active and show_buy:
+        rows.append([InlineKeyboardButton(text=t["buy"], callback_data="menu:buy")])
+    if is_active:
+        rows.append([InlineKeyboardButton(text=connect_text, callback_data="menu:download")])
+        rows.append([InlineKeyboardButton(text=t["devices"], callback_data="menu:devices")])
+    else:
+        rows.append([InlineKeyboardButton(text=t["sub"], callback_data="menu:sub")])
+    rows.append([InlineKeyboardButton(text=t["support"], callback_data="menu:support")])
+    rows.append([InlineKeyboardButton(text=t["instructions"], callback_data="menu:instructions")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 
@@ -664,7 +708,8 @@ def platform_open_inline(
     final_open_url = build_open_app_url(lang=lang, token=subscription_token, platform=platform) if subscription_token else (open_app_url or build_open_app_url(lang=lang, platform=platform))
     if is_supported_telegram_url(final_open_url):
         rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=final_open_url)])
-    rows.extend(subscription_copy_rows(lang, subscription_url))
+    platform_subscription_url = build_subscription_url(subscription_url=subscription_url, subscription_token=subscription_token, platform=platform)
+    rows.extend(subscription_copy_rows(lang, platform_subscription_url, platform=platform))
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:download")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
@@ -742,6 +787,24 @@ def subscription_required_inline(lang: str, show_buy: bool = True) -> InlineKeyb
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def device_connect_rows(lang: str, used: int, limit: int, *, include_devices: bool = True) -> List[List[InlineKeyboardButton]]:
+    t = TEXT[lang]
+    rows: List[List[InlineKeyboardButton]] = []
+    safe_used = max(0, int(used or 0))
+    safe_limit = max(1, int(limit or 1))
+    if safe_used < safe_limit:
+        if safe_used == 0:
+            label = t["connect_this_device"]
+        elif safe_used == 1 and safe_limit >= 2:
+            label = t["add_second_device"]
+        else:
+            label = t["add_device"]
+        rows.append([InlineKeyboardButton(text=label, callback_data="menu:download")])
+    if include_devices:
+        rows.append([InlineKeyboardButton(text=t["devices"], callback_data="menu:devices")])
+    return rows
+
+
 async def render_subscription_message(lang: str, token: str, telegram_id: int) -> Tuple[str, InlineKeyboardMarkup]:
     del telegram_id
     t = TEXT[lang]
@@ -768,6 +831,7 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
             ]
         ).strip()
         rows: List[List[InlineKeyboardButton]] = []
+        rows.extend(device_connect_rows(lang, used, limit))
         rows.extend(subscription_copy_rows(lang, subscription_url))
         if is_supported_telegram_url(open_app_url):
             rows.append([InlineKeyboardButton(text=tx(lang, "open_app"), url=open_app_url)])
@@ -798,6 +862,7 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
             ]
         ).strip()
         rows: List[List[InlineKeyboardButton]] = []
+        rows.extend(device_connect_rows(lang, used, limit))
         rows.extend(subscription_copy_rows(lang, subscription_url))
         if show_buy:
             rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
@@ -839,6 +904,7 @@ async def render_subscription_message(lang: str, token: str, telegram_id: int) -
         ]
     ).strip()
     rows: List[List[InlineKeyboardButton]] = []
+    rows.extend(device_connect_rows(lang, used, limit))
     rows.extend(subscription_copy_rows(lang, subscription_url))
     if show_buy:
         rows.append([InlineKeyboardButton(text=t["renew"], callback_data="menu:buy")])
@@ -856,23 +922,24 @@ async def render_devices_message(lang: str, token: str) -> Tuple[str, InlineKeyb
     items = data.get("items", [])
     used = int(data.get("devices_used") or 0)
     limit = int(data.get("device_limit") or settings.VPN_DEFAULT_DEVICE_LIMIT)
-    if not items:
-        text = f"{t['devices_none']}\n\n{t['connected_now']}: {used} / {limit}"
-        return text, back_inline(lang)
-    lines = []
+    lines: List[str] = [t["devices"], f"{t['devices_used']}: {used} / {limit}", "", t["devices_hint"], ""]
     rows: List[List[InlineKeyboardButton]] = []
-    for row in items:
-        device_name = row.get("device_name") or "—"
-        platform = _platform_label(str(row.get("platform") or ""))
-        status_text = t["device_active"] if row.get("is_active", True) else t["device_inactive"]
-        lines.append(f"• {platform} — {device_name} — {status_text} — {_fmt_dt(row.get('last_seen_at'))}")
-        rows.append([InlineKeyboardButton(text=f"{t['remove']} {platform}", callback_data=f"device:remove:{row['id']}")])
-    lines.append("")
-    lines.append(f"{t['connected_now']}: {used} / {limit}")
+
+    if not items:
+        lines.append(t["devices_none"])
+    else:
+        for idx, row in enumerate(items, start=1):
+            device_name = row.get("device_name") or "—"
+            platform = _platform_label(str(row.get("platform") or ""))
+            status_text = t["device_active"] if row.get("is_active", True) else t["device_inactive"]
+            lines.append(f"{idx}. {platform} — {device_name} — {status_text} — {_fmt_dt(row.get('last_seen_at'))}")
+            rows.append([InlineKeyboardButton(text=f"{t['delete_device']} #{idx}", callback_data=f"device:remove:{row['id']}")])
+
     if used >= limit:
-        lines.append(t["limit_reached"])
+        lines.extend(["", t["limit_reached"]])
+    rows.extend(device_connect_rows(lang, used, limit, include_devices=False))
     rows.append([InlineKeyboardButton(text=t["back"], callback_data="menu:root")])
-    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
+    return "\n".join(lines).strip(), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def ensure_active_subscription_ui(lang: str, token: str) -> Optional[Tuple[str, InlineKeyboardMarkup]]:
@@ -923,7 +990,7 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
     subscription_token = (data.get("subscription_token") or "").strip() or None
     open_app_url = build_open_app_url(lang=lang, token=subscription_token) if subscription_token else ""
     if not sub:
-        text = "\n".join([t["payment_received"], tx(lang, "manual_import_hint"), subscription_url or ""]).strip()
+        text = "\n".join([t["payment_received"], tx(lang, "manual_import_hint")]).strip()
         return text, activated_inline(lang, open_app_url, subscription_url=subscription_url, subscription_token=subscription_token)
     plan_name = sub["name_ru"] if lang == "ru" else sub["name_en"]
     device_limit = int(data.get('device_limit') or sub.get('device_limit') or settings.VPN_DEFAULT_DEVICE_LIMIT)
@@ -934,8 +1001,6 @@ async def render_payment_success_message(lang: str, token: str, telegram_id: int
             f"{t['plan']}: {plan_name}",
             f"{t['active_until']}: {_fmt_dt(sub.get('expires_at'))}",
             f"{t['available_devices']}: {device_limit} / {device_limit}",
-            "",
-            subscription_url or "",
             "",
             tx(lang, "manual_import_hint"),
         ]
@@ -1246,6 +1311,18 @@ async def cb_device_remove(callback: CallbackQuery) -> None:
     await with_user_guard(callback, _handler)
 
 
+@dp.callback_query(F.data.startswith("device:reset:"))
+async def cb_device_reset(callback: CallbackQuery) -> None:
+    async def _handler(lang: str, ctx: Dict[str, Any]) -> None:
+        device_id = int(callback.data.split(":", 2)[2])
+        await api_request("DELETE", f"/devices/{device_id}", token=ctx["token"])
+        text, markup = await render_devices_message(lang, ctx["token"])
+        await safe_edit(callback, f"{TEXT[lang]['device_removed']}\n\n{text}", markup)
+        await callback.answer()
+
+    await with_user_guard(callback, _handler)
+
+
 @dp.callback_query(F.data == "menu:download")
 async def cb_download(callback: CallbackQuery) -> None:
     async def _handler(lang: str, _ctx: Dict[str, Any]) -> None:
@@ -1341,8 +1418,6 @@ async def build_notification_message(item: Dict[str, Any]) -> Tuple[str, Optiona
                 f"{t['plan']}: {plan_name}",
                 f"{t['active_until']}: {_fmt_dt(payload.get('expires_at'))}",
                 f"{t['available_devices']}: {device_limit} / {device_limit}",
-                "",
-                subscription_url or "",
                 "",
                 tx(lang, "manual_import_hint"),
             ]
