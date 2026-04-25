@@ -49,7 +49,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "delete_device": "🗑 Удалить устройство",
         "reset_device": "🔄 Сбросить устройство",
         "device_reset_done": "Устройство удалено. Старый token и UUID отключены. Слот освобождён. Теперь можно подключить другой телефон.",
-        "devices_hint": "Нажмите «Подключить это устройство» на том телефоне, где хотите использовать VPN. Если меняете телефон — удалите старое устройство, потом подключите новый телефон.",
+        "devices_hint": "Нажмите «Подключить это устройство» / «Добавить второе устройство». Если ссылка создана, но приложение ещё не импортировало профиль, слот будет занят как «⏳ ожидает подключения». Если передумали — удалите это устройство, слот освободится.",
         "support": "🛟 Поддержка",
         "instructions": "📘 Инструкция",
         "renew": "🔄 Продлить",
@@ -106,7 +106,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "status_label": "Статус",
         "remove": "🗑️ Удалить",
         "device_slot": "Слот",
-        "device_active": "активен",
+        "device_active": "✅ подключено",
+        "device_pending": "⏳ ожидает подключения",
         "device_inactive": "неактивен",
         "available_devices": "Доступно устройств",
         "token_label": "Код входа",
@@ -136,7 +137,7 @@ TEXT: Dict[str, Dict[str, str]] = {
         "delete_device": "🗑 Delete device",
         "reset_device": "🔄 Reset device",
         "device_reset_done": "Device removed. The old token and UUID are disabled. The slot is free. You can now connect another phone.",
-        "devices_hint": "Tap “Connect this device” on the phone where you want to use VPN. If you are changing phones, delete the old device first, then connect the new phone.",
+        "devices_hint": "Tap “Connect this device” / “Add second device”. If the link is created but the VPN app has not imported it yet, the slot stays reserved as “⏳ waiting for connection”. Delete it if you changed your mind.",
         "support": "🛟 Support",
         "instructions": "📘 Instructions",
         "renew": "🔄 Renew",
@@ -193,7 +194,8 @@ TEXT: Dict[str, Dict[str, str]] = {
         "status_label": "Status",
         "remove": "🗑️ Remove",
         "device_slot": "Slot",
-        "device_active": "active",
+        "device_active": "✅ connected",
+        "device_pending": "⏳ waiting for connection",
         "device_inactive": "inactive",
         "available_devices": "Devices available",
         "token_label": "Login code",
@@ -980,8 +982,14 @@ async def render_devices_message(lang: str, token: str) -> Tuple[str, InlineKeyb
         for idx, row in enumerate(items, start=1):
             device_name = row.get("device_name") or "—"
             platform = _platform_label(str(row.get("platform") or ""))
-            status_text = t["device_active"] if row.get("is_active", True) else t["device_inactive"]
-            lines.append(f"{idx}. {platform} — {device_name} — {status_text} — {_fmt_dt(row.get('last_seen_at'))}")
+            is_pending = bool(row.get("is_pending")) or str(row.get("device_status") or "").lower() == "pending"
+            if is_pending:
+                status_text = t.get("device_pending", "⏳ waiting for connection")
+                shown_time = _fmt_dt(row.get("pending_created_at") or row.get("created_at"))
+            else:
+                status_text = t["device_active"] if row.get("is_active", True) else t["device_inactive"]
+                shown_time = _fmt_dt(row.get("last_seen_at"))
+            lines.append(f"{idx}. {platform} — {device_name} — {status_text} — {shown_time}")
             rows.append([InlineKeyboardButton(text=f"{t['delete_device']} #{idx}", callback_data=f"device:remove:{row['id']}")])
 
     if used >= limit:
