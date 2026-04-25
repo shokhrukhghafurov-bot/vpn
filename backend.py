@@ -46,6 +46,11 @@ from db_store import (
     _normalize_vpn_payload_keys,
     _config_is_complete,
     build_user_vpn_payload_for_location,
+    create_device_subscription_token_for_user,
+    get_device_subscription_token,
+    user_from_device_subscription_token,
+    bind_device_subscription_token,
+    touch_device_subscription_token,
     _pick_virtual_location,
     get_active_plans,
     get_payment_by_internal_or_external,
@@ -68,6 +73,7 @@ from db_store import (
     list_bot_errors,
     list_broadcast_targets,
     list_locations,
+    list_active_device_location_credentials,
     list_payments,
     patch_location,
     reset_virtual_location_assignments_for_concrete_code,
@@ -80,6 +86,7 @@ from db_store import (
     set_user_language,
     set_user_status_by_telegram,
     settings_snapshot,
+    get_runtime_settings_payload,
     save_runtime_settings_payload,
     sync_plans_from_env,
     upsert_telegram_user,
@@ -88,12 +95,411 @@ from db_store import (
     enqueue_notification,
     _get_user_subscription_view_with_conn,
 )
+from xui_sync import (
+    XUIClient,
+    XUIError,
+    XUIServerConfig,
+    client_email_prefix,
+    make_vless_client,
+    sync_inbound_managed_clients,
+)
 
 
 app = FastAPI(title=f"{settings.APP_NAME} VPN API")
 logger = logging.getLogger("inet.vpn")
 _LOG_LEVEL_NAME = str(getattr(settings, "LOG_LEVEL", "ERROR") or "ERROR").upper()
 logger.setLevel(getattr(logging, _LOG_LEVEL_NAME, logging.ERROR))
+_XRAY_SYNC_LAST: Dict[str, float] = {}
+_XRAY_SYNC_LOCK = threading.Lock()
+
+
+def _xray_sync_payload(reason: str, *, user_id: Optional[int] = None, device_id: Optional[int] = None) -> Dict[str, Any]:
+    # Important: sync payload must contain ALL active per-device UUIDs.
+    # 3X-UI/Xray sync rewrites managed clients in an inbound; sending only one
+    # user/device would accidentally delete other active users from that inbound.
+    credentials = list_active_device_location_credentials()
+    return {
+        "reason": str(reason or "manual").strip() or "manual",
+        "user_id": int(user_id or 0) or None,
+        "device_id": int(device_id or 0) or None,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "active_credentials": [
+            {
+                "user_id": int(item.get("user_id") or 0),
+                "telegram_id": int(item.get("telegram_id") or 0) if item.get("telegram_id") is not None else None,
+                "device_id": int(item.get("device_id") or 0),
+                "location_code": str(item.get("location_code") or ""),
+                "uuid": str(item.get("uuid") or ""),
+                "platform": str(item.get("platform") or ""),
+                "device_name": str(item.get("device_name") or ""),
+                "status": str(item.get("status") or "active"),
+            }
+            for item in credentials
+            if str(item.get("uuid") or "").strip()
+        ],
+    }
+
+
+
+
+def _xui_parse_bool(value: Any, default: bool = True) -> bool:
+    if value is None:
+        return bool(default)
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"1", "true", "yes", "on", "y"}:
+        return True
+    if text in {"0", "false", "no", "off", "n"}:
+        return False
+    return bool(default)
+
+
+def _xui_server_key(value: Any) -> str:
+    raw = str(value or "").strip().lower()
+    raw = re.sub(r"[^a-z0-9_.-]+", "-", raw).strip("-._")
+    return raw[:64]
+
+
+def _xui_runtime_server_entries() -> List[Dict[str, Any]]:
+    payload = get_runtime_settings_payload()
+    raw = payload.get("xui_servers")
+    if isinstance(raw, dict):
+        entries: List[Dict[str, Any]] = []
+        for key, value in raw.items():
+            if isinstance(value, dict):
+                item = dict(value)
+                item.setdefault("key", key)
+                entries.append(item)
+        return entries
+    if isinstance(raw, list):
+        return [dict(item) for item in raw if isinstance(item, dict)]
+    return []
+
+
+def _xui_normalize_server_item(item: Dict[str, Any], *, preserve_password: str = "", preserve_token: str = "") -> Optional[Dict[str, Any]]:
+    key = _xui_server_key(item.get("key") or item.get("name") or item.get("server_key"))
+    base_url = str(item.get("base_url") or item.get("url") or item.get("xui_base_url") or "").strip().rstrip("/")
+    if not key or not base_url:
+        return None
+    password = str(item.get("password") if item.get("password") is not None else preserve_password or "").strip()
+    token = str(item.get("token") if item.get("token") is not None else preserve_token or "").strip()
+    if not password and preserve_password:
+        password = str(preserve_password or "").strip()
+    if not token and preserve_token:
+        token = str(preserve_token or "").strip()
+    try:
+        timeout_sec = int(item.get("timeout_sec") or getattr(settings, "XUI_TIMEOUT_SEC", 8) or 8)
+    except Exception:
+        timeout_sec = 8
+    return {
+        "key": key,
+        "name": str(item.get("name") or key).strip()[:120],
+        "base_url": base_url,
+        "username": str(item.get("username") or item.get("user") or item.get("admin_user") or "").strip(),
+        "password": password,
+        "token": token,
+        "timeout_sec": max(1, min(60, timeout_sec)),
+        "verify_ssl": _xui_parse_bool(item.get("verify_ssl"), bool(getattr(settings, "XUI_VERIFY_SSL", False))),
+        "is_active": _xui_parse_bool(item.get("is_active"), True),
+    }
+
+
+def _xui_public_server_item(item: Dict[str, Any], *, source: str = "db") -> Dict[str, Any]:
+    return {
+        "key": item.get("key"),
+        "name": item.get("name") or item.get("key"),
+        "base_url": item.get("base_url"),
+        "username": item.get("username"),
+        "password_set": bool(str(item.get("password") or "").strip()),
+        "token_set": bool(str(item.get("token") or "").strip()),
+        "timeout_sec": item.get("timeout_sec"),
+        "verify_ssl": bool(item.get("verify_ssl")),
+        "is_active": bool(item.get("is_active", True)),
+        "source": source,
+    }
+
+
+def _xui_parse_entries(parsed: Any) -> List[Tuple[str, Dict[str, Any]]]:
+    entries: List[Tuple[str, Dict[str, Any]]] = []
+    if isinstance(parsed, dict):
+        for key, value in parsed.items():
+            if isinstance(value, dict):
+                entries.append((str(key), value))
+    elif isinstance(parsed, list):
+        for item in parsed:
+            if isinstance(item, dict):
+                entries.append((str(item.get("key") or item.get("name") or len(entries) + 1), item))
+    return entries
+
+
+def _xui_add_config(configs: Dict[str, XUIServerConfig], key: str, item: Dict[str, Any]) -> None:
+    data = dict(item)
+    data.setdefault("key", key)
+    normalized = _xui_normalize_server_item(data)
+    if not normalized or not normalized.get("is_active", True):
+        return
+    configs[str(normalized["key"])] = XUIServerConfig(
+        key=str(normalized["key"]),
+        base_url=str(normalized["base_url"]),
+        username=str(normalized.get("username") or ""),
+        password=str(normalized.get("password") or ""),
+        token=str(normalized.get("token") or ""),
+        timeout_sec=max(1, int(normalized.get("timeout_sec") or getattr(settings, "XUI_TIMEOUT_SEC", 8) or 8)),
+        verify_ssl=bool(normalized.get("verify_ssl")),
+    )
+
+
+def _xui_server_configs() -> Dict[str, XUIServerConfig]:
+    configs: Dict[str, XUIServerConfig] = {}
+    default_key = str(getattr(settings, "XUI_DEFAULT_SERVER_KEY", "default") or "default").strip() or "default"
+    default_base = str(getattr(settings, "XUI_BASE_URL", "") or "").strip()
+    if default_base:
+        _xui_add_config(configs, default_key, {
+            "key": default_key,
+            "base_url": default_base,
+            "username": str(getattr(settings, "XUI_USERNAME", "") or "").strip(),
+            "password": str(getattr(settings, "XUI_PASSWORD", "") or "").strip(),
+            "token": str(getattr(settings, "XUI_TOKEN", "") or "").strip(),
+            "timeout_sec": max(1, int(getattr(settings, "XUI_TIMEOUT_SEC", 8) or 8)),
+            "verify_ssl": bool(getattr(settings, "XUI_VERIFY_SSL", True)),
+            "is_active": True,
+        })
+
+    raw = str(getattr(settings, "XUI_SERVERS_JSON", "") or "").strip()
+    if raw:
+        try:
+            parsed = json.loads(raw)
+        except Exception as exc:
+            logger.warning("[xui-sync] XUI_SERVERS_JSON parse failed: %s", exc)
+            parsed = None
+        for key, item in _xui_parse_entries(parsed):
+            _xui_add_config(configs, key, item)
+
+    # DB/runtime registry has the final word. New servers added from the admin
+    # panel become available immediately after save/redeploy is not required.
+    for item in _xui_runtime_server_entries():
+        _xui_add_config(configs, str(item.get("key") or item.get("name") or ""), item)
+    return configs
+
+
+def _xui_save_runtime_servers(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    normalized: List[Dict[str, Any]] = []
+    seen: set[str] = set()
+    for raw in items:
+        if not isinstance(raw, dict):
+            continue
+        item = _xui_normalize_server_item(raw)
+        if not item:
+            continue
+        key = str(item["key"])
+        if key in seen:
+            continue
+        seen.add(key)
+        normalized.append(item)
+    payload = get_runtime_settings_payload()
+    payload["xui_servers"] = normalized
+    save_runtime_settings_payload(payload)
+    return normalized
+
+
+def _xui_int(value: Any) -> Optional[int]:
+    try:
+        number = int(str(value).strip())
+    except Exception:
+        return None
+    return number if number > 0 else None
+
+
+def _xui_location_sync_configs() -> Dict[str, Dict[str, Any]]:
+    configs: Dict[str, Dict[str, Any]] = {}
+    default_server_key = str(getattr(settings, "XUI_DEFAULT_SERVER_KEY", "default") or "default").strip() or "default"
+    default_prefix = str(getattr(settings, "XUI_CLIENT_EMAIL_PREFIX", "inet:") or "inet:").strip() or "inet:"
+    for row in list_locations(active_only=False):
+        code = str(row.get("code") or "").strip()
+        if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            continue
+        raw_payload = dict(row.get("vpn_payload") or {}) if isinstance(row.get("vpn_payload"), dict) else {}
+        payload = _compose_vpn_payload_for_location(dict(row)) or _normalize_vpn_payload_keys(raw_payload)
+        managed_by = str(
+            payload.get("managed_by")
+            or payload.get("managedBy")
+            or payload.get("provider")
+            or payload.get("runtime_provider")
+            or ""
+        ).strip().lower()
+        inbound_id = _xui_int(
+            payload.get("xui_inbound_id")
+            or payload.get("xuiInboundId")
+            or payload.get("inbound_id")
+            or payload.get("inboundId")
+        )
+        if not inbound_id:
+            continue
+        if managed_by and managed_by not in {"3x-ui", "3xui", "xui", "x-ui", "three-x-ui"}:
+            continue
+        server_key = str(
+            payload.get("xui_server_key")
+            or payload.get("xuiServerKey")
+            or payload.get("server_key")
+            or default_server_key
+        ).strip() or default_server_key
+        configs[code] = {
+            "code": code,
+            "server_key": server_key,
+            "inbound_id": int(inbound_id),
+            "email_prefix": client_email_prefix(default_prefix, payload),
+            "flow": str(payload.get("xui_client_flow") or payload.get("flow") or "").strip(),
+            "payload": payload,
+        }
+    return configs
+
+
+def _trigger_xui_sync(sync_payload: Dict[str, Any]) -> Dict[str, Any]:
+    if not bool(getattr(settings, "XUI_SYNC_ENABLED", False)):
+        return {"ok": False, "skipped": True, "reason": "XUI_SYNC_ENABLED disabled"}
+
+    server_configs = _xui_server_configs()
+    if not server_configs:
+        return {"ok": False, "skipped": True, "reason": "No 3X-UI server configured"}
+
+    location_configs = _xui_location_sync_configs()
+    if not location_configs:
+        return {"ok": False, "skipped": True, "reason": "No locations with xui_inbound_id"}
+
+    active_credentials = [
+        dict(item)
+        for item in (sync_payload.get("active_credentials") or [])
+        if isinstance(item, dict) and str(item.get("uuid") or "").strip()
+    ]
+
+    grouped: Dict[Tuple[str, int, str], Dict[str, Any]] = {}
+    for loc_code, loc_cfg in location_configs.items():
+        key = (str(loc_cfg["server_key"]), int(loc_cfg["inbound_id"]), str(loc_cfg["email_prefix"]))
+        group = grouped.setdefault(
+            key,
+            {
+                "server_key": key[0],
+                "inbound_id": key[1],
+                "email_prefix": key[2],
+                "desired_clients": [],
+                "location_codes": [],
+            },
+        )
+        group["location_codes"].append(loc_code)
+
+    for cred in active_credentials:
+        loc_code = str(cred.get("location_code") or "").strip()
+        loc_cfg = location_configs.get(loc_code)
+        if not loc_cfg:
+            continue
+        key = (str(loc_cfg["server_key"]), int(loc_cfg["inbound_id"]), str(loc_cfg["email_prefix"]))
+        group = grouped.setdefault(
+            key,
+            {
+                "server_key": key[0],
+                "inbound_id": key[1],
+                "email_prefix": key[2],
+                "desired_clients": [],
+                "location_codes": [loc_code],
+            },
+        )
+        group["desired_clients"].append(
+            make_vless_client(cred, flow=str(loc_cfg.get("flow") or ""), email_prefix=str(loc_cfg.get("email_prefix") or "inet:"))
+        )
+
+    results: List[Dict[str, Any]] = []
+    dry_run = bool(getattr(settings, "XUI_DRY_RUN", False))
+    for (server_key, inbound_id, email_prefix), group in grouped.items():
+        cfg = server_configs.get(server_key)
+        if not cfg:
+            results.append({
+                "ok": False,
+                "server_key": server_key,
+                "inbound_id": inbound_id,
+                "error": "3X-UI server config not found",
+            })
+            continue
+        try:
+            api = XUIClient(cfg)
+            result = sync_inbound_managed_clients(
+                api,
+                inbound_id=inbound_id,
+                desired_clients=list(group.get("desired_clients") or []),
+                email_prefix=email_prefix,
+                dry_run=dry_run,
+            )
+            result.update({
+                "server_key": server_key,
+                "location_codes": list(group.get("location_codes") or []),
+            })
+            results.append(result)
+        except Exception as exc:
+            logger.warning("[xui-sync] failed server=%s inbound=%s err=%s", server_key, inbound_id, exc)
+            results.append({
+                "ok": False,
+                "server_key": server_key,
+                "inbound_id": inbound_id,
+                "location_codes": list(group.get("location_codes") or []),
+                "error": str(exc)[:500],
+            })
+
+    return {
+        "ok": bool(results) and all(bool(item.get("ok")) for item in results),
+        "dry_run": dry_run,
+        "groups": len(results),
+        "results": results,
+    }
+
+def _trigger_xray_sync(reason: str, *, user_id: Optional[int] = None, device_id: Optional[int] = None) -> Dict[str, Any]:
+    """Notify an external Xray sync service, if configured.
+
+    The backend database is the source of truth for active per-device UUIDs.
+    XRAY_SYNC_WEBHOOK_URL should point to your service/script that rewrites Xray
+    client users and reloads/restarts Xray. If the URL is not configured, the
+    backend still revokes DB credentials and dt_ tokens, but it cannot remove a
+    UUID that is already loaded inside a separate Xray process.
+    """
+    normalized_reason = str(reason or "manual").strip() or "manual"
+    if normalized_reason == "subscription_generated":
+        if not bool(getattr(settings, "XRAY_SYNC_ON_SUBSCRIPTION", True)):
+            return {"ok": False, "skipped": True, "reason": "XRAY_SYNC_ON_SUBSCRIPTION disabled"}
+        key = f"{normalized_reason}:{int(user_id or 0)}:{int(device_id or 0)}"
+        min_interval = max(0, int(getattr(settings, "XRAY_SYNC_MIN_INTERVAL_SEC", 60) or 60))
+        now_ts = time.time()
+        with _XRAY_SYNC_LOCK:
+            last_ts = float(_XRAY_SYNC_LAST.get(key) or 0.0)
+            if min_interval and now_ts - last_ts < min_interval:
+                return {"ok": False, "skipped": True, "reason": "xray_sync_throttled"}
+            _XRAY_SYNC_LAST[key] = now_ts
+    url = str(getattr(settings, "XRAY_SYNC_WEBHOOK_URL", "") or "").strip()
+    payload = _xray_sync_payload(normalized_reason, user_id=user_id, device_id=device_id)
+    xui_sync = _trigger_xui_sync(payload)
+    if not url:
+        return {
+            "ok": bool(xui_sync.get("ok")),
+            "skipped": True,
+            "reason": "XRAY_SYNC_WEBHOOK_URL not configured",
+            "xui_sync": xui_sync,
+            "payload": payload,
+        }
+    headers = {"Content-Type": "application/json"}
+    token = str(getattr(settings, "XRAY_SYNC_WEBHOOK_TOKEN", "") or "").strip()
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    timeout = max(1, int(getattr(settings, "XRAY_SYNC_TIMEOUT_SEC", 8) or 8))
+    try:
+        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        webhook_ok = 200 <= int(resp.status_code) < 300
+        return {
+            "ok": bool(webhook_ok or xui_sync.get("ok")),
+            "status_code": int(resp.status_code),
+            "body": (resp.text or "")[:500],
+            "xui_sync": xui_sync,
+        }
+    except Exception as exc:
+        logger.warning("[xray-sync] failed reason=%s user_id=%s device_id=%s err=%s", reason, user_id, device_id, exc)
+        return {"ok": bool(xui_sync.get("ok")), "error": str(exc), "xui_sync": xui_sync, "payload": payload}
 
 
 security = HTTPBearer(auto_error=False)
@@ -256,6 +662,21 @@ class AdminVpnSettingsIn(BaseModel):
     max_devices_per_account: int = Field(default=settings.VPN_MAX_DEVICES_PER_ACCOUNT, ge=1)
     device_limit: Optional[int] = Field(default=None, ge=1)
     plans: List[AdminPlanSettingsIn] = Field(default_factory=list)
+
+
+class AdminXUIServerIn(BaseModel):
+    # Dynamic 3X-UI server registry. These records are stored in
+    # vpn_runtime_settings.payload.xui_servers, so adding a new VPN node does
+    # not require changing code or Railway variables.
+    key: str = Field(..., min_length=1, max_length=64)
+    name: Optional[str] = Field(default="", max_length=120)
+    base_url: str = Field(..., min_length=6, max_length=500)
+    username: str = Field(default="", max_length=160)
+    password: str = Field(default="", max_length=500)
+    token: str = Field(default="", max_length=1000)
+    timeout_sec: int = Field(default=8, ge=1, le=60)
+    verify_ssl: bool = False
+    is_active: bool = True
 
 
 RU_LTE_RESERVE_LOCATION_CODES: Tuple[str, ...] = ("ru-lte-reserve-1", "ru-lte-reserve-2", "ru-lte-reserve-3")
@@ -3480,6 +3901,11 @@ def _subscription_access_context(token: str) -> Optional[Dict[str, Any]]:
     expected = str(settings.SUBSCRIPTION_TOKEN or "").strip()
     if settings.LEGACY_GLOBAL_SUBSCRIPTION_TOKEN_ENABLED and expected and secrets.compare_digest(provided, expected):
         return {"kind": "global", "user": None}
+    device_token = get_device_subscription_token(provided)
+    if device_token:
+        user = user_from_device_subscription_token(device_token)
+        if user:
+            return {"kind": "device", "user": user, "device_token": device_token}
     user = get_user_by_subscription_token(provided)
     if user:
         return {"kind": "user", "user": user}
@@ -3491,11 +3917,23 @@ def _subscription_token_is_active(token: Optional[str]) -> bool:
     access = _subscription_access_context(str(token or "").strip())
     if not access:
         return False
-    if access["kind"] != "user":
+    if access.get("kind") == "global":
         return True
     user = access.get("user")
     if not user or user.get("status") == "blocked":
         return False
+    if access.get("kind") == "device":
+        device_token = access.get("device_token") or {}
+        if not bool(device_token.get("is_active")):
+            return False
+        expires_at = device_token.get("expires_at")
+        if expires_at:
+            try:
+                parsed = expires_at if isinstance(expires_at, datetime) else datetime.fromisoformat(str(expires_at).replace("Z", "+00:00"))
+                if parsed.astimezone(timezone.utc) < datetime.now(timezone.utc):
+                    return False
+            except Exception:
+                return False
     view = get_user_subscription_view(int(user["id"]))
     return bool(view.get("is_active"))
 
@@ -3816,21 +4254,27 @@ def _subscription_client_id_from_request(request: Request) -> str:
 
 def _subscription_fingerprint_source(request: Request, token: str, client_id: Optional[str] = None) -> Optional[Tuple[str, str]]:
     normalized_client_id = _sanitize_tracking_value(client_id, max_len=120)
-    if normalized_client_id:
-        return (f"cid:{normalized_client_id}", "client_id")
     user_agent = str(request.headers.get("user-agent") or "").strip()
     accept_language = str(request.headers.get("accept-language") or "").strip()
     sec_ch_ua = str(request.headers.get("sec-ch-ua") or "").strip()
     sec_platform = str(request.headers.get("sec-ch-ua-platform") or "").strip()
     sec_mobile = str(request.headers.get("sec-ch-ua-mobile") or "").strip()
     platform, device_name = _detect_device_platform_and_name(request)
+    token_is_device_token = str(token or "").strip().startswith("dt_")
+    if normalized_client_id and not (token_is_device_token and bool(getattr(settings, "DEVICE_TOKEN_STRICT_BINDING", True))):
+        return (f"cid:{normalized_client_id}", "client_id")
     parts = [user_agent, accept_language, sec_ch_ua, sec_platform, sec_mobile, str(platform or "").strip(), str(device_name or "").strip()]
     normalized_parts = [part.strip() for part in parts if part and part.strip()]
     if normalized_client_id:
         normalized_parts.append(f"subcid:{normalized_client_id}")
+    if token_is_device_token and bool(getattr(settings, "DEVICE_TOKEN_BIND_IP_ENABLED", False)):
+        ip = _client_ip_from_request(request)
+        if ip:
+            normalized_parts.append(f"ip:{ip}")
     if not normalized_parts:
         return None
-    return ("fallback:" + "|".join(normalized_parts), "fallback")
+    prefix = "device-token" if token_is_device_token else "fallback"
+    return (prefix + ":" + "|".join(normalized_parts), prefix)
 
 
 
@@ -3902,6 +4346,8 @@ def _subscription_cookie_value(request: Request, token: str) -> str:
 
 def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, Any]], gate: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
     if not gate or gate.get("allowed"):
+        return gate
+    if bool(getattr(settings, "DEVICE_TOKEN_STRICT_BINDING", True)):
         return gate
     if not access or access.get("kind") != "user":
         return gate
@@ -4000,7 +4446,7 @@ def _subscription_soft_gate_allow(request: Request, access: Optional[Dict[str, A
 
 
 def _track_subscription_device_access(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[str]:
-    if not access or access.get("kind") != "user":
+    if not access or access.get("kind") not in {"user", "device"}:
         return None
     user = access.get("user") or {}
     if not user or user.get("status") == "blocked":
@@ -4011,7 +4457,10 @@ def _track_subscription_device_access(request: Request, token: str, access: Opti
         return None
     platform, device_name = _detect_device_platform_and_name(request)
     try:
-        touch_subscription_device_by_token(token, platform=platform, device_name=device_name, device_fingerprint=fingerprint)
+        if access.get("kind") == "device":
+            touch_device_subscription_token(token, fingerprint)
+        else:
+            touch_subscription_device_by_token(token, platform=platform, device_name=device_name, device_fingerprint=fingerprint)
     except Exception:
         pass
     return fingerprint
@@ -4025,7 +4474,7 @@ def _record_real_connected_locations(
     *,
     fingerprint: Optional[str] = None,
 ) -> None:
-    if not access or access.get("kind") != "user":
+    if not access or access.get("kind") not in {"user", "device"}:
         return
     user = access.get("user") or {}
     user_id = int(user.get("id") or 0)
@@ -4062,7 +4511,7 @@ def _record_real_connected_locations(
 
 
 def _subscription_device_gate(request: Request, token: str, access: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    if not access or access.get("kind") != "user":
+    if not access or access.get("kind") not in {"user", "device"}:
         return None
     user = access.get("user") or {}
     if not user or user.get("status") == "blocked":
@@ -4070,8 +4519,27 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
     client_id = _subscription_client_id_from_request(request)
     fingerprint = _build_subscription_device_fingerprint(request, token, client_id)
     if not fingerprint:
-        return None
+        return {"allowed": False, "reason": "device_fingerprint_required", "detail": "Device fingerprint is required"}
+    platform, device_name = _detect_device_platform_and_name(request)
+    client_hint = str(request.query_params.get("client") or "").strip().lower()
+    if not client_hint:
+        ua = str(request.headers.get("user-agent") or "").strip().lower()
+        if "hiddify" in ua:
+            client_hint = "hiddify"
+        elif "v2raytun" in ua:
+            client_hint = "v2raytun"
+        elif "happ" in ua:
+            client_hint = "happ"
     try:
+        if access.get("kind") == "device":
+            return bind_device_subscription_token(
+                token,
+                platform=platform,
+                device_name=device_name,
+                device_fingerprint=fingerprint,
+                client=client_hint,
+                client_id=client_id,
+            )
         gate = get_subscription_device_gate_by_token(token, fingerprint)
     except Exception:
         return None
@@ -4241,7 +4709,7 @@ def _subscription_transport_allowed(payload: Dict[str, Any], client_hint: Option
     return transport in allowed if allowed else True
 
 
-def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
+def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Optional[int] = None, device_id: Optional[int] = None) -> Tuple[Optional[Dict[str, Any]], str]:
     code = str(row.get("code") or "").strip()
     resolved_row = dict(row)
     if code in PUBLIC_VIRTUAL_LOCATION_CODES:
@@ -4251,7 +4719,12 @@ def _subscription_payload_and_fallback_name(row: Dict[str, Any], *, user_id: Opt
         resolved_row = dict(picked)
 
     if user_id is not None:
-        payload = build_user_vpn_payload_for_location(int(user_id), resolved_row, requested_location_code=code or None)
+        payload = build_user_vpn_payload_for_location(
+            int(user_id),
+            resolved_row,
+            requested_location_code=code or None,
+            device_id=device_id,
+        )
     else:
         payload = _compose_vpn_payload_for_location(resolved_row, requested_location_code=code or None)
     if not payload:
@@ -4474,10 +4947,46 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     expires_ts = int(time.time()) + 86400 * 3650
     profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
     subscription_user_id: Optional[int] = None
-    if access["kind"] == "user":
+    subscription_device_id: Optional[int] = None
+    if access["kind"] in {"user", "device"}:
         user = access["user"]
         if not user or user.get("status") == "blocked":
             raise HTTPException(status_code=404, detail="Subscription not found")
+
+        if access["kind"] == "device":
+            device_token = access.get("device_token") or {}
+            if not bool(device_token.get("is_active")):
+                return _subscription_empty_response(
+                    request,
+                    token,
+                    head_only=head_only,
+                    expires_ts=int(time.time()) - 300,
+                    state="empty",
+                    profile_suffix=_bot_profile_title_label(),
+                )
+            token_expires_at = device_token.get("expires_at")
+            if token_expires_at:
+                try:
+                    token_exp = token_expires_at if isinstance(token_expires_at, datetime) else datetime.fromisoformat(str(token_expires_at).replace("Z", "+00:00"))
+                    if token_exp.astimezone(timezone.utc) < datetime.now(timezone.utc):
+                        return _subscription_empty_response(
+                            request,
+                            token,
+                            head_only=head_only,
+                            expires_ts=int(time.time()) - 300,
+                            state="empty",
+                            profile_suffix=_bot_profile_title_label(),
+                        )
+                except Exception:
+                    return _subscription_empty_response(
+                        request,
+                        token,
+                        head_only=head_only,
+                        expires_ts=int(time.time()) - 300,
+                        state="empty",
+                        profile_suffix=_bot_profile_title_label(),
+                    )
+
         view = get_user_subscription_view(int(user["id"]))
         subscription = view.get("subscription") or {}
         expires_at = subscription.get("expires_at")
@@ -4506,12 +5015,30 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
             return _subscription_inactive_response(request, token, head_only=head_only, expires_ts=expires_ts)
         profile_title = f"{settings.APP_NAME} · {_bot_profile_title_label()}"
         subscription_user_id = int(user["id"])
+        if access.get("kind") == "device":
+            try:
+                subscription_device_id = int((access.get("device_token") or {}).get("device_id") or 0) or None
+            except Exception:
+                subscription_device_id = None
 
         is_browser_preview = _subscription_browser_preview_request(request)
+        if access.get("kind") == "user" and bool(getattr(settings, "DEVICE_TOKEN_REQUIRED_FOR_SUBSCRIPTION", True)):
+            content = (
+                "Direct user subscription token is disabled. Open the connection from the bot to create a one-device link.\n"
+                "Прямой общий токен отключён. Откройте подключение из бота, чтобы создать ссылку только для этого устройства.\n"
+            )
+            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+        if access.get("kind") == "device" and bool(getattr(settings, "DEVICE_TOKEN_STRICT_BINDING", True)) and not _subscription_client_id_from_request(request):
+            content = (
+                "Device token requires the original app link with subcid. Open the connection from the bot again.\n"
+                "Токен устройства требует исходную ссылку приложения с subcid. Откройте подключение из бота ещё раз.\n"
+            )
+            return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
         if not is_browser_preview:
             gate = _subscription_device_gate(request, token, access)
             if gate and not gate.get("allowed"):
-                if str(gate.get("reason") or "").strip() == "device_removed":
+                reason = str(gate.get("reason") or "").strip()
+                if reason in {"device_removed", "token_bound_to_other_device", "token_revoked", "token_expired"}:
                     return _subscription_empty_response(
                         request,
                         token,
@@ -4527,6 +5054,18 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
                     f"Лимит устройств исчерпан ({used}/{limit}). Удалите одно устройство в боте или админке и попробуйте снова.\n"
                 )
                 return Response(content=content, status_code=403, media_type="text/plain; charset=utf-8")
+            if gate and access.get("kind") == "device":
+                try:
+                    gate_device = gate.get("device") or {}
+                    gate_token = gate.get("device_token") or {}
+                    subscription_device_id = int(
+                        gate_device.get("id")
+                        or gate_token.get("device_id")
+                        or subscription_device_id
+                        or 0
+                    ) or None
+                except Exception:
+                    pass
 
     client_hint = _subscription_client_hint(request)
     user_agent_hint = str(request.headers.get("user-agent") or "").strip().lower()
@@ -4539,13 +5078,20 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
     rows = _subscription_location_rows(subscription_user_id, client_hint=client_hint)
     lines: List[str] = []
     for row in rows:
-        payload_for_subscription, fallback_name = _subscription_payload_and_fallback_name(dict(row), user_id=subscription_user_id)
+        payload_for_subscription, fallback_name = _subscription_payload_and_fallback_name(
+            dict(row),
+            user_id=subscription_user_id,
+            device_id=subscription_device_id,
+        )
         if not payload_for_subscription:
             continue
         try:
             lines.append(_build_vless_subscription_line(payload_for_subscription, fallback_name=fallback_name, client_hint=client_hint))
         except Exception:
             continue
+
+    if lines and subscription_device_id:
+        _trigger_xray_sync("subscription_generated", user_id=subscription_user_id, device_id=subscription_device_id)
 
     if not lines:
         logger.warning("[sub][publish] returning_empty_subscription_no_503 user_id=%s", subscription_user_id if subscription_user_id is not None else "-")
@@ -4674,7 +5220,40 @@ def open_app_bridge(
     client_name = _client_name_for_platform(target_platform)
     resolved_token = _resolve_subscription_token(token=token, code=code)
     active_token = resolved_token if _subscription_token_is_active(resolved_token) else None
-    subscription_client_id = _subscription_cookie_value(request, active_token) if active_token else ""
+    subscription_client_id = ""
+    if active_token:
+        try:
+            bridge_access = _subscription_access_context(active_token)
+            if bridge_access and bridge_access.get("kind") == "user":
+                bridge_user = bridge_access.get("user") or {}
+                ttl_hours = int(getattr(settings, "DEVICE_TOKEN_TTL_HOURS", 0) or 0)
+                device_token_row = create_device_subscription_token_for_user(
+                    int(bridge_user["id"]),
+                    platform=target_platform,
+                    device_name=client_name,
+                    client=client_mode,
+                    ttl_hours=ttl_hours if ttl_hours > 0 else None,
+                )
+                active_token = str(device_token_row.get("token") or "").strip() or active_token
+                subscription_client_id = str(device_token_row.get("client_id") or "").strip()
+            elif bridge_access and bridge_access.get("kind") == "device":
+                subscription_client_id = str((bridge_access.get("device_token") or {}).get("client_id") or "").strip()
+        except PermissionError as exc:
+            logger.info("[sub][device-token] device token was not created: %s", exc)
+            active_token = None
+            subscription_client_id = ""
+        except Exception as exc:
+            logger.warning("[sub][device-token] failed to create bridge device token: %s", exc)
+            active_token = None
+            subscription_client_id = ""
+    if active_token and not subscription_client_id:
+        try:
+            token_row = get_device_subscription_token(active_token)
+            subscription_client_id = str((token_row or {}).get("client_id") or "").strip()
+        except Exception:
+            subscription_client_id = ""
+    if active_token and not subscription_client_id:
+        subscription_client_id = _subscription_cookie_value(request, active_token)
     subscription_url = _subscription_public_url(request, token=active_token) if active_token else None
     tracked_subscription_url = None
     if subscription_url:
@@ -4728,8 +5307,9 @@ def open_app_bridge(
         },
     }[norm_lang]
     display_subscription_url = tracked_subscription_url or subscription_url
+    show_direct_copy = bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)) or client_mode == "happ" or not supports_native_launch
     copy_block = ""
-    if display_subscription_url:
+    if display_subscription_url and show_direct_copy:
         copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(display_subscription_url)}</code></div>'
     native_url_attr = html.escape(native_url or display_subscription_url or "", quote=True)
     native_url_js = json.dumps(native_url)
@@ -5172,7 +5752,8 @@ def devices_delete(device_id: int, user: Dict[str, Any] = Depends(get_current_us
     item = delete_device(user["id"], device_id)
     if not item:
         raise HTTPException(status_code=404, detail="Device not found")
-    return {"ok": True, "device": item}
+    xray_sync = _trigger_xray_sync("device_deleted", user_id=int(user["id"]), device_id=int(device_id))
+    return {"ok": True, "device": item, "xray_sync": xray_sync}
 
 
 @app.get("/config/version")
@@ -5619,11 +6200,125 @@ def admin_user_extend(telegram_id: int, payload: ExtendIn, admin_name: str = Dep
         raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
+@app.get("/api/infra/admin/vpn/xray/active-uuids")
+def admin_xray_active_uuids(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    payload = _xray_sync_payload("admin_export")
+    return {"ok": True, **payload}
+
+
+@app.post("/api/infra/admin/vpn/xray/sync")
+def admin_xray_sync(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    result = _trigger_xray_sync("admin_manual_sync")
+    return {"ok": bool(result.get("ok")), "result": result}
+
+
+@app.get("/api/infra/admin/vpn/xui/servers")
+def admin_xui_servers(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    runtime_items = [_xui_public_server_item(item, source="db") for item in _xui_runtime_server_entries()]
+    effective_items = []
+    for key, cfg in sorted(_xui_server_configs().items()):
+        effective_items.append({
+            "key": key,
+            "base_url": cfg.base_url,
+            "username": cfg.username,
+            "password_set": bool(cfg.password),
+            "token_set": bool(cfg.token),
+            "timeout_sec": cfg.timeout_sec,
+            "verify_ssl": cfg.verify_ssl,
+        })
+    return {"ok": True, "items": runtime_items, "effective": effective_items}
+
+
+@app.post("/api/infra/admin/vpn/xui/servers")
+def admin_xui_servers_save(payload: AdminXUIServerIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    incoming = payload.model_dump()
+    key = _xui_server_key(incoming.get("key"))
+    if not key:
+        raise HTTPException(status_code=400, detail="server key is required")
+    existing = {str(item.get("key") or ""): dict(item) for item in _xui_runtime_server_entries() if isinstance(item, dict)}
+    previous = existing.get(key, {})
+    normalized = _xui_normalize_server_item(
+        incoming,
+        preserve_password=str(previous.get("password") or ""),
+        preserve_token=str(previous.get("token") or ""),
+    )
+    if not normalized:
+        raise HTTPException(status_code=400, detail="base_url and key are required")
+    existing[key] = normalized
+    items = _xui_save_runtime_servers(list(existing.values()))
+    saved = next((item for item in items if item.get("key") == key), normalized)
+    return {"ok": True, "item": _xui_public_server_item(saved, source="db"), "items": [_xui_public_server_item(item, source="db") for item in items]}
+
+
+@app.delete("/api/infra/admin/vpn/xui/servers/{server_key}")
+def admin_xui_servers_delete(server_key: str, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    key = _xui_server_key(server_key)
+    if not key:
+        raise HTTPException(status_code=400, detail="server key is required")
+    remaining = [item for item in _xui_runtime_server_entries() if _xui_server_key(item.get("key")) != key]
+    items = _xui_save_runtime_servers(remaining)
+    return {"ok": True, "items": [_xui_public_server_item(item, source="db") for item in items]}
+
+
+@app.post("/api/infra/admin/vpn/xui/servers/{server_key}/test")
+def admin_xui_servers_test(server_key: str, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    key = _xui_server_key(server_key)
+    cfg = _xui_server_configs().get(key)
+    if not cfg:
+        raise HTTPException(status_code=404, detail=f"3X-UI server config not found: {key}")
+    try:
+        rows = XUIClient(cfg).list_inbounds()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    return {"ok": True, "server_key": key, "count": len(rows), "items": [{"id": r.get("id"), "remark": r.get("remark"), "port": r.get("port"), "protocol": r.get("protocol"), "enable": r.get("enable")} for r in rows]}
+
+
+@app.get("/api/infra/admin/vpn/xui/inbounds")
+def admin_xui_inbounds(server_key: str = Query(default=""), admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
+    del admin_name
+    configs = _xui_server_configs()
+    selected_key = str(server_key or getattr(settings, "XUI_DEFAULT_SERVER_KEY", "default") or "default").strip() or "default"
+    cfg = configs.get(selected_key)
+    if not cfg:
+        raise HTTPException(status_code=400, detail=f"3X-UI server config not found: {selected_key}")
+    try:
+        api = XUIClient(cfg)
+        rows = api.list_inbounds()
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    items = []
+    for row in rows:
+        settings_payload = row.get("settings")
+        client_count = 0
+        try:
+            parsed_settings = json.loads(settings_payload) if isinstance(settings_payload, str) else settings_payload
+            if isinstance(parsed_settings, dict) and isinstance(parsed_settings.get("clients"), list):
+                client_count = len(parsed_settings.get("clients") or [])
+        except Exception:
+            client_count = 0
+        items.append({
+            "id": row.get("id"),
+            "remark": row.get("remark"),
+            "port": row.get("port"),
+            "protocol": row.get("protocol"),
+            "enable": row.get("enable"),
+            "client_count": client_count,
+        })
+    return {"ok": True, "server_key": selected_key, "items": items}
+
+
 @app.post("/api/infra/admin/vpn/users/{telegram_id}/reset-devices")
 def admin_user_reset_devices(telegram_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     try:
         item = reset_user_devices_by_telegram(telegram_id, admin_name)
-        return {"ok": True, "item": item}
+        xray_sync = _trigger_xray_sync("admin_reset_devices", user_id=int(item.get("user_id") or 0) or None)
+        return {"ok": True, "item": item, "xray_sync": xray_sync}
     except ValueError as exc:
         raise HTTPException(status_code=404, detail=str(exc)) from exc
 
