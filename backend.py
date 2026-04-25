@@ -4046,9 +4046,66 @@ def _subscription_device_gate(request: Request, token: str, access: Optional[Dic
 
 
 
+def _reserve_family_key_for_code(code: str) -> str:
+    normalized = str(code or "").strip().lower()
+    if normalized.startswith("ru-lte"):
+        return "ru-lte"
+    if normalized.startswith("intl-fast"):
+        return "intl-fast"
+    if normalized.startswith("uz-lte"):
+        return "uz-lte"
+    return normalized.split("-", 1)[0] if normalized else ""
+
+
+def _reserve_index_for_row(row: Dict[str, Any]) -> Optional[int]:
+    code = str(row.get("code") or "").strip().lower()
+    if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES or not bool(row.get("is_reserve")):
+        return None
+    family = _reserve_family_key_for_code(code)
+    if not family:
+        return None
+    try:
+        rows = list_locations(active_only=False)
+    except Exception:
+        rows = []
+    reserves: List[Dict[str, Any]] = []
+    for item in rows:
+        item_code = str(item.get("code") or "").strip().lower()
+        if not item_code or item_code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            continue
+        if not bool(item.get("is_reserve")):
+            continue
+        if _reserve_family_key_for_code(item_code) != family:
+            continue
+        reserves.append(dict(item))
+    reserves.sort(key=lambda item: (int(item.get("sort_order") or 9999), str(item.get("code") or "")))
+    for idx, item in enumerate(reserves, start=1):
+        if str(item.get("code") or "").strip().lower() == code:
+            return idx
+    return None
+
+
+def _append_reserve_suffix_for_row(row: Dict[str, Any], text: str) -> str:
+    value = str(text or "").strip()
+    if not value:
+        return value
+    if not bool(row.get("is_reserve")):
+        return value
+    code = str(row.get("code") or "").strip().lower()
+    if code in PUBLIC_VIRTUAL_LOCATION_CODES:
+        return value
+    if re.search(r"\breserve\b|\bрезерв\b", value, flags=re.IGNORECASE):
+        return value
+    reserve_index = _reserve_index_for_row(row)
+    if reserve_index is None:
+        return f"{value} | Reserve"
+    return f"{value} | Reserve {reserve_index}"
+
+
 def _subscription_remark_for_row(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> str:
     normalized = _normalize_vpn_payload_keys(payload or {}) if payload else {}
     base_name = _subscription_target_name_for_row(row, normalized)
+    base_name = _append_reserve_suffix_for_row(row, base_name)
     if bool(row.get("is_recommended")) and " ★ " not in base_name and not base_name.startswith(("★ ", "⭐ ")):
         icon = _subscription_icon_for_row(row, normalized)
         if icon and base_name.startswith(f"{icon} "):
