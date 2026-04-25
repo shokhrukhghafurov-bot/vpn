@@ -46,6 +46,7 @@ from db_store import (
     _normalize_vpn_payload_keys,
     _config_is_complete,
     build_user_vpn_payload_for_location,
+    ensure_user_device_location_credential,
     create_device_subscription_token_for_user,
     get_device_subscription_token,
     user_from_device_subscription_token,
@@ -453,6 +454,38 @@ def _trigger_xui_sync(sync_payload: Dict[str, Any]) -> Dict[str, Any]:
         "groups": len(results),
         "results": results,
     }
+
+def _preprovision_device_credentials_for_active_locations(user_id: int, device_id: int) -> Dict[str, Any]:
+    """Create per-device UUID credentials before the app imports /sub/dt_... .
+
+    This makes the second/child-phone flow deterministic: after the bot creates
+    the pending device slot, the backend already has UUIDs ready for Xray/3X-UI
+    sync. Virtual locations are skipped because they resolve to a concrete
+    location later during subscription generation.
+    """
+    uid = int(user_id or 0)
+    did = int(device_id or 0)
+    if uid <= 0 or did <= 0:
+        return {"ok": False, "created": 0, "errors": ["missing user_id/device_id"]}
+    created = 0
+    existing = 0
+    errors: List[str] = []
+    for row in list_locations(active_only=True):
+        code = str(row.get("code") or "").strip()
+        if not code or code in PUBLIC_VIRTUAL_LOCATION_CODES:
+            continue
+        try:
+            before_id = None
+            # ensure_user_device_location_credential is idempotent. We count a
+            # newly returned row as existing/created only for diagnostics.
+            cred = ensure_user_device_location_credential(uid, did, code)
+            before_id = int(cred.get("id") or 0)
+            if before_id:
+                existing += 1
+        except Exception as exc:
+            errors.append(f"{code}: {str(exc)[:160]}")
+    return {"ok": not errors, "created_or_existing": existing, "errors": errors[:20]}
+
 
 def _trigger_xray_sync(reason: str, *, user_id: Optional[int] = None, device_id: Optional[int] = None) -> Dict[str, Any]:
     """Notify an external Xray sync service, if configured.
@@ -5841,6 +5874,9 @@ def issue_device_subscription_token(
 
     device_token = str(device_token_row.get("token") or "").strip()
     client_id = str(device_token_row.get("client_id") or "").strip()
+    pending_device_id = int(device_token_row.get("device_id") or (device_token_row.get("device") or {}).get("id") or 0)
+    preprovision = _preprovision_device_credentials_for_active_locations(int(user["id"]), pending_device_id) if pending_device_id > 0 else {"ok": False, "skipped": True}
+    xray_sync = _trigger_xray_sync("subscription_generated", user_id=int(user["id"]), device_id=pending_device_id) if pending_device_id > 0 else {"ok": False, "skipped": True}
     base_subscription_url = _subscription_public_url_from_base(settings.BACKEND_BASE_URL, device_token)
     subscription_url = _subscription_url_with_tracking(base_subscription_url, client_id=client_id, client=client_mode)
     open_app_url = _build_open_app_bridge_url(request, token=device_token, lang=norm_lang, platform=target_platform)
@@ -5852,7 +5888,12 @@ def issue_device_subscription_token(
         "client_id": client_id,
         "client": client_mode,
         "platform": target_platform,
-        "device_id": device_token_row.get("device_id"),
+        "device_id": pending_device_id or device_token_row.get("device_id"),
+        "device_status": "pending",
+        "slot_reserved": True,
+        "pending_ttl_hours": int(getattr(settings, "DEVICE_PENDING_SLOT_TTL_HOURS", 24) or 0),
+        "preprovision": preprovision,
+        "xray_sync": xray_sync,
     }
 
 
