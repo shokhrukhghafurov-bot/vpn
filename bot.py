@@ -1,6 +1,7 @@
 import contextlib
 import asyncio
 import logging
+import os
 import time
 from datetime import datetime
 from typing import Any, Dict, List, Optional, Tuple
@@ -29,7 +30,7 @@ from db_store import (
 )
 
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+logging.basicConfig(level=getattr(logging, os.getenv("LOG_LEVEL", "ERROR").strip().upper(), logging.ERROR), format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 logger = logging.getLogger(__name__)
 
 
@@ -1428,12 +1429,12 @@ async def configure_bot() -> None:
     await app_bot.delete_webhook(drop_pending_updates=False)
     with contextlib.suppress(Exception):
         await app_bot.delete_my_commands()
-    logger.info("Bot configured, webhook removed, command menu cleared")
+    logger.debug("Bot configured, webhook removed, command menu cleared")
 
 
 async def verify_backend() -> None:
     data = await api_request("GET", "/health")
-    logger.info("Backend health check succeeded: %s", data)
+    logger.debug("Backend health check succeeded: %s", data)
 
 
 async def main() -> None:
@@ -1445,8 +1446,8 @@ async def main() -> None:
 
     bot = Bot(token=settings.BOT_TOKEN)
 
-    logger.info("Starting bot for %s", settings.BOT_USERNAME or settings.BOT_NAME)
-    logger.info("Backend base URL: %s", settings.BACKEND_BASE_URL)
+    logger.debug("Starting bot for %s", settings.BOT_USERNAME or settings.BOT_NAME)
+    logger.debug("Backend base URL: %s", settings.BACKEND_BASE_URL)
 
     await configure_bot()
     await verify_backend()
