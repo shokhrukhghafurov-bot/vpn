@@ -9,14 +9,36 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 from urllib.parse import urljoin
 
 import requests
+try:
+    import urllib3
+    from urllib3.exceptions import InsecureRequestWarning
+except Exception:  # pragma: no cover - urllib3 is a requests dependency
+    urllib3 = None
+    InsecureRequestWarning = None
 
 logger = logging.getLogger("inet.vpn.xui")
+
+
+def _env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _disable_insecure_https_warning() -> None:
+    if urllib3 is not None and InsecureRequestWarning is not None:
+        urllib3.disable_warnings(InsecureRequestWarning)
+
+
+_SSL_FALLBACK_WARNED: set[str] = set()
 
 
 class XUIError(RuntimeError):
@@ -48,9 +70,32 @@ class XUIClient:
 
     def _request(self, method: str, path: str, **kwargs: Any) -> requests.Response:
         kwargs.setdefault("timeout", max(1, int(self.cfg.timeout_sec or 8)))
-        kwargs.setdefault("verify", bool(self.cfg.verify_ssl))
-        resp = self.session.request(method.upper(), self._url(path), **kwargs)
-        return resp
+        verify_ssl = bool(kwargs.pop("verify", bool(self.cfg.verify_ssl)))
+        request_url = self._url(path)
+
+        if not verify_ssl:
+            _disable_insecure_https_warning()
+
+        try:
+            kwargs["verify"] = verify_ssl
+            return self.session.request(method.upper(), request_url, **kwargs)
+        except requests.exceptions.SSLError:
+            # Compatibility fallback for old 3X-UI panels that are exposed by IP
+            # or use a self-signed certificate. This restores the old behavior
+            # without breaking sync after XUI_VERIFY_SSL=true was accidentally set.
+            if verify_ssl and _env_bool("XUI_SSL_AUTO_FALLBACK", True):
+                warn_key = str(self.cfg.key or self.cfg.base_url or "default")
+                if warn_key not in _SSL_FALLBACK_WARNED:
+                    logger.warning(
+                        "[xui-sync] SSL verification failed for %s; retrying once with verify_ssl=false. "
+                        "For production, use a domain with a valid SSL certificate and keep XUI_VERIFY_SSL=true.",
+                        warn_key,
+                    )
+                    _SSL_FALLBACK_WARNED.add(warn_key)
+                _disable_insecure_https_warning()
+                kwargs["verify"] = False
+                return self.session.request(method.upper(), request_url, **kwargs)
+            raise
 
     def login(self) -> None:
         if self.cfg.token:
