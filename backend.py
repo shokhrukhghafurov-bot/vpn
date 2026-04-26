@@ -653,6 +653,7 @@ class LocationIn(BaseModel):
 
 
 class LocationPatchIn(BaseModel):
+    code: Optional[str] = None
     name_ru: Optional[str] = None
     name_en: Optional[str] = None
     country_code: Optional[str] = None
@@ -703,13 +704,15 @@ class AdminPlanSettingsIn(BaseModel):
 
 
 class AdminVpnSettingsIn(BaseModel):
-    app_name: str
-    client_mode: str = "hiddify"
-    app_env: str = "production"
-    languages: List[str] = Field(default_factory=lambda: ["ru", "en"])
-    bot_name: str
-    bot_username: str
-    support_telegram_url: str
+    # Take defaults from the currently loaded runtime settings. This keeps the
+    # admin save endpoint tolerant when a UI block is hidden or a field is absent.
+    app_name: str = Field(default_factory=lambda: str(getattr(settings, "APP_NAME", "INET") or "INET"))
+    client_mode: str = Field(default_factory=lambda: str(getattr(settings, "VPN_CLIENT_MODE", "hiddify") or "hiddify"))
+    app_env: str = Field(default_factory=lambda: str(getattr(settings, "APP_ENV", "production") or "production"))
+    languages: List[str] = Field(default_factory=lambda: list(getattr(settings, "APP_LANGS", ["ru", "en"]) or ["ru", "en"]))
+    bot_name: str = Field(default_factory=lambda: str(getattr(settings, "BOT_NAME", "INET Bot") or "INET Bot"))
+    bot_username: str = Field(default_factory=lambda: str(getattr(settings, "BOT_USERNAME", "inetvpnru_bot") or "inetvpnru_bot"))
+    support_telegram_url: str = Field(default_factory=lambda: str(getattr(settings, "SUPPORT_TELEGRAM_URL", "") or ""))
     payments_enabled: bool = False
     maintenance_mode: bool = False
     new_activations_enabled: bool = True
@@ -6500,12 +6503,13 @@ def admin_xui_inbounds(server_key: str = Query(default=""), admin_name: str = De
     selected_key = str(server_key or getattr(settings, "XUI_DEFAULT_SERVER_KEY", "default") or "default").strip() or "default"
     cfg = configs.get(selected_key)
     if not cfg:
-        raise HTTPException(status_code=400, detail=f"3X-UI server config not found: {selected_key}")
+        return {"ok": True, "server_key": selected_key, "items": [], "warning": f"3X-UI server config not found: {selected_key}"}
     try:
         api = XUIClient(cfg)
         rows = api.list_inbounds()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        logger.warning("[xui-admin] list inbounds failed server=%s err=%s", selected_key, exc)
+        return {"ok": True, "server_key": selected_key, "items": [], "warning": str(exc)}
     items = []
     for row in rows:
         settings_payload = row.get("settings")
@@ -6903,14 +6907,26 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     _ = admin_name
     data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
     try:
+        before_rows = [row for row in list_locations(active_only=False) if int(row.get("id") or 0) == int(location_id)]
+        before_code = str((before_rows[0] if before_rows else {}).get("code") or "").strip()
         item = patch_location(location_id, data)
         reset_assignments = 0
-        code = str(item.get("code") or "").strip()
-        if code and code not in PUBLIC_VIRTUAL_LOCATION_CODES and any(key in data for key in {"is_active", "status", "vpn_payload", "is_reserve"}):
-            reset_assignments = reset_virtual_location_assignments_for_concrete_code(code)
+        after_code = str(item.get("code") or "").strip()
+        codes_to_reset = []
+        for candidate in (before_code, after_code):
+            if candidate and candidate not in PUBLIC_VIRTUAL_LOCATION_CODES and candidate not in codes_to_reset:
+                codes_to_reset.append(candidate)
+        if any(key in data for key in {"code", "is_active", "status", "vpn_payload", "is_reserve"}):
+            for code in codes_to_reset:
+                reset_assignments += reset_virtual_location_assignments_for_concrete_code(code)
         return {"ok": True, "item": serialize_location(item, include_payload=True), "reset_virtual_assignments": reset_assignments}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except psycopg.Error as exc:
+        detail = str(exc).strip() or "Database error while saving location"
+        if "duplicate key" in detail.lower() or "unique constraint" in detail.lower():
+            detail = "Location code already exists"
+        raise HTTPException(status_code=500, detail=detail) from exc
 
 
 @app.delete("/api/infra/admin/vpn/locations/{location_id}")
@@ -6935,7 +6951,11 @@ def admin_settings(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/settings")
 def admin_settings_save(payload: AdminVpnSettingsIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
-    save_runtime_settings_payload(payload.model_dump(exclude_none=True))
+    try:
+        save_runtime_settings_payload(payload.model_dump(exclude_none=True))
+    except psycopg.Error as exc:
+        detail = str(exc).strip() or "Database error while saving VPN settings"
+        raise HTTPException(status_code=500, detail=detail) from exc
     return {
         "ok": True,
         "message": "Settings saved to database and applied immediately.",
