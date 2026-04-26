@@ -1357,13 +1357,46 @@ def _ru_split_domain_patterns(payload: Dict[str, Any]) -> List[str]:
 
 
 def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
+    # Respect explicit admin switch first. Before this fix route_mode=split forced
+    # direct_ru back on even when the admin set direct_ru=false.
+    if "direct_ru" in payload:
+        value = payload.get("direct_ru")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
     route_mode = str(payload.get("route_mode") or "").strip().lower()
     if route_mode == "split":
         return True
-    if payload.get("direct_ru") is True:
-        return True
     code = str(payload.get("location_code") or payload.get("locationCode") or "").strip().lower()
     return code.startswith("ru-lte")
+
+
+def _xray_force_proxy_domain_rules() -> List[str]:
+    # Must stay through proxy even in RU LTE/split mode. If geoip/geosite direct
+    # is enabled later, these rules protect Telegram/YouTube/Googlevideo from
+    # being routed outside the tunnel.
+    return [
+        "geosite:telegram",
+        "domain:telegram.org",
+        "domain:t.me",
+        "domain:tdesktop.com",
+        "domain:telegra.ph",
+        "geosite:youtube",
+        "domain:youtube.com",
+        "domain:youtu.be",
+        "domain:googlevideo.com",
+        "domain:ytimg.com",
+        "domain:ggpht.com",
+        "domain:googleusercontent.com",
+        "domain:youtubei.googleapis.com",
+        "geosite:instagram",
+        "domain:instagram.com",
+        "domain:cdninstagram.com",
+        "domain:fbcdn.net",
+    ]
 
 
 def _ru_lte_geoip_direct_enabled() -> bool:
@@ -1463,6 +1496,11 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     rules: List[Dict[str, Any]] = [
         {
             "type": "field",
+            "domain": _xray_force_proxy_domain_rules(),
+            "outboundTag": "proxy",
+        },
+        {
+            "type": "field",
             "ip": private_cidrs,
             "outboundTag": "direct",
         },
@@ -1472,7 +1510,7 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "outboundTag": "direct",
         },
     ]
-    insert_at = 1
+    insert_at = 2
     if _ru_lte_geoip_direct_enabled() and paths.get("geoip"):
         rules.insert(insert_at, {
             "type": "field",
@@ -1489,16 +1527,37 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     return rules
 
 
+
+
+def _singbox_force_proxy_domain_suffixes() -> List[str]:
+    return [
+        "telegram.org",
+        "t.me",
+        "tdesktop.com",
+        "telegra.ph",
+        "youtube.com",
+        "youtu.be",
+        "googlevideo.com",
+        "ytimg.com",
+        "ggpht.com",
+        "googleusercontent.com",
+        "youtubei.googleapis.com",
+        "instagram.com",
+        "cdninstagram.com",
+        "fbcdn.net",
+    ]
+
 def _singbox_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     if not _payload_direct_ru_enabled(payload):
         return []
     paths = _probe_runner_geodata_paths()
     suffixes = [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()]
     rules: List[Dict[str, Any]] = [
+        {"domain_suffix": _singbox_force_proxy_domain_suffixes(), "outbound": "proxy"},
         {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
         {"domain_suffix": suffixes, "outbound": "direct"},
     ]
-    insert_at = 1
+    insert_at = 2
     if _ru_lte_geoip_direct_enabled() and paths.get("geoip"):
         rules.insert(insert_at, {"geoip": ["ru"], "outbound": "direct"})
         insert_at += 1
@@ -4763,7 +4822,7 @@ def _subscription_client_hint(request: Request) -> str:
 
 def _subscription_minimal_url_for_client(client_hint: Optional[str]) -> bool:
     client = str(client_hint or "").strip().lower()
-    return client == "happ" and bool(getattr(settings, "HAPP_SUBSCRIPTION_MINIMAL", True))
+    return client == "happ" and bool(getattr(settings, "HAPP_SUBSCRIPTION_MINIMAL", False))
 
 
 def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS", client_hint: Optional[str] = None) -> str:
