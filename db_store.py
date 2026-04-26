@@ -1252,9 +1252,17 @@ def _xray_force_proxy_domain_rules() -> List[str]:
 
 
 def _xray_force_proxy_ip_rules() -> List[str]:
-    return [
-        "geoip:telegram",
-    ]
+    # Avoid geoip:telegram here: not every client bundle ships that geosite/geoip entry.
+    # Domain/SNI/sniffing rules above are safer and match the known-good config style.
+    return []
+
+
+def _ru_lte_geoip_direct_enabled() -> bool:
+    return bool(getattr(settings, "RU_LTE_GEOIP_DIRECT_ENABLED", False))
+
+
+def _ru_lte_geosite_direct_enabled() -> bool:
+    return bool(getattr(settings, "RU_LTE_GEOSITE_DIRECT_ENABLED", False))
 
 
 def _extract_proxy_outbound_from_raw(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1443,13 +1451,23 @@ def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[s
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
     ]
     if _payload_direct_ru_enabled(payload):
-        # Order is critical: blocked external apps must be forced to `proxy`
-        # before broad `geoip:ru`/`.ru` direct rules are evaluated.
+        # Order is critical. The known-good RU LTE config does NOT use broad geoip:ru direct.
+        # Broad geoip direct can catch Telegram/YouTube/Googlevideo cache IPs and bypass VPN.
         routing_rules.insert(1, {"type": "field", "domain": _xray_force_proxy_domain_rules(), "outboundTag": "proxy"})
-        routing_rules.insert(2, {"type": "field", "ip": _xray_force_proxy_ip_rules(), "outboundTag": "proxy"})
-        routing_rules.insert(3, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
-        domain_rules = ["geosite:ru"] + _xray_direct_domain_rules(payload)
-        routing_rules.insert(4, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
+        force_proxy_ips = _xray_force_proxy_ip_rules()
+        insert_at = 2
+        if force_proxy_ips:
+            routing_rules.insert(insert_at, {"type": "field", "ip": force_proxy_ips, "outboundTag": "proxy"})
+            insert_at += 1
+        if _ru_lte_geoip_direct_enabled():
+            routing_rules.insert(insert_at, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
+            insert_at += 1
+        domain_rules = []
+        if _ru_lte_geosite_direct_enabled():
+            domain_rules.append("geosite:ru")
+        domain_rules.extend(_xray_direct_domain_rules(payload))
+        if domain_rules:
+            routing_rules.insert(insert_at, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
 
     config: Dict[str, Any] = {
         "dns": {"queryStrategy": "UseIP", "servers": dns_servers},
