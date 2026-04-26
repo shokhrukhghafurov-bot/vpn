@@ -1672,6 +1672,57 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["raw_xray_config"] = normalized.get("rawXrayConfig")
     if "raw_xray_config" in normalized and "rawXrayConfig" not in normalized:
         normalized["rawXrayConfig"] = normalized.get("raw_xray_config")
+
+    # Admin UI can send camelCase aliases and can also have XUI fields filled
+    # while managed_by dropdown is still manual/shared. Do not drop those fields:
+    # any non-empty xui_inbound_id or non-default xui_server_key means this is a
+    # 3X-UI-managed template and must be saved as such.
+    if "managedBy" in normalized and "managed_by" not in normalized:
+        normalized["managed_by"] = normalized.get("managedBy")
+    if "managed_by" in normalized and "managedBy" not in normalized:
+        normalized["managedBy"] = normalized.get("managed_by")
+    if "xuiServerKey" in normalized and "xui_server_key" not in normalized:
+        normalized["xui_server_key"] = normalized.get("xuiServerKey")
+    if "xui_server_key" in normalized and "xuiServerKey" not in normalized:
+        normalized["xuiServerKey"] = normalized.get("xui_server_key")
+    if "xuiInboundId" in normalized and "xui_inbound_id" not in normalized:
+        normalized["xui_inbound_id"] = normalized.get("xuiInboundId")
+    if "xui_inbound_id" in normalized and "xuiInboundId" not in normalized:
+        normalized["xuiInboundId"] = normalized.get("xui_inbound_id")
+    if "credentialMode" in normalized and "credential_mode" not in normalized:
+        normalized["credential_mode"] = normalized.get("credentialMode")
+    if "credential_mode" in normalized and "credentialMode" not in normalized:
+        normalized["credentialMode"] = normalized.get("credential_mode")
+    if "accessMode" in normalized and "access_mode" not in normalized:
+        normalized["access_mode"] = normalized.get("accessMode")
+    if "access_mode" in normalized and "accessMode" not in normalized:
+        normalized["accessMode"] = normalized.get("access_mode")
+    if "uuidMode" in normalized and "uuid_mode" not in normalized:
+        normalized["uuid_mode"] = normalized.get("uuidMode")
+    if "uuid_mode" in normalized and "uuidMode" not in normalized:
+        normalized["uuidMode"] = normalized.get("uuid_mode")
+
+    xui_server_key = str(normalized.get("xui_server_key") or normalized.get("xuiServerKey") or "").strip()
+    xui_inbound_id = normalized.get("xui_inbound_id") if normalized.get("xui_inbound_id") is not None else normalized.get("xuiInboundId")
+    has_xui_identity = bool(str(xui_inbound_id or "").strip()) or bool(xui_server_key and xui_server_key != "default")
+    managed_by = str(normalized.get("managed_by") or normalized.get("managedBy") or "").strip().lower()
+    if has_xui_identity or managed_by in {"3x-ui", "3xui", "xui", "x-ui", "three-x-ui"}:
+        normalized["managed_by"] = "3x-ui"
+        normalized["managedBy"] = "3x-ui"
+        normalized["xui_server_key"] = xui_server_key or "default"
+        normalized["xuiServerKey"] = normalized["xui_server_key"]
+        if str(xui_inbound_id or "").strip():
+            try:
+                inbound_int = int(float(str(xui_inbound_id).strip()))
+            except (TypeError, ValueError):
+                inbound_int = xui_inbound_id
+            normalized["xui_inbound_id"] = inbound_int
+            normalized["xuiInboundId"] = inbound_int
+        if str(normalized.get("credential_mode") or normalized.get("credentialMode") or "").strip().lower() in {"", "per_user", "owned_per_user", "device", "device_uuid", "per_device"}:
+            normalized["credential_mode"] = "per_device"
+            normalized["credentialMode"] = "per_device"
+            normalized["uuid_mode"] = "per_device"
+            normalized["uuidMode"] = "per_device"
     normalized = _apply_anti_block_profile(_apply_admin_mobile_defaults(normalized))
     normalized = _invalidate_stale_live_probe(normalized)
     return _canonicalize_payload_metadata(normalized)
