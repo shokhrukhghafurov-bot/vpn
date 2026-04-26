@@ -1343,6 +1343,41 @@ def _ru_split_domain_patterns(payload: Dict[str, Any]) -> List[str]:
     return patterns or [r"regexp:.*\.ru$", r"regexp:.*\.su$", r"regexp:.*\.xn--p1ai$"]
 
 
+def _force_proxy_domain_patterns() -> List[str]:
+    return [
+        "youtube.com",
+        "youtu.be",
+        "googlevideo.com",
+        "ytimg.com",
+        "ggpht.com",
+        "googleapis.com",
+        "google.com",
+        "gstatic.com",
+        "telegram.org",
+        "t.me",
+        "telegram.me",
+        "tdesktop.com",
+        "instagram.com",
+        "cdninstagram.com",
+        "facebook.com",
+        "fbcdn.net",
+        "whatsapp.net",
+    ]
+
+
+def _force_proxy_ip_cidrs() -> List[str]:
+    return [
+        "91.108.4.0/22",
+        "91.108.8.0/22",
+        "91.108.12.0/22",
+        "91.108.16.0/22",
+        "91.108.20.0/22",
+        "91.108.56.0/22",
+        "95.161.64.0/20",
+        "149.154.160.0/20",
+    ]
+
+
 def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
     route_mode = str(payload.get("route_mode") or "").strip().lower()
     if route_mode == "split":
@@ -1440,6 +1475,22 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = _probe_runner_geodata_paths()
     private_cidrs = _probe_private_ip_cidrs()
     rules: List[Dict[str, Any]] = [
+        {"type": "field", "domain": [f"domain:{item}" for item in _force_proxy_domain_patterns()], "outboundTag": "proxy"},
+        {"type": "field", "ip": _force_proxy_ip_cidrs(), "outboundTag": "proxy"},
+    ]
+    if paths.get("geoip"):
+        rules.append({
+            "type": "field",
+            "ip": ["geoip:ru"],
+            "outboundTag": "direct",
+        })
+    if paths.get("geosite"):
+        rules.append({
+            "type": "field",
+            "domain": ["geosite:ru"],
+            "outboundTag": "direct",
+        })
+    rules.extend([
         {
             "type": "field",
             "ip": private_cidrs,
@@ -1450,19 +1501,7 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "domain": _ru_split_domain_patterns(payload),
             "outboundTag": "direct",
         },
-    ]
-    if paths.get("geoip"):
-        rules.insert(1, {
-            "type": "field",
-            "ip": ["geoip:ru"],
-            "outboundTag": "direct",
-        })
-    if paths.get("geosite"):
-        rules.insert(2 if paths.get("geoip") else 1, {
-            "type": "field",
-            "domain": ["geosite:ru"],
-            "outboundTag": "direct",
-        })
+    ])
     return rules
 
 
@@ -1472,13 +1511,17 @@ def _singbox_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = _probe_runner_geodata_paths()
     suffixes = [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()]
     rules: List[Dict[str, Any]] = [
-        {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
-        {"domain_suffix": suffixes, "outbound": "direct"},
+        {"domain_suffix": _force_proxy_domain_patterns(), "outbound": "proxy"},
+        {"ip_cidr": _force_proxy_ip_cidrs(), "outbound": "proxy"},
     ]
     if paths.get("geoip"):
-        rules.insert(1, {"geoip": ["ru"], "outbound": "direct"})
+        rules.append({"geoip": ["ru"], "outbound": "direct"})
     if paths.get("geosite"):
-        rules.insert(2 if paths.get("geoip") else 1, {"geosite": ["ru"], "outbound": "direct"})
+        rules.append({"geosite": ["ru"], "outbound": "direct"})
+    rules.extend([
+        {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
+        {"domain_suffix": suffixes, "outbound": "direct"},
+    ])
     return rules
 
 
@@ -3434,7 +3477,8 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("full_tunnel is disabled")
         fixes.append("Set full_tunnel=true for full-device routing.")
     elif full_tunnel is False and ru_split_profile:
-        fixes.append("RU LTE split profile detected: full_tunnel=false is acceptable because RU/private traffic should go direct and blocked external traffic should go via VPN.")
+        issues.append("RU split profile has full_tunnel=false")
+        fixes.append("Set full_tunnel=true. Split is handled by direct_ru rules; non-RU traffic must still enter TUN/proxy.")
 
     if not dns_servers or any(_diagnostic_placeholder(item) for item in dns_servers):
         issues.append("dns_servers is empty or still contains placeholders")
