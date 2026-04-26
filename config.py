@@ -349,6 +349,10 @@ class Settings:
     RU_LTE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_CONNECT_TIMEOUT_SEC", 4)
     RU_LTE_DEAD_COOLDOWN_MINUTES: int = _env_int("RU_LTE_DEAD_COOLDOWN_MINUTES", 45)
     RU_LTE_ALLOWED_TRANSPORTS: List[str] = None
+    # Keep RU LTE split routing close to the known-good external config: direct by explicit domains only, not broad geoip:ru.
+    # geoip:ru direct can send Telegram/YouTube CDN IPs outside the tunnel and causes unstable video/messenger behavior.
+    RU_LTE_GEOIP_DIRECT_ENABLED: bool = _env_bool("RU_LTE_GEOIP_DIRECT_ENABLED", False)
+    RU_LTE_GEOSITE_DIRECT_ENABLED: bool = _env_bool("RU_LTE_GEOSITE_DIRECT_ENABLED", False)
     RU_LTE_REAL_PROBE_ENABLED: bool = _env_bool("RU_LTE_REAL_PROBE_ENABLED", True)
     RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", True)
     RU_LTE_REAL_PROBE_MIN_SUCCESS: int = _env_int("RU_LTE_REAL_PROBE_MIN_SUCCESS", 2)
