@@ -649,6 +649,11 @@ class LocationIn(BaseModel):
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
     access_mode: Optional[str] = None
+    managed_by: Optional[str] = None
+    xui_server_key: Optional[str] = None
+    xui_inbound_id: Optional[int] = None
+    credential_mode: Optional[str] = None
+    save_exact_vpn_payload: bool = False
     vpn_payload: Dict[str, Any] = Field(default_factory=dict)
 
 
@@ -670,6 +675,11 @@ class LocationPatchIn(BaseModel):
     ping_ms: Optional[int] = None
     speed_checked_at: Optional[str] = None
     access_mode: Optional[str] = None
+    managed_by: Optional[str] = None
+    xui_server_key: Optional[str] = None
+    xui_inbound_id: Optional[int] = None
+    credential_mode: Optional[str] = None
+    save_exact_vpn_payload: Optional[bool] = None
     vpn_payload: Optional[Dict[str, Any]] = None
 
 
@@ -3714,8 +3724,35 @@ def _normalize_admin_location_input(data: Dict[str, Any]) -> Dict[str, Any]:
     for alias_key, canonical_key in alias_pairs:
         if canonical_key not in normalized and alias_key in normalized:
             normalized[canonical_key] = normalized.get(alias_key)
-    return normalized
 
+    # Admin panel v4 sends XUI controls both at top-level and inside vpn_payload.
+    # Keep the DB payload as the source of truth, but fold top-level controls into
+    # it before db_store.patch_location() sees the update. This prevents the UI
+    # from visually changing to 3x-ui/ru1/inbound and then saving old manual/default
+    # values because an older backend ignored those top-level fields.
+    payload = normalized.get("vpn_payload")
+    if isinstance(payload, dict):
+        payload = dict(payload)
+    else:
+        payload = {}
+    if normalized.get("managed_by") is not None:
+        payload["managed_by"] = normalized.get("managed_by")
+        payload["managedBy"] = normalized.get("managed_by")
+    if normalized.get("xui_server_key") is not None:
+        payload["xui_server_key"] = normalized.get("xui_server_key")
+        payload["xuiServerKey"] = normalized.get("xui_server_key")
+    if normalized.get("xui_inbound_id") is not None:
+        payload["xui_inbound_id"] = normalized.get("xui_inbound_id")
+        payload["xuiInboundId"] = normalized.get("xui_inbound_id")
+    if normalized.get("credential_mode") is not None:
+        payload["credential_mode"] = normalized.get("credential_mode")
+        payload["credentialMode"] = normalized.get("credential_mode")
+    if normalized.get("access_mode") is not None:
+        payload["access_mode"] = normalized.get("access_mode")
+        payload["accessMode"] = normalized.get("access_mode")
+    if payload:
+        normalized["vpn_payload"] = payload
+    return normalized
 
 def _bot_public_url() -> str:
     bot_username = (settings.BOT_USERNAME or "").strip().lstrip("@")
