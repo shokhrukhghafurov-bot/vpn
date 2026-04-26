@@ -1164,7 +1164,9 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["route_mode"] = str(normalized.get("route_mode") or "split").strip() or "split"
         normalized["direct_ru"] = _coerce_runtime_bool(normalized.get("direct_ru", True), True)
         normalized["direct_domains"] = [str(item or "").strip() for item in (normalized.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item or "").strip()] or [".ru", ".su", ".xn--p1ai"]
-        normalized["full_tunnel"] = False
+        # Split means full-device TUN + direct rules for RU/private traffic.
+        # full_tunnel=false caused Telegram/YouTube to bypass proxy partially.
+        normalized["full_tunnel"] = True
     else:
         normalized["anti_block_profile"] = "global"
     normalized["location_code"] = normalized.get("location_code") or code
@@ -1172,6 +1174,7 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized["domainResolver"] = normalized["domain_resolver"]
     normalized["packetEncoding"] = normalized["packet_encoding"]
     normalized["connectMode"] = normalized["connect_mode"]
+    normalized["fullTunnel"] = normalized["full_tunnel"]
     return normalized
 
 
@@ -1208,6 +1211,43 @@ def _default_xray_private_ip_rules() -> List[str]:
     return ["geoip:private", "geoip:loopback"]
 
 
+def _xray_force_proxy_domain_rules() -> List[str]:
+    # Keep these services inside proxy before RU direct rules.
+    return [
+        "domain:youtube.com",
+        "domain:youtu.be",
+        "domain:googlevideo.com",
+        "domain:ytimg.com",
+        "domain:ggpht.com",
+        "domain:googleapis.com",
+        "domain:google.com",
+        "domain:gstatic.com",
+        "domain:telegram.org",
+        "domain:t.me",
+        "domain:telegram.me",
+        "domain:tdesktop.com",
+        "domain:instagram.com",
+        "domain:cdninstagram.com",
+        "domain:facebook.com",
+        "domain:fbcdn.net",
+        "domain:whatsapp.net",
+    ]
+
+
+def _xray_force_proxy_ip_rules() -> List[str]:
+    # Telegram often opens raw IP connections; route its common DC ranges via proxy.
+    return [
+        "91.108.4.0/22",
+        "91.108.8.0/22",
+        "91.108.12.0/22",
+        "91.108.16.0/22",
+        "91.108.20.0/22",
+        "91.108.56.0/22",
+        "95.161.64.0/20",
+        "149.154.160.0/20",
+    ]
+
+
 def _xray_direct_domain_rules(payload: Dict[str, Any]) -> List[str]:
     rules: List[str] = []
     for suffix in _default_direct_domains(payload):
@@ -1219,69 +1259,6 @@ def _xray_direct_domain_rules(payload: Dict[str, Any]) -> List[str]:
         if cleaned:
             rules.append(f"domain:{cleaned}")
     return rules
-
-
-def _default_priority_proxy_domains() -> List[str]:
-    # These services must stay behind the tunnel even in RU split mode.
-    # Otherwise CDN/DNS may resolve video/messenger traffic to RU-looking IPs,
-    # and the later geoip:ru direct rule can bypass the proxy.
-    return [
-        "domain:youtube.com",
-        "domain:youtu.be",
-        "domain:googlevideo.com",
-        "domain:ytimg.com",
-        "domain:ggpht.com",
-        "domain:googleapis.com",
-        "domain:gvt1.com",
-        "domain:telegram.org",
-        "domain:t.me",
-        "domain:telegram.me",
-        "domain:tdesktop.com",
-        "domain:telegra.ph",
-        "domain:web.telegram.org",
-        "domain:cdn-telegram.org",
-        "domain:instagram.com",
-        "domain:cdninstagram.com",
-        "domain:facebook.com",
-        "domain:fbcdn.net",
-        "domain:whatsapp.com",
-    ]
-
-
-def _xray_priority_proxy_domain_rules(payload: Dict[str, Any]) -> List[str]:
-    raw_values = (
-        payload.get("force_proxy_domains")
-        or payload.get("proxy_domains")
-        or payload.get("tunnel_domains")
-        or _default_priority_proxy_domains()
-    )
-    if isinstance(raw_values, str):
-        raw_values = [part.strip() for part in raw_values.split(",")]
-    result: List[str] = []
-    seen: set[str] = set()
-    iterable = raw_values if isinstance(raw_values, list) else []
-    for value in iterable:
-        cleaned = str(value or "").strip().lower()
-        if not cleaned:
-            continue
-        if cleaned.startswith("*."):
-            cleaned = cleaned[2:]
-        elif cleaned.startswith("."):
-            cleaned = cleaned[1:]
-        if not cleaned:
-            continue
-        if not (
-            cleaned.startswith("geosite:")
-            or cleaned.startswith("domain:")
-            or cleaned.startswith("full:")
-            or cleaned.startswith("regexp:")
-            or cleaned.startswith("keyword:")
-        ):
-            cleaned = f"domain:{cleaned}"
-        if cleaned not in seen:
-            seen.add(cleaned)
-            result.append(cleaned)
-    return result
 
 
 def _extract_proxy_outbound_from_raw(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -1463,25 +1440,20 @@ def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[s
     else:
         first_direct_rule = {"type": "field", "domain": [f"domain:{server}"], "outboundTag": "direct"}
 
-    routing_rules: List[Dict[str, Any]] = [
-        first_direct_rule,
+    routing_rules: List[Dict[str, Any]] = [first_direct_rule]
+    if _payload_direct_ru_enabled(payload):
+        # Must be before geoip:ru/geosite:ru direct. Otherwise media CDN or
+        # Telegram IP traffic can go direct and break only part of the app.
+        routing_rules.append({"type": "field", "domain": _xray_force_proxy_domain_rules(), "outboundTag": "proxy"})
+        routing_rules.append({"type": "field", "ip": _xray_force_proxy_ip_rules(), "outboundTag": "proxy"})
+        routing_rules.append({"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
+        domain_rules = ["geosite:ru"] + _xray_direct_domain_rules(payload)
+        routing_rules.append({"type": "field", "domain": domain_rules, "outboundTag": "direct"})
+    routing_rules.extend([
         {"type": "field", "ip": _default_xray_private_ip_rules(), "outboundTag": "direct"},
         {"type": "field", "domain": ["domain:localhost"], "outboundTag": "direct"},
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
-    ]
-    if _payload_direct_ru_enabled(payload):
-        # Order matters: force YouTube/Telegram/Instagram through proxy before
-        # geoip:ru direct, otherwise local CDN/IP matches may break video chunks
-        # or messenger traffic in RU split mode.
-        priority_proxy_domains = _xray_priority_proxy_domain_rules(payload)
-        if priority_proxy_domains:
-            routing_rules.insert(1, {"type": "field", "domain": priority_proxy_domains, "outboundTag": "proxy"})
-            direct_insert_at = 2
-        else:
-            direct_insert_at = 1
-        routing_rules.insert(direct_insert_at, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
-        domain_rules = ["geosite:ru"] + _xray_direct_domain_rules(payload)
-        routing_rules.insert(direct_insert_at + 1, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
+    ])
 
     config: Dict[str, Any] = {
         "dns": {"queryStrategy": "UseIP", "servers": dns_servers},
@@ -1676,6 +1648,10 @@ def _normalize_vpn_payload_keys(payload: Dict[str, Any]) -> Dict[str, Any]:
         normalized["allow_insecure"] = normalized.get("allowInsecure")
     if "allow_insecure" in normalized and "allowInsecure" not in normalized:
         normalized["allowInsecure"] = normalized.get("allow_insecure")
+    if "fullTunnel" in normalized and "full_tunnel" not in normalized:
+        normalized["full_tunnel"] = normalized.get("fullTunnel")
+    if "full_tunnel" in normalized and "fullTunnel" not in normalized:
+        normalized["fullTunnel"] = normalized.get("full_tunnel")
     _sync_alias("domain_resolver", "domainResolver")
     _sync_alias("packet_encoding", "packetEncoding")
     if "rawSingBoxConfig" in normalized and "raw_sing_box_config" not in normalized:
@@ -2026,11 +2002,8 @@ def build_user_vpn_payload_for_location(user_id: int, row: Dict[str, Any], *, re
         payload["credential_device_id"] = int(device_id or 0)
     if template_uuid and template_uuid != payload["uuid"]:
         payload["template_uuid"] = template_uuid
-    # Keep rawXrayConfig/raw_xray_config in sync with the personal UUID.
-    # Without this, one part of the profile can contain the new UUID while the
-    # embedded raw JSON still contains the template UUID.
-    payload = _canonicalize_payload_metadata(payload)
-    return payload
+    # Rebuild rawXrayConfig/raw_xray_config with the injected per-device UUID.
+    return _canonicalize_payload_metadata(payload)
 
 
 def _location_speed_rank(row: Dict[str, Any]) -> tuple:
