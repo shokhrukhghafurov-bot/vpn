@@ -7020,19 +7020,60 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
     _ = admin_name
     data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
     try:
-        before_rows = [row for row in list_locations(active_only=False) if int(row.get("id") or 0) == int(location_id)]
-        before_code = str((before_rows[0] if before_rows else {}).get("code") or "").strip()
-        item = patch_location(location_id, data)
+        # v11 safety net: the admin modal can be opened from a stale/duplicate row
+        # and then saved with an existing location_code (for example PATCH /locations/76
+        # with code=ru-lte-01 while the real ru-lte-01 row already exists).
+        # In that case, update the existing code row instead of throwing
+        # "Location code already exists". This keeps Save idempotent for admins.
+        all_rows = list_locations(active_only=False)
+        rows_by_id = {int(row.get("id") or 0): row for row in all_rows if int(row.get("id") or 0)}
+        before_code = str((rows_by_id.get(int(location_id)) or {}).get("code") or "").strip()
+        requested_code = str(data.get("code") or "").strip()
+        target_location_id = int(location_id)
+        patched_existing_code_row = False
+        if requested_code:
+            for row in all_rows:
+                row_id = int(row.get("id") or 0)
+                row_code = str(row.get("code") or "").strip()
+                if row_id and row_id != int(location_id) and row_code == requested_code:
+                    target_location_id = row_id
+                    patched_existing_code_row = True
+                    break
+
+        try:
+            item = patch_location(target_location_id, data)
+        except ValueError as exc:
+            # Extra fallback for databases that raise duplicate-code during UPDATE
+            # before the pre-check above can catch it. Resolve by code and update that row.
+            if "Location code already exists" in str(exc) and requested_code:
+                refreshed_rows = list_locations(active_only=False)
+                duplicate_row = next((row for row in refreshed_rows if str(row.get("code") or "").strip() == requested_code), None)
+                if duplicate_row and int(duplicate_row.get("id") or 0) != int(target_location_id):
+                    target_location_id = int(duplicate_row.get("id") or 0)
+                    patched_existing_code_row = True
+                    item = patch_location(target_location_id, data)
+                else:
+                    raise
+            else:
+                raise
+
         reset_assignments = 0
         after_code = str(item.get("code") or "").strip()
         codes_to_reset = []
-        for candidate in (before_code, after_code):
+        for candidate in (before_code, requested_code, after_code):
             if candidate and candidate not in PUBLIC_VIRTUAL_LOCATION_CODES and candidate not in codes_to_reset:
                 codes_to_reset.append(candidate)
         if any(key in data for key in {"code", "is_active", "status", "vpn_payload", "is_reserve"}):
             for code in codes_to_reset:
                 reset_assignments += reset_virtual_location_assignments_for_concrete_code(code)
-        return {"ok": True, "item": serialize_location(item, include_payload=True), "reset_virtual_assignments": reset_assignments}
+        return {
+            "ok": True,
+            "item": serialize_location(item, include_payload=True),
+            "reset_virtual_assignments": reset_assignments,
+            "patched_existing_code_row": patched_existing_code_row,
+            "requested_location_id": int(location_id),
+            "saved_location_id": int(target_location_id),
+        }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except psycopg.Error as exc:
@@ -7040,8 +7081,6 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
         if "duplicate key" in detail.lower() or "unique constraint" in detail.lower():
             detail = "Location code already exists"
         raise HTTPException(status_code=500, detail=detail) from exc
-
-
 @app.delete("/api/infra/admin/vpn/locations/{location_id}")
 def admin_locations_delete(location_id: int, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
