@@ -1221,6 +1221,42 @@ def _xray_direct_domain_rules(payload: Dict[str, Any]) -> List[str]:
     return rules
 
 
+def _xray_force_proxy_domain_rules() -> List[str]:
+    """Domains that must stay behind VPN even in RU split/LTE mode.
+
+    With `geoip:ru -> direct`, some clients can resolve Telegram/YouTube/CDN
+    endpoints to Russian or nearby cache IPs. If the direct RU rule is matched
+    first, Telegram can stop opening or YouTube can show "video unavailable /
+    skipped" while the VLESS tunnel itself is healthy. Put these proxy rules
+    before RU-direct rules.
+    """
+    return [
+        "geosite:telegram",
+        "domain:telegram.org",
+        "domain:t.me",
+        "domain:tdesktop.com",
+        "domain:telegra.ph",
+        "geosite:youtube",
+        "domain:youtube.com",
+        "domain:youtu.be",
+        "domain:googlevideo.com",
+        "domain:ytimg.com",
+        "domain:ggpht.com",
+        "domain:googleusercontent.com",
+        "domain:youtubei.googleapis.com",
+        "geosite:instagram",
+        "domain:instagram.com",
+        "domain:cdninstagram.com",
+        "domain:fbcdn.net",
+    ]
+
+
+def _xray_force_proxy_ip_rules() -> List[str]:
+    return [
+        "geoip:telegram",
+    ]
+
+
 def _extract_proxy_outbound_from_raw(payload: Dict[str, Any]) -> Dict[str, Any]:
     raw = payload.get("raw_xray_config") or payload.get("rawXrayConfig")
     parsed = _parse_json_object_if_possible(raw)
@@ -1407,9 +1443,13 @@ def _build_canonical_raw_xray_config(payload: Dict[str, Any]) -> Optional[Dict[s
         {"type": "field", "protocol": ["bittorrent"], "outboundTag": "block"},
     ]
     if _payload_direct_ru_enabled(payload):
-        routing_rules.insert(1, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
+        # Order is critical: blocked external apps must be forced to `proxy`
+        # before broad `geoip:ru`/`.ru` direct rules are evaluated.
+        routing_rules.insert(1, {"type": "field", "domain": _xray_force_proxy_domain_rules(), "outboundTag": "proxy"})
+        routing_rules.insert(2, {"type": "field", "ip": _xray_force_proxy_ip_rules(), "outboundTag": "proxy"})
+        routing_rules.insert(3, {"type": "field", "ip": ["geoip:ru"], "outboundTag": "direct"})
         domain_rules = ["geosite:ru"] + _xray_direct_domain_rules(payload)
-        routing_rules.insert(2, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
+        routing_rules.insert(4, {"type": "field", "domain": domain_rules, "outboundTag": "direct"})
 
     config: Dict[str, Any] = {
         "dns": {"queryStrategy": "UseIP", "servers": dns_servers},
@@ -1954,6 +1994,12 @@ def build_user_vpn_payload_for_location(user_id: int, row: Dict[str, Any], *, re
         payload["credential_device_id"] = int(device_id or 0)
     if template_uuid and template_uuid != payload["uuid"]:
         payload["template_uuid"] = template_uuid
+
+    # Rebuild rawXrayConfig after replacing the template UUID with the runtime
+    # per-device/per-user UUID. Some clients and diagnostics prefer the raw JSON
+    # over the top-level VLESS fields; keeping both in sync prevents "half-old,
+    # half-new" profiles after personal UUID migration.
+    payload = _canonicalize_payload_metadata(payload)
     return payload
 
 
