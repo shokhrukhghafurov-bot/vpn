@@ -1622,19 +1622,28 @@ def _prepare_exact_admin_vpn_payload(
 
     xui_server_key = str(full_payload.get("xui_server_key") or full_payload.get("xuiServerKey") or "").strip()
     xui_inbound_id = full_payload.get("xui_inbound_id") if full_payload.get("xui_inbound_id") is not None else full_payload.get("xuiInboundId")
-    managed_raw = str(full_payload.get("managed_by") or full_payload.get("managedBy") or "").strip().lower()
-    if str(xui_inbound_id or "").strip() or (xui_server_key and xui_server_key != "default") or managed_raw in {"3x-ui", "3xui", "xui"}:
-        full_payload["managed_by"] = "3x-ui"
-        full_payload["managedBy"] = "3x-ui"
-        full_payload["xui_server_key"] = xui_server_key or "default"
-        full_payload["xuiServerKey"] = full_payload["xui_server_key"]
-        if str(xui_inbound_id or "").strip():
-            try:
-                inbound_int = int(float(str(xui_inbound_id).strip()))
-            except (TypeError, ValueError):
-                inbound_int = xui_inbound_id
-            full_payload["xui_inbound_id"] = inbound_int
-            full_payload["xuiInboundId"] = inbound_int
+    managed_raw_original = str(full_payload.get("managed_by") or full_payload.get("managedBy") or "").strip()
+    managed_raw = managed_raw_original.lower()
+    # Exact admin save: the dropdown value is source of truth. Do not force
+    # managed_by=3x-ui only because xui_server_key/inbound exists. This fixes
+    # the modal reopening with the old/forced value after Save location.
+    if managed_raw_original:
+        if managed_raw in {"3x-ui", "3xui", "xui", "x-ui", "three-x-ui"}:
+            full_payload["managed_by"] = "3x-ui"
+            full_payload["managedBy"] = "3x-ui"
+        else:
+            full_payload["managed_by"] = managed_raw_original
+            full_payload["managedBy"] = managed_raw_original
+    if xui_server_key:
+        full_payload["xui_server_key"] = xui_server_key
+        full_payload["xuiServerKey"] = xui_server_key
+    if str(xui_inbound_id or "").strip():
+        try:
+            inbound_int = int(float(str(xui_inbound_id).strip()))
+        except (TypeError, ValueError):
+            inbound_int = xui_inbound_id
+        full_payload["xui_inbound_id"] = inbound_int
+        full_payload["xuiInboundId"] = inbound_int
 
     code = str(canonical_code or full_payload.get("location_code") or full_payload.get("locationCode") or full_payload.get("resolved_location_code") or "").strip()
     country = str(canonical_country or full_payload.get("country_code") or full_payload.get("resolved_country_code") or "").strip().upper()
