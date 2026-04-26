@@ -165,7 +165,7 @@ class Settings:
     # Happ can always show the final local Xray JSON inside the app.
     # This flag only keeps our subscription feed cleaner for Happ: no inline
     # subscription comments and no non-standard internal route hints in the URL.
-    HAPP_SUBSCRIPTION_MINIMAL: bool = _env_bool("HAPP_SUBSCRIPTION_MINIMAL", True)
+    HAPP_SUBSCRIPTION_MINIMAL: bool = _env_bool("HAPP_SUBSCRIPTION_MINIMAL", False)
     V2RAYTUN_ANDROID_APP_URL: str = os.getenv("V2RAYTUN_ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.v2raytun.android")
     V2RAYTUN_ANDROID_APP_PACKAGE: str = os.getenv("V2RAYTUN_ANDROID_APP_PACKAGE", "com.v2raytun.android")
     V2RAYTUN_IOS_APP_URL: str = os.getenv("V2RAYTUN_IOS_APP_URL", "https://v2raytun.com/")
@@ -437,7 +437,7 @@ class Settings:
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
-                "https://www.vk.com/,https://ya.ru/",
+                "https://www.youtube.com/generate_204,https://web.telegram.org/",
             )
         if self.VPN_REAL_PROBE_URLS is None:
             self.VPN_REAL_PROBE_URLS = _env_list(
@@ -447,7 +447,7 @@ class Settings:
         if self.VPN_REAL_PROBE_RU_EXTRA_URLS is None:
             self.VPN_REAL_PROBE_RU_EXTRA_URLS = _env_list(
                 "VPN_REAL_PROBE_RU_EXTRA_URLS",
-                "https://www.vk.com/,https://ya.ru/",
+                "https://www.youtube.com/generate_204,https://web.telegram.org/",
             )
         if self.BLACK_ALLOWED_TRANSPORTS is None:
             self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
