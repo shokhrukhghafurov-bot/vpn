@@ -4281,6 +4281,27 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
     data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
     data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
+
+    # Fold visible 3X-UI modal controls into vpn_payload for both create and edit.
+    # This is important for exact admin saves: the DB payload must store the same
+    # Managed by / XUI server key / inbound / credential mode that the admin sees.
+    if isinstance(data.get("vpn_payload"), dict):
+        folded_payload = dict(data.get("vpn_payload") or {})
+    else:
+        folded_payload = {}
+    for source_key, snake_key, camel_key in (
+        ("managed_by", "managed_by", "managedBy"),
+        ("xui_server_key", "xui_server_key", "xuiServerKey"),
+        ("xui_inbound_id", "xui_inbound_id", "xuiInboundId"),
+        ("credential_mode", "credential_mode", "credentialMode"),
+        ("access_mode", "access_mode", "accessMode"),
+    ):
+        if source_key in data and data.get(source_key) is not None:
+            folded_payload[snake_key] = data.get(source_key)
+            folded_payload[camel_key] = data.get(source_key)
+    if folded_payload:
+        data["vpn_payload"] = folded_payload
+
     if save_exact_vpn_payload:
         data["vpn_payload"] = _prepare_exact_admin_vpn_payload(
             data.get("vpn_payload") or {},
