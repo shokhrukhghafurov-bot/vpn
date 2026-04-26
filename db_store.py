@@ -4343,25 +4343,30 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                 elif key == "speed_checked_at":
                     value = _normalize_optional_timestamp(value)
                 elif key == "vpn_payload":
-                    merged_payload = dict(existing_row.get("vpn_payload") or {})
+                    # Admin edits the textarea as a FULL config. Do not merge with the old
+                    # payload here: merging keeps deleted/old keys and makes the admin UI look
+                    # like it did not save. Other admin jobs that need to keep probe metadata
+                    # already pass the full current payload before calling patch_location().
                     if isinstance(value, dict):
-                        merged_payload.update(value or {})
-                    merged_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(merged_payload or {})))
-                    merged_payload = _apply_location_access_mode(merged_payload, _extract_location_access_mode(normalized_payload, merged_payload))
-                    canonical_code = str(normalized_payload.get("code") or existing_row.get("code") or merged_payload.get("location_code") or merged_payload.get("locationCode") or "").strip()
-                    canonical_name = str(normalized_payload.get("name_en") or existing_row.get("name_en") or existing_row.get("name_ru") or canonical_code or merged_payload.get("remark") or merged_payload.get("display_name") or "").strip()
-                    canonical_country = str(normalized_payload.get("country_code") or existing_row.get("country_code") or merged_payload.get("country_code") or merged_payload.get("resolved_country_code") or "").strip().upper()
+                        full_payload = dict(value or {})
+                    else:
+                        full_payload = {}
+                    full_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(full_payload or {})))
+                    full_payload = _apply_location_access_mode(full_payload, _extract_location_access_mode(normalized_payload, full_payload))
+                    canonical_code = str(normalized_payload.get("code") or full_payload.get("location_code") or full_payload.get("locationCode") or existing_row.get("code") or "").strip()
+                    canonical_name = str(normalized_payload.get("name_en") or full_payload.get("remark") or full_payload.get("display_name") or existing_row.get("name_en") or existing_row.get("name_ru") or canonical_code or "").strip()
+                    canonical_country = str(normalized_payload.get("country_code") or full_payload.get("country_code") or full_payload.get("resolved_country_code") or existing_row.get("country_code") or "").strip().upper()
                     if canonical_code:
-                        merged_payload["location_code"] = canonical_code
-                        merged_payload["locationCode"] = canonical_code
-                        merged_payload["resolved_location_code"] = canonical_code
+                        full_payload["location_code"] = canonical_code
+                        full_payload["locationCode"] = canonical_code
+                        full_payload["resolved_location_code"] = canonical_code
                     if canonical_name:
-                        merged_payload["remark"] = canonical_name
-                        merged_payload["display_name"] = canonical_name
+                        full_payload["remark"] = canonical_name
+                        full_payload["display_name"] = canonical_name
                     if canonical_country:
-                        merged_payload["country_code"] = canonical_country
-                        merged_payload["resolved_country_code"] = canonical_country
-                    value = Jsonb(_canonicalize_payload_metadata(merged_payload))
+                        full_payload["country_code"] = canonical_country
+                        full_payload["resolved_country_code"] = canonical_country
+                    value = Jsonb(_canonicalize_payload_metadata(full_payload))
                 updates.append(f"{key} = %s")
                 values.append(value)
 
