@@ -352,6 +352,7 @@ class Settings:
     RU_LTE_REAL_PROBE_ENABLED: bool = _env_bool("RU_LTE_REAL_PROBE_ENABLED", True)
     RU_LTE_REAL_PROBE_REQUIRED: bool = _env_bool("RU_LTE_REAL_PROBE_REQUIRED", True)
     RU_LTE_REAL_PROBE_MIN_SUCCESS: int = _env_int("RU_LTE_REAL_PROBE_MIN_SUCCESS", 2)
+    RU_LTE_REAL_PROBE_REQUIRED_LABELS: List[str] = None
     RU_LTE_REAL_PROBE_RUNNER: str = os.getenv("RU_LTE_REAL_PROBE_RUNNER", "xray")
     RU_LTE_REAL_PROBE_XRAY_BIN: str = os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray")
     RU_LTE_REAL_PROBE_SINGBOX_BIN: str = os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box")
@@ -370,6 +371,7 @@ class Settings:
     VPN_REAL_PROBE_MAX_TIME_SEC: int = _env_int("VPN_REAL_PROBE_MAX_TIME_SEC", _env_int("RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12))
     VPN_REAL_PROBE_WARMUP_MS: int = _env_int("VPN_REAL_PROBE_WARMUP_MS", _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200))
     VPN_REAL_PROBE_MIN_SUCCESS: int = _env_int("VPN_REAL_PROBE_MIN_SUCCESS", 2)
+    VPN_REAL_PROBE_REQUIRED_LABELS: List[str] = None
     VPN_LIVE_CHECK_ON_STARTUP: bool = _env_bool("VPN_LIVE_CHECK_ON_STARTUP", True)
     VPN_LIVE_CHECK_AUTO_ENABLED: bool = _env_bool("VPN_LIVE_CHECK_AUTO_ENABLED", True)
     VPN_LIVE_CHECK_AUTO_MINUTES: int = _env_int("VPN_LIVE_CHECK_AUTO_MINUTES", 3)
@@ -400,6 +402,7 @@ class Settings:
     BLACK_ALLOWED_TRANSPORTS: List[str] = None
     BLACK_REAL_PROBE_REQUIRED: bool = _env_bool("BLACK_REAL_PROBE_REQUIRED", True)
     BLACK_REAL_PROBE_MIN_SUCCESS: int = _env_int("BLACK_REAL_PROBE_MIN_SUCCESS", _env_int("VPN_REAL_PROBE_MIN_SUCCESS", 2))
+    BLACK_REAL_PROBE_REQUIRED_LABELS: List[str] = None
 
     def __post_init__(self) -> None:
         self.ANDROID_APP_URL = _normalize_store_url(self.ANDROID_APP_URL, "android")
@@ -433,7 +436,7 @@ class Settings:
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
-                "https://www.vk.com/,https://ya.ru/",
+                "https://www.youtube.com/generate_204,https://web.telegram.org/,https://www.instagram.com/,https://ya.ru/",
             )
         if self.VPN_REAL_PROBE_URLS is None:
             self.VPN_REAL_PROBE_URLS = _env_list(
@@ -445,6 +448,12 @@ class Settings:
                 "VPN_REAL_PROBE_RU_EXTRA_URLS",
                 "https://www.vk.com/,https://ya.ru/",
             )
+        if self.RU_LTE_REAL_PROBE_REQUIRED_LABELS is None:
+            self.RU_LTE_REAL_PROBE_REQUIRED_LABELS = _env_list("RU_LTE_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
+        if self.VPN_REAL_PROBE_REQUIRED_LABELS is None:
+            self.VPN_REAL_PROBE_REQUIRED_LABELS = _env_list("VPN_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
+        if self.BLACK_REAL_PROBE_REQUIRED_LABELS is None:
+            self.BLACK_REAL_PROBE_REQUIRED_LABELS = _env_list("BLACK_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
         if self.BLACK_ALLOWED_TRANSPORTS is None:
             self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
         if self.BLACK_SOURCE_URLS is None:
