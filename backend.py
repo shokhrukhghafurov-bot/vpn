@@ -1374,11 +1374,9 @@ def _ru_lte_force_proxy_telegram_cidrs() -> List[str]:
 
 
 def _xray_ru_lte_force_proxy_rules() -> List[Dict[str, Any]]:
-    paths = _probe_runner_geodata_paths()
-    domain_rules: List[str] = []
-    if paths.get("geosite"):
-        domain_rules.extend(["geosite:youtube", "geosite:telegram"])
-    domain_rules.extend([f"domain:{item}" for item in _ru_lte_force_proxy_domains()])
+    # Explicit domains only: safer than geosite:youtube/geosite:telegram on
+    # clients/runners where geosite.dat may be missing or incomplete.
+    domain_rules: List[str] = [f"domain:{item}" for item in _ru_lte_force_proxy_domains()]
     return [
         {"type": "field", "domain": domain_rules, "outboundTag": "proxy"},
         {"type": "field", "ip": _ru_lte_force_proxy_telegram_cidrs(), "outboundTag": "proxy"},
@@ -1386,13 +1384,10 @@ def _xray_ru_lte_force_proxy_rules() -> List[Dict[str, Any]]:
 
 
 def _singbox_ru_lte_force_proxy_rules() -> List[Dict[str, Any]]:
-    paths = _probe_runner_geodata_paths()
-    rules: List[Dict[str, Any]] = []
-    if paths.get("geosite"):
-        rules.append({"geosite": ["youtube", "telegram"], "outbound": "proxy"})
-    rules.append({"domain_suffix": _ru_lte_force_proxy_domains(), "outbound": "proxy"})
-    rules.append({"ip_cidr": _ru_lte_force_proxy_telegram_cidrs(), "outbound": "proxy"})
-    return rules
+    return [
+        {"domain_suffix": _ru_lte_force_proxy_domains(), "outbound": "proxy"},
+        {"ip_cidr": _ru_lte_force_proxy_telegram_cidrs(), "outbound": "proxy"},
+    ]
 
 def _probe_runner_geodata_paths() -> Dict[str, Optional[str]]:
     runner_name, runner_bin = _resolve_probe_runner()
