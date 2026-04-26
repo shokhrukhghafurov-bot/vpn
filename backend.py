@@ -6988,13 +6988,30 @@ def admin_locations(admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
 @app.post("/api/infra/admin/vpn/locations")
 def admin_locations_create(payload: LocationIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
+    data = _normalize_admin_location_input(payload.model_dump(exclude_none=True))
+    code = str(data.get("code") or "").strip()
     try:
-        item = create_location(_normalize_admin_location_input(payload.model_dump(exclude_none=True)))
-        return {"ok": True, "item": serialize_location(item, include_payload=True)}
+        # Admin safety net: old/stale HTML can open the modal in create mode even
+        # when the admin is editing an existing location. If the code already
+        # exists, update the existing row instead of returning
+        # "Location code already exists". This keeps Save Location idempotent.
+        existing_id = None
+        if code:
+            for row in list_locations(active_only=False):
+                if str(row.get("code") or "").strip() == code:
+                    existing_id = int(row.get("id") or 0) or None
+                    break
+        if existing_id:
+            item = patch_location(existing_id, data)
+            return {"ok": True, "item": serialize_location(item, include_payload=True), "updated_existing": True}
+        item = create_location(data)
+        return {"ok": True, "item": serialize_location(item, include_payload=True), "updated_existing": False}
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except psycopg.Error as exc:
         detail = str(exc).strip() or "Database error while saving location"
+        if "duplicate key" in detail.lower() or "unique constraint" in detail.lower():
+            detail = "Location code already exists"
         raise HTTPException(status_code=500, detail=detail) from exc
 
 
