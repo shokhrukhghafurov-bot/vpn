@@ -356,6 +356,7 @@ class Settings:
     RU_LTE_REAL_PROBE_XRAY_BIN: str = os.getenv("RU_LTE_REAL_PROBE_XRAY_BIN", "xray")
     RU_LTE_REAL_PROBE_SINGBOX_BIN: str = os.getenv("RU_LTE_REAL_PROBE_SINGBOX_BIN", "sing-box")
     RU_LTE_REAL_PROBE_URLS: List[str] = None
+    RU_LTE_REAL_PROBE_REQUIRED_LABELS: List[str] = None
     RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC: int = _env_int("RU_LTE_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6)
     RU_LTE_REAL_PROBE_MAX_TIME_SEC: int = _env_int("RU_LTE_REAL_PROBE_MAX_TIME_SEC", 12)
     RU_LTE_REAL_PROBE_WARMUP_MS: int = _env_int("RU_LTE_REAL_PROBE_WARMUP_MS", 1200)
@@ -433,7 +434,12 @@ class Settings:
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
-                "https://www.vk.com/,https://ya.ru/",
+                "https://www.youtube.com/generate_204,https://web.telegram.org/,https://www.instagram.com/",
+            )
+        if self.RU_LTE_REAL_PROBE_REQUIRED_LABELS is None:
+            self.RU_LTE_REAL_PROBE_REQUIRED_LABELS = _env_list(
+                "RU_LTE_REAL_PROBE_REQUIRED_LABELS",
+                "youtube,telegram",
             )
         if self.VPN_REAL_PROBE_URLS is None:
             self.VPN_REAL_PROBE_URLS = _env_list(
