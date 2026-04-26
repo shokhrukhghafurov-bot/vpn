@@ -436,7 +436,7 @@ class Settings:
         if self.RU_LTE_REAL_PROBE_URLS is None:
             self.RU_LTE_REAL_PROBE_URLS = _env_list(
                 "RU_LTE_REAL_PROBE_URLS",
-                "https://www.youtube.com/generate_204,https://web.telegram.org/,https://www.instagram.com/,https://ya.ru/",
+                "https://www.vk.com/,https://ya.ru/",
             )
         if self.VPN_REAL_PROBE_URLS is None:
             self.VPN_REAL_PROBE_URLS = _env_list(
@@ -449,11 +449,11 @@ class Settings:
                 "https://www.vk.com/,https://ya.ru/",
             )
         if self.RU_LTE_REAL_PROBE_REQUIRED_LABELS is None:
-            self.RU_LTE_REAL_PROBE_REQUIRED_LABELS = _env_list("RU_LTE_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
+            self.RU_LTE_REAL_PROBE_REQUIRED_LABELS = _env_list("RU_LTE_REAL_PROBE_REQUIRED_LABELS", "")
         if self.VPN_REAL_PROBE_REQUIRED_LABELS is None:
-            self.VPN_REAL_PROBE_REQUIRED_LABELS = _env_list("VPN_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
+            self.VPN_REAL_PROBE_REQUIRED_LABELS = _env_list("VPN_REAL_PROBE_REQUIRED_LABELS", "")
         if self.BLACK_REAL_PROBE_REQUIRED_LABELS is None:
-            self.BLACK_REAL_PROBE_REQUIRED_LABELS = _env_list("BLACK_REAL_PROBE_REQUIRED_LABELS", "youtube,telegram")
+            self.BLACK_REAL_PROBE_REQUIRED_LABELS = _env_list("BLACK_REAL_PROBE_REQUIRED_LABELS", "")
         if self.BLACK_ALLOWED_TRANSPORTS is None:
             self.BLACK_ALLOWED_TRANSPORTS = _env_list("BLACK_ALLOWED_TRANSPORTS", "grpc,tcp,ws,xhttp")
         if self.BLACK_SOURCE_URLS is None:
