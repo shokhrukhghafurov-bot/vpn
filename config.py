@@ -239,7 +239,8 @@ class Settings:
     XUI_DEFAULT_SERVER_KEY: str = os.getenv("XUI_DEFAULT_SERVER_KEY", "default").strip() or "default"
     XUI_CLIENT_EMAIL_PREFIX: str = os.getenv("XUI_CLIENT_EMAIL_PREFIX", "inet:").strip() or "inet:"
     XUI_TIMEOUT_SEC: int = _env_int("XUI_TIMEOUT_SEC", 8)
-    XUI_VERIFY_SSL: bool = _env_bool("XUI_VERIFY_SSL", True)
+    XUI_VERIFY_SSL: bool = _env_bool("XUI_VERIFY_SSL", False)
+    XUI_SSL_AUTO_FALLBACK: bool = _env_bool("XUI_SSL_AUTO_FALLBACK", True)
     XUI_DRY_RUN: bool = _env_bool("XUI_DRY_RUN", False)
 
     AUTH_DEV_LOGIN_CODE: str = os.getenv("AUTH_DEV_LOGIN_CODE", "111111")
