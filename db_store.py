@@ -1176,16 +1176,19 @@ def _apply_anti_block_profile(payload: Dict[str, Any]) -> Dict[str, Any]:
 
 
 def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
+    # Respect explicit admin switch first. route_mode=split should not silently
+    # re-enable RU direct if admin turned direct_ru off for troubleshooting.
+    if "direct_ru" in payload:
+        value = payload.get("direct_ru")
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        if isinstance(value, str):
+            return value.strip().lower() in {"1", "true", "yes", "on"}
     route_mode = str(payload.get("route_mode") or "").strip().lower()
     if route_mode == "split":
         return True
-    value = payload.get("direct_ru")
-    if isinstance(value, bool):
-        return value
-    if isinstance(value, (int, float)):
-        return bool(value)
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
     code = str(payload.get("location_code") or payload.get("locationCode") or payload.get("resolved_location_code") or "").strip().lower()
     return code.startswith("ru-lte")
 
