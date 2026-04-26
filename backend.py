@@ -1343,41 +1343,6 @@ def _ru_split_domain_patterns(payload: Dict[str, Any]) -> List[str]:
     return patterns or [r"regexp:.*\.ru$", r"regexp:.*\.su$", r"regexp:.*\.xn--p1ai$"]
 
 
-def _force_proxy_domain_patterns() -> List[str]:
-    return [
-        "youtube.com",
-        "youtu.be",
-        "googlevideo.com",
-        "ytimg.com",
-        "ggpht.com",
-        "googleapis.com",
-        "google.com",
-        "gstatic.com",
-        "telegram.org",
-        "t.me",
-        "telegram.me",
-        "tdesktop.com",
-        "instagram.com",
-        "cdninstagram.com",
-        "facebook.com",
-        "fbcdn.net",
-        "whatsapp.net",
-    ]
-
-
-def _force_proxy_ip_cidrs() -> List[str]:
-    return [
-        "91.108.4.0/22",
-        "91.108.8.0/22",
-        "91.108.12.0/22",
-        "91.108.16.0/22",
-        "91.108.20.0/22",
-        "91.108.56.0/22",
-        "95.161.64.0/20",
-        "149.154.160.0/20",
-    ]
-
-
 def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
     route_mode = str(payload.get("route_mode") or "").strip().lower()
     if route_mode == "split":
@@ -1475,22 +1440,6 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = _probe_runner_geodata_paths()
     private_cidrs = _probe_private_ip_cidrs()
     rules: List[Dict[str, Any]] = [
-        {"type": "field", "domain": [f"domain:{item}" for item in _force_proxy_domain_patterns()], "outboundTag": "proxy"},
-        {"type": "field", "ip": _force_proxy_ip_cidrs(), "outboundTag": "proxy"},
-    ]
-    if paths.get("geoip"):
-        rules.append({
-            "type": "field",
-            "ip": ["geoip:ru"],
-            "outboundTag": "direct",
-        })
-    if paths.get("geosite"):
-        rules.append({
-            "type": "field",
-            "domain": ["geosite:ru"],
-            "outboundTag": "direct",
-        })
-    rules.extend([
         {
             "type": "field",
             "ip": private_cidrs,
@@ -1501,7 +1450,19 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "domain": _ru_split_domain_patterns(payload),
             "outboundTag": "direct",
         },
-    ])
+    ]
+    if paths.get("geoip"):
+        rules.insert(1, {
+            "type": "field",
+            "ip": ["geoip:ru"],
+            "outboundTag": "direct",
+        })
+    if paths.get("geosite"):
+        rules.insert(2 if paths.get("geoip") else 1, {
+            "type": "field",
+            "domain": ["geosite:ru"],
+            "outboundTag": "direct",
+        })
     return rules
 
 
@@ -1511,17 +1472,13 @@ def _singbox_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
     paths = _probe_runner_geodata_paths()
     suffixes = [str(item).lstrip(".") for item in (payload.get("direct_domains") or [".ru", ".su", ".xn--p1ai"]) if str(item).strip()]
     rules: List[Dict[str, Any]] = [
-        {"domain_suffix": _force_proxy_domain_patterns(), "outbound": "proxy"},
-        {"ip_cidr": _force_proxy_ip_cidrs(), "outbound": "proxy"},
-    ]
-    if paths.get("geoip"):
-        rules.append({"geoip": ["ru"], "outbound": "direct"})
-    if paths.get("geosite"):
-        rules.append({"geosite": ["ru"], "outbound": "direct"})
-    rules.extend([
         {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
         {"domain_suffix": suffixes, "outbound": "direct"},
-    ])
+    ]
+    if paths.get("geoip"):
+        rules.insert(1, {"geoip": ["ru"], "outbound": "direct"})
+    if paths.get("geosite"):
+        rules.insert(2 if paths.get("geoip") else 1, {"geosite": ["ru"], "outbound": "direct"})
     return rules
 
 
@@ -1840,7 +1797,7 @@ def _pool_real_probe_required(pool: str) -> bool:
 def _pool_probe_min_success(pool: str, total_targets: int) -> int:
     total = max(1, int(total_targets or 0))
     if pool == "ru_lte":
-        raw = int(getattr(settings, "RU_LTE_REAL_PROBE_MIN_SUCCESS", 2) or 2)
+        raw = int(getattr(settings, "RU_LTE_REAL_PROBE_MIN_SUCCESS", 1) or 1)
     elif pool == "black":
         raw = int(getattr(settings, "BLACK_REAL_PROBE_MIN_SUCCESS", getattr(settings, "VPN_REAL_PROBE_MIN_SUCCESS", 2)) or 1)
     else:
@@ -1852,23 +1809,14 @@ def _pool_probe_min_success(pool: str, total_targets: int) -> int:
     return min(max(1, raw), total)
 
 
-def _pool_required_probe_labels(pool: str) -> set[str]:
-    if pool == "ru_lte":
-        raw_items = getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED_LABELS", []) or []
-        labels = {str(item or "").strip().lower() for item in raw_items if str(item or "").strip()}
-        return labels or {"youtube", "telegram"}
-    return set()
-
-
 def _candidate_probe_targets(payload: Dict[str, Any], *, pool: str = "generic") -> List[Tuple[str, str]]:
     targets: List[Tuple[str, str]] = []
     seen: set[str] = set()
 
     pool_urls = _pool_probe_urls(pool)
 
-    # RU LTE must be tested against the services users actually need.
-    # Default pool includes YouTube + Telegram + Instagram, and required labels
-    # below force YouTube and Telegram to pass before a node is published.
+    # RU LTE is a special white-list/mobile pool. Probe only explicit RU/mobile
+    # targets instead of requiring global services like YouTube/Instagram.
     if pool == "ru_lte":
         for item in pool_urls:
             _append_probe_url(targets, seen, item)
@@ -1912,7 +1860,6 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
     required_successes = _pool_probe_min_success(pool, len(targets))
-    required_labels = _pool_required_probe_labels(pool)
     socks_port = _pick_free_local_port()
     warmup_ms = max(0, int(getattr(settings, "VPN_REAL_PROBE_WARMUP_MS", 1200) or 1200))
     startup_timeout = max(2.0, float(getattr(settings, "VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
@@ -1944,9 +1891,7 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                 result = _run_curl_through_socks(url, socks_port)
                 if result.get("ok"):
                     successes.append((label, url, result.get("latency_ms")))
-                    labels_ok = {item[0] for item in successes}
-                    required_ok = not required_labels or required_labels.issubset(labels_ok)
-                    if len(labels_ok) >= required_successes and required_ok:
+                    if len({item[0] for item in successes}) >= required_successes:
                         latencies = [int(item[2]) for item in successes if item[2] is not None]
                         latency_ms = int(sum(latencies) / len(latencies)) if latencies else None
                         primary_url = successes[0][1] if successes else None
@@ -1957,7 +1902,6 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                             "probe_url": primary_url,
                             "probe_labels_ok": [item[0] for item in successes],
                             "probe_urls_ok": [item[1] for item in successes],
-                            "required_probe_labels": sorted(required_labels),
                             "geo_assets": geo_assets_available,
                         }
                 else:
@@ -1966,12 +1910,10 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                 "ok": False,
                 "latency_ms": None,
                 "error": f"real_probe_not_enough_success:{len({item[0] for item in successes})}/{required_successes}"
-                         + (f"; missing_required={','.join(sorted(required_labels - {item[0] for item in successes}))}" if required_labels else "")
                          + (f"; {' | '.join(failures[:4])}" if failures else ""),
                 "method": f"{runner_name}_real",
                 "probe_labels_ok": [item[0] for item in successes],
                 "probe_urls_ok": [item[1] for item in successes],
-                "required_probe_labels": sorted(required_labels),
                 "geo_assets": geo_assets_available,
             }
         except subprocess.TimeoutExpired:
@@ -3492,8 +3434,7 @@ def _build_tun_platform_diagnostics(payload: Dict[str, Any], platform_label: str
         issues.append("full_tunnel is disabled")
         fixes.append("Set full_tunnel=true for full-device routing.")
     elif full_tunnel is False and ru_split_profile:
-        issues.append("RU split profile has full_tunnel=false")
-        fixes.append("Set full_tunnel=true. Split is handled by direct_ru rules; non-RU traffic must still enter TUN/proxy.")
+        fixes.append("RU LTE split profile detected: full_tunnel=false is acceptable because RU/private traffic should go direct and blocked external traffic should go via VPN.")
 
     if not dns_servers or any(_diagnostic_placeholder(item) for item in dns_servers):
         issues.append("dns_servers is empty or still contains placeholders")
