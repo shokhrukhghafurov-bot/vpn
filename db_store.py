@@ -1243,8 +1243,10 @@ def _ru_lte_force_proxy_telegram_cidrs() -> List[str]:
 
 
 def _xray_ru_lte_force_proxy_rules() -> List[Dict[str, Any]]:
-    domain_rules = ["geosite:youtube", "geosite:telegram"]
-    domain_rules.extend([f"domain:{item}" for item in _ru_lte_force_proxy_domains()])
+    # Do not use geosite:youtube/geosite:telegram here. Some mobile clients
+    # start without a complete geosite.dat and then the whole profile fails.
+    # Explicit domain rules are enough and safer for Hiddify/v2RayTun/Happ.
+    domain_rules = [f"domain:{item}" for item in _ru_lte_force_proxy_domains()]
     return [
         {"type": "field", "domain": domain_rules, "outboundTag": "proxy"},
         {"type": "field", "ip": _ru_lte_force_proxy_telegram_cidrs(), "outboundTag": "proxy"},
