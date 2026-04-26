@@ -1353,6 +1353,14 @@ def _payload_direct_ru_enabled(payload: Dict[str, Any]) -> bool:
     return code.startswith("ru-lte")
 
 
+def _ru_lte_geoip_direct_enabled() -> bool:
+    return bool(getattr(settings, "RU_LTE_GEOIP_DIRECT_ENABLED", False))
+
+
+def _ru_lte_geosite_direct_enabled() -> bool:
+    return bool(getattr(settings, "RU_LTE_GEOSITE_DIRECT_ENABLED", False))
+
+
 def _probe_runner_geodata_paths() -> Dict[str, Optional[str]]:
     runner_name, runner_bin = _resolve_probe_runner()
     base_dir = str(Path(runner_bin).resolve().parent) if runner_bin else "/usr/local/bin"
@@ -1451,14 +1459,16 @@ def _xray_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
             "outboundTag": "direct",
         },
     ]
-    if paths.get("geoip"):
-        rules.insert(1, {
+    insert_at = 1
+    if _ru_lte_geoip_direct_enabled() and paths.get("geoip"):
+        rules.insert(insert_at, {
             "type": "field",
             "ip": ["geoip:ru"],
             "outboundTag": "direct",
         })
-    if paths.get("geosite"):
-        rules.insert(2 if paths.get("geoip") else 1, {
+        insert_at += 1
+    if _ru_lte_geosite_direct_enabled() and paths.get("geosite"):
+        rules.insert(insert_at, {
             "type": "field",
             "domain": ["geosite:ru"],
             "outboundTag": "direct",
@@ -1475,10 +1485,12 @@ def _singbox_ru_split_rules(payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         {"ip_cidr": _probe_private_ip_cidrs(), "outbound": "direct"},
         {"domain_suffix": suffixes, "outbound": "direct"},
     ]
-    if paths.get("geoip"):
-        rules.insert(1, {"geoip": ["ru"], "outbound": "direct"})
-    if paths.get("geosite"):
-        rules.insert(2 if paths.get("geoip") else 1, {"geosite": ["ru"], "outbound": "direct"})
+    insert_at = 1
+    if _ru_lte_geoip_direct_enabled() and paths.get("geoip"):
+        rules.insert(insert_at, {"geoip": ["ru"], "outbound": "direct"})
+        insert_at += 1
+    if _ru_lte_geosite_direct_enabled() and paths.get("geosite"):
+        rules.insert(insert_at, {"geosite": ["ru"], "outbound": "direct"})
     return rules
 
 
