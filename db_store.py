@@ -4266,11 +4266,15 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
 
             updates: List[str] = []
             values: List[Any] = []
-            allowed = {"name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
+            allowed = {"code", "name_ru", "name_en", "country_code", "is_active", "is_recommended", "is_reserve", "status", "sort_order", "download_mbps", "upload_mbps", "ping_ms", "speed_checked_at", "vpn_payload"}
             for key, value in normalized_payload.items():
                 if key not in allowed:
                     continue
-                if key in {"name_ru", "name_en"}:
+                if key == "code":
+                    value = str(value or "").strip()
+                    if not value:
+                        raise ValueError("code is required")
+                elif key in {"name_ru", "name_en"}:
                     value = str(value or "").strip()
                 elif key == "country_code":
                     value = str(value).strip().upper() or None if value is not None else None
@@ -4293,7 +4297,7 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                         merged_payload.update(value or {})
                     merged_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(merged_payload or {})))
                     merged_payload = _apply_location_access_mode(merged_payload, _extract_location_access_mode(normalized_payload, merged_payload))
-                    canonical_code = str(existing_row.get("code") or merged_payload.get("location_code") or merged_payload.get("locationCode") or "").strip()
+                    canonical_code = str(normalized_payload.get("code") or existing_row.get("code") or merged_payload.get("location_code") or merged_payload.get("locationCode") or "").strip()
                     canonical_name = str(normalized_payload.get("name_en") or existing_row.get("name_en") or existing_row.get("name_ru") or canonical_code or merged_payload.get("remark") or merged_payload.get("display_name") or "").strip()
                     canonical_country = str(normalized_payload.get("country_code") or existing_row.get("country_code") or merged_payload.get("country_code") or merged_payload.get("resolved_country_code") or "").strip().upper()
                     if canonical_code:
@@ -4315,7 +4319,11 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
 
             values.append(location_id)
             query = f"UPDATE locations SET {', '.join(updates)}, updated_at = NOW() WHERE id = %s AND is_deleted = FALSE RETURNING *"
-            cur.execute(query, tuple(values))
+            try:
+                cur.execute(query, tuple(values))
+            except psycopg.errors.UniqueViolation as exc:
+                conn.rollback()
+                raise ValueError("Location code already exists") from exc
             row = cur.fetchone()
             if not row:
                 raise ValueError("Location not found")
