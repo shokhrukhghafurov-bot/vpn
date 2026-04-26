@@ -209,7 +209,7 @@ class Settings:
     # refresh. If the dt_ token is already bound to a reserved device slot, allow
     # the refresh to continue instead of returning HTTP 403. First import still
     # requires the original bot/open-app link with subcid.
-    DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID: bool = _env_bool("DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", False)
+    DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID: bool = _env_bool("DEVICE_TOKEN_ALLOW_BOUND_REFRESH_WITHOUT_SUBCID", True)
     DEVICE_TOKEN_BIND_IP_ENABLED: bool = _env_bool("DEVICE_TOKEN_BIND_IP_ENABLED", False)
     DEVICE_TOKEN_TTL_HOURS: int = _env_int("DEVICE_TOKEN_TTL_HOURS", 0)
     # Pending slots are created when the bot shows /sub/dt_... buttons, before
