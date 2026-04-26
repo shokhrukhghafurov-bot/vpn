@@ -1840,7 +1840,7 @@ def _pool_real_probe_required(pool: str) -> bool:
 def _pool_probe_min_success(pool: str, total_targets: int) -> int:
     total = max(1, int(total_targets or 0))
     if pool == "ru_lte":
-        raw = int(getattr(settings, "RU_LTE_REAL_PROBE_MIN_SUCCESS", 1) or 1)
+        raw = int(getattr(settings, "RU_LTE_REAL_PROBE_MIN_SUCCESS", 2) or 2)
     elif pool == "black":
         raw = int(getattr(settings, "BLACK_REAL_PROBE_MIN_SUCCESS", getattr(settings, "VPN_REAL_PROBE_MIN_SUCCESS", 2)) or 1)
     else:
@@ -1852,14 +1852,23 @@ def _pool_probe_min_success(pool: str, total_targets: int) -> int:
     return min(max(1, raw), total)
 
 
+def _pool_required_probe_labels(pool: str) -> set[str]:
+    if pool == "ru_lte":
+        raw_items = getattr(settings, "RU_LTE_REAL_PROBE_REQUIRED_LABELS", []) or []
+        labels = {str(item or "").strip().lower() for item in raw_items if str(item or "").strip()}
+        return labels or {"youtube", "telegram"}
+    return set()
+
+
 def _candidate_probe_targets(payload: Dict[str, Any], *, pool: str = "generic") -> List[Tuple[str, str]]:
     targets: List[Tuple[str, str]] = []
     seen: set[str] = set()
 
     pool_urls = _pool_probe_urls(pool)
 
-    # RU LTE is a special white-list/mobile pool. Probe only explicit RU/mobile
-    # targets instead of requiring global services like YouTube/Instagram.
+    # RU LTE must be tested against the services users actually need.
+    # Default pool includes YouTube + Telegram + Instagram, and required labels
+    # below force YouTube and Telegram to pass before a node is published.
     if pool == "ru_lte":
         for item in pool_urls:
             _append_probe_url(targets, seen, item)
@@ -1903,6 +1912,7 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
         return {"ok": False, "latency_ms": None, "error": "probe_urls_missing", "method": f"{runner_name}_real"}
 
     required_successes = _pool_probe_min_success(pool, len(targets))
+    required_labels = _pool_required_probe_labels(pool)
     socks_port = _pick_free_local_port()
     warmup_ms = max(0, int(getattr(settings, "VPN_REAL_PROBE_WARMUP_MS", 1200) or 1200))
     startup_timeout = max(2.0, float(getattr(settings, "VPN_REAL_PROBE_CONNECT_TIMEOUT_SEC", 6) or 6))
@@ -1934,7 +1944,9 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                 result = _run_curl_through_socks(url, socks_port)
                 if result.get("ok"):
                     successes.append((label, url, result.get("latency_ms")))
-                    if len({item[0] for item in successes}) >= required_successes:
+                    labels_ok = {item[0] for item in successes}
+                    required_ok = not required_labels or required_labels.issubset(labels_ok)
+                    if len(labels_ok) >= required_successes and required_ok:
                         latencies = [int(item[2]) for item in successes if item[2] is not None]
                         latency_ms = int(sum(latencies) / len(latencies)) if latencies else None
                         primary_url = successes[0][1] if successes else None
@@ -1945,6 +1957,7 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                             "probe_url": primary_url,
                             "probe_labels_ok": [item[0] for item in successes],
                             "probe_urls_ok": [item[1] for item in successes],
+                            "required_probe_labels": sorted(required_labels),
                             "geo_assets": geo_assets_available,
                         }
                 else:
@@ -1953,10 +1966,12 @@ def _probe_candidate_via_real_tunnel(payload: Dict[str, Any], *, pool: str = "ge
                 "ok": False,
                 "latency_ms": None,
                 "error": f"real_probe_not_enough_success:{len({item[0] for item in successes})}/{required_successes}"
+                         + (f"; missing_required={','.join(sorted(required_labels - {item[0] for item in successes}))}" if required_labels else "")
                          + (f"; {' | '.join(failures[:4])}" if failures else ""),
                 "method": f"{runner_name}_real",
                 "probe_labels_ok": [item[0] for item in successes],
                 "probe_urls_ok": [item[1] for item in successes],
+                "required_probe_labels": sorted(required_labels),
                 "geo_assets": geo_assets_available,
             }
         except subprocess.TimeoutExpired:
