@@ -7019,23 +7019,42 @@ def admin_locations_create(payload: LocationIn, admin_name: str = Depends(requir
 def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name: str = Depends(require_admin)) -> Dict[str, Any]:
     _ = admin_name
     data = _normalize_admin_location_input({key: value for key, value in payload.model_dump().items() if value is not None})
+
+    def _requested_code_from_payload(patch_data: Dict[str, Any]) -> str:
+        # v12: the admin modal stores the visible code inside vpn_payload
+        # (location_code/locationCode/resolved_location_code). Older code looked
+        # only at top-level `code`, so PATCH /locations/<stale-id> could still
+        # try to rename a duplicate row and fail with "Location code already exists".
+        candidates: List[Any] = [patch_data.get("code")]
+        vp = patch_data.get("vpn_payload")
+        if isinstance(vp, dict):
+            candidates.extend([vp.get("location_code"), vp.get("locationCode"), vp.get("resolved_location_code")])
+        for candidate in candidates:
+            code = str(candidate or "").strip()
+            if code:
+                return code
+        return ""
+
     try:
-        # v11 safety net: the admin modal can be opened from a stale/duplicate row
-        # and then saved with an existing location_code (for example PATCH /locations/76
-        # with code=ru-lte-01 while the real ru-lte-01 row already exists).
-        # In that case, update the existing code row instead of throwing
-        # "Location code already exists". This keeps Save idempotent for admins.
         all_rows = list_locations(active_only=False)
         rows_by_id = {int(row.get("id") or 0): row for row in all_rows if int(row.get("id") or 0)}
         before_code = str((rows_by_id.get(int(location_id)) or {}).get("code") or "").strip()
-        requested_code = str(data.get("code") or "").strip()
+        requested_code = _requested_code_from_payload(data)
         target_location_id = int(location_id)
         patched_existing_code_row = False
+
+        # If the JSON says ru-lte-01, force the canonical top-level code too.
+        # This keeps DB metadata and payload metadata in sync.
+        if requested_code:
+            data["code"] = requested_code
+
+        duplicate_row = None
         if requested_code:
             for row in all_rows:
                 row_id = int(row.get("id") or 0)
                 row_code = str(row.get("code") or "").strip()
                 if row_id and row_id != int(location_id) and row_code == requested_code:
+                    duplicate_row = row
                     target_location_id = row_id
                     patched_existing_code_row = True
                     break
@@ -7043,17 +7062,28 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
         try:
             item = patch_location(target_location_id, data)
         except ValueError as exc:
-            # Extra fallback for databases that raise duplicate-code during UPDATE
-            # before the pre-check above can catch it. Resolve by code and update that row.
+            # v12 hard fallback: if code already exists, always save payload/fields
+            # into the row that already owns this code. If updating the code column
+            # itself still collides because there are stale duplicate rows, drop only
+            # the top-level code update and keep the payload update.
             if "Location code already exists" in str(exc) and requested_code:
                 refreshed_rows = list_locations(active_only=False)
-                duplicate_row = next((row for row in refreshed_rows if str(row.get("code") or "").strip() == requested_code), None)
-                if duplicate_row and int(duplicate_row.get("id") or 0) != int(target_location_id):
-                    target_location_id = int(duplicate_row.get("id") or 0)
+                duplicate_row = next((row for row in refreshed_rows if str(row.get("code") or "").strip() == requested_code), duplicate_row)
+                if duplicate_row:
+                    target_location_id = int(duplicate_row.get("id") or 0) or target_location_id
                     patched_existing_code_row = True
-                    item = patch_location(target_location_id, data)
+                    try:
+                        item = patch_location(target_location_id, data)
+                    except ValueError as exc2:
+                        if "Location code already exists" not in str(exc2):
+                            raise
+                        data_without_code = dict(data)
+                        data_without_code.pop("code", None)
+                        item = patch_location(target_location_id, data_without_code)
                 else:
-                    raise
+                    data_without_code = dict(data)
+                    data_without_code.pop("code", None)
+                    item = patch_location(target_location_id, data_without_code)
             else:
                 raise
 
@@ -7073,6 +7103,7 @@ def admin_locations_patch(location_id: int, payload: LocationPatchIn, admin_name
             "patched_existing_code_row": patched_existing_code_row,
             "requested_location_id": int(location_id),
             "saved_location_id": int(target_location_id),
+            "requested_code": requested_code,
         }
     except ValueError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
