@@ -4865,7 +4865,10 @@ def _subscription_location_rows(user_id: Optional[int] = None, client_hint: Opti
             base_row = dict(row)
             if not _subscription_row_allowed_for_publish(base_row, user_id=user_id, strict_health=strict_health):
                 continue
-            payload, _ = _subscription_payload_and_fallback_name(base_row, user_id=user_id)
+            # Do not create user/per-device credentials during publish filtering.
+            # The actual subscription generation below receives the real device_id
+            # and is the only place that should allocate personal UUIDs.
+            payload, _ = _subscription_payload_and_fallback_name(base_row, user_id=None)
             if not payload or not _subscription_transport_allowed(payload, client_hint):
                 continue
             publish_key = _subscription_publish_dedupe_key(base_row, payload)
