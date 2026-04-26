@@ -1581,6 +1581,79 @@ def _canonicalize_payload_metadata(payload: Dict[str, Any]) -> Dict[str, Any]:
     return normalized
 
 
+def _prepare_exact_admin_vpn_payload(
+    payload: Dict[str, Any],
+    *,
+    canonical_code: str = "",
+    canonical_country: str = "",
+    canonical_name: str = "",
+) -> Dict[str, Any]:
+    """Prepare an admin-edited vpn_payload for exact storage.
+
+    Exact admin save means: store the JSON/textarea + visible modal fields as the
+    source of truth. Do not rebuild raw_xray_config, do not merge old DB values,
+    and do not force credential_mode/access_mode to another mode.
+    """
+    full_payload = dict(payload or {})
+
+    def _sync_pair(primary: str, alias: str) -> None:
+        primary_has = primary in full_payload and full_payload.get(primary) not in (None, "")
+        alias_has = alias in full_payload and full_payload.get(alias) not in (None, "")
+        chosen = full_payload.get(primary) if primary_has else (full_payload.get(alias) if alias_has else None)
+        if chosen not in (None, ""):
+            full_payload[primary] = chosen
+            full_payload[alias] = chosen
+
+    for primary, alias in (
+        ("managed_by", "managedBy"),
+        ("xui_server_key", "xuiServerKey"),
+        ("xui_inbound_id", "xuiInboundId"),
+        ("credential_mode", "credentialMode"),
+        ("access_mode", "accessMode"),
+        ("uuid_mode", "uuidMode"),
+        ("server_name", "sni"),
+        ("public_key", "publicKey"),
+        ("short_id", "shortId"),
+        ("domain_resolver", "domainResolver"),
+        ("packet_encoding", "packetEncoding"),
+        ("location_code", "locationCode"),
+    ):
+        _sync_pair(primary, alias)
+
+    xui_server_key = str(full_payload.get("xui_server_key") or full_payload.get("xuiServerKey") or "").strip()
+    xui_inbound_id = full_payload.get("xui_inbound_id") if full_payload.get("xui_inbound_id") is not None else full_payload.get("xuiInboundId")
+    managed_raw = str(full_payload.get("managed_by") or full_payload.get("managedBy") or "").strip().lower()
+    if str(xui_inbound_id or "").strip() or (xui_server_key and xui_server_key != "default") or managed_raw in {"3x-ui", "3xui", "xui"}:
+        full_payload["managed_by"] = "3x-ui"
+        full_payload["managedBy"] = "3x-ui"
+        full_payload["xui_server_key"] = xui_server_key or "default"
+        full_payload["xuiServerKey"] = full_payload["xui_server_key"]
+        if str(xui_inbound_id or "").strip():
+            try:
+                inbound_int = int(float(str(xui_inbound_id).strip()))
+            except (TypeError, ValueError):
+                inbound_int = xui_inbound_id
+            full_payload["xui_inbound_id"] = inbound_int
+            full_payload["xuiInboundId"] = inbound_int
+
+    code = str(canonical_code or full_payload.get("location_code") or full_payload.get("locationCode") or full_payload.get("resolved_location_code") or "").strip()
+    country = str(canonical_country or full_payload.get("country_code") or full_payload.get("resolved_country_code") or "").strip().upper()
+    name = str(canonical_name or full_payload.get("remark") or full_payload.get("display_name") or "").strip()
+    if code:
+        full_payload["location_code"] = code
+        full_payload["locationCode"] = code
+        full_payload["resolved_location_code"] = code
+    if country:
+        full_payload["country_code"] = country
+        full_payload["resolved_country_code"] = country
+    if name and not full_payload.get("remark"):
+        full_payload["remark"] = name
+    if name and not full_payload.get("display_name"):
+        full_payload["display_name"] = name
+
+    return full_payload
+
+
 def _apply_admin_mobile_defaults(payload: Dict[str, Any]) -> Dict[str, Any]:
     normalized = dict(payload or {})
     if not normalized:
@@ -4188,6 +4261,7 @@ def list_locations(active_only: bool = True) -> List[Dict[str, Any]]:
 
 def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_status: str = "offline") -> Dict[str, Any]:
     data = dict(payload or {})
+    save_exact_vpn_payload = bool(data.pop("save_exact_vpn_payload", False))
     data["code"] = str(data.get("code") or "").strip()
     data["name_ru"] = str(data.get("name_ru") or "").strip()
     data["name_en"] = str(data.get("name_en") or data.get("name_ru") or "").strip()
@@ -4207,6 +4281,15 @@ def _normalize_location_mutation_payload(payload: Dict[str, Any], *, default_sta
     data["upload_mbps"] = _normalize_optional_float(data.get("upload_mbps"))
     data["ping_ms"] = _normalize_optional_int(data.get("ping_ms"))
     data["speed_checked_at"] = _normalize_optional_timestamp(data.get("speed_checked_at"))
+    if save_exact_vpn_payload:
+        data["vpn_payload"] = _prepare_exact_admin_vpn_payload(
+            data.get("vpn_payload") or {},
+            canonical_code=data["code"],
+            canonical_country=data.get("country_code") or "",
+            canonical_name=data.get("name_en") or "",
+        )
+        return data
+
     vpn_payload = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(data.get("vpn_payload") or {}))
     access_mode = _extract_location_access_mode(data, vpn_payload)
     vpn_payload = _apply_location_access_mode(vpn_payload, access_mode)
@@ -4330,7 +4413,7 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                 raise ValueError("Location not found")
             existing_row = dict(existing)
 
-            if access_mode_requested:
+            if access_mode_requested and not save_exact_vpn_payload:
                 current_vpn_payload = dict(existing_row.get("vpn_payload") or {})
                 if isinstance(normalized_payload.get("vpn_payload"), dict):
                     current_vpn_payload.update(normalized_payload.get("vpn_payload") or {})
@@ -4379,59 +4462,12 @@ def patch_location(location_id: int, payload: Dict[str, Any]) -> Dict[str, Any]:
                         # Keep common snake/camel aliases in sync, but do not regenerate the
                         # whole config. That lets admin changes to raw_xray_config, code, xui_*,
                         # credential_mode, access_mode and custom fields persist exactly.
-                        def _sync_pair(primary: str, alias: str) -> None:
-                            primary_present = primary in full_payload and full_payload.get(primary) not in (None, "")
-                            alias_present = alias in full_payload and full_payload.get(alias) not in (None, "")
-                            chosen = full_payload.get(primary) if primary_present else (full_payload.get(alias) if alias_present else None)
-                            if chosen not in (None, ""):
-                                full_payload[primary] = chosen
-                                full_payload[alias] = chosen
-
-                        for primary, alias in (
-                            ("managed_by", "managedBy"),
-                            ("xui_server_key", "xuiServerKey"),
-                            ("xui_inbound_id", "xuiInboundId"),
-                            ("credential_mode", "credentialMode"),
-                            ("access_mode", "accessMode"),
-                            ("uuid_mode", "uuidMode"),
-                            ("server_name", "sni"),
-                            ("public_key", "publicKey"),
-                            ("short_id", "shortId"),
-                            ("domain_resolver", "domainResolver"),
-                            ("packet_encoding", "packetEncoding"),
-                            ("location_code", "locationCode"),
-                        ):
-                            _sync_pair(primary, alias)
-
-                        xui_server_key = str(full_payload.get("xui_server_key") or full_payload.get("xuiServerKey") or "").strip()
-                        xui_inbound_id = full_payload.get("xui_inbound_id") if full_payload.get("xui_inbound_id") is not None else full_payload.get("xuiInboundId")
-                        if str(xui_inbound_id or "").strip() or (xui_server_key and xui_server_key != "default") or str(full_payload.get("managed_by") or full_payload.get("managedBy") or "").strip().lower() in {"3x-ui", "3xui", "xui"}:
-                            full_payload["managed_by"] = "3x-ui"
-                            full_payload["managedBy"] = "3x-ui"
-                            full_payload["xui_server_key"] = xui_server_key or "default"
-                            full_payload["xuiServerKey"] = full_payload["xui_server_key"]
-                            if str(xui_inbound_id or "").strip():
-                                try:
-                                    inbound_int = int(float(str(xui_inbound_id).strip()))
-                                except (TypeError, ValueError):
-                                    inbound_int = xui_inbound_id
-                                full_payload["xui_inbound_id"] = inbound_int
-                                full_payload["xuiInboundId"] = inbound_int
-
-                        canonical_code = str(normalized_payload.get("code") or full_payload.get("location_code") or full_payload.get("locationCode") or existing_row.get("code") or "").strip()
-                        canonical_country = str(normalized_payload.get("country_code") or full_payload.get("country_code") or full_payload.get("resolved_country_code") or existing_row.get("country_code") or "").strip().upper()
-                        canonical_name = str(normalized_payload.get("name_en") or full_payload.get("remark") or full_payload.get("display_name") or existing_row.get("name_en") or existing_row.get("name_ru") or "").strip()
-                        if canonical_code:
-                            full_payload["location_code"] = canonical_code
-                            full_payload["locationCode"] = canonical_code
-                            full_payload["resolved_location_code"] = canonical_code
-                        if canonical_country:
-                            full_payload["country_code"] = canonical_country
-                            full_payload["resolved_country_code"] = canonical_country
-                        if canonical_name and not full_payload.get("remark"):
-                            full_payload["remark"] = canonical_name
-                        if canonical_name and not full_payload.get("display_name"):
-                            full_payload["display_name"] = canonical_name
+                        full_payload = _prepare_exact_admin_vpn_payload(
+                            full_payload,
+                            canonical_code=str(normalized_payload.get("code") or existing_row.get("code") or "").strip(),
+                            canonical_country=str(normalized_payload.get("country_code") or existing_row.get("country_code") or "").strip().upper(),
+                            canonical_name=str(normalized_payload.get("name_en") or existing_row.get("name_en") or existing_row.get("name_ru") or "").strip(),
+                        )
                         value = Jsonb(full_payload)
                     else:
                         full_payload = dict(_apply_admin_mobile_defaults(_normalize_vpn_payload_keys(full_payload or {})))
