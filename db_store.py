@@ -1920,7 +1920,44 @@ def _placeholder_like_value(value: Any) -> bool:
     return False
 
 
+def _truthy_payload_value(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
+
+
+def _vpn_payload_is_mix_profile(payload: Dict[str, Any]) -> bool:
+    data = dict(payload or {})
+    profile_type = str(data.get("profile_type") or data.get("profileType") or "").strip().lower()
+    return profile_type == "mix" or _truthy_payload_value(data.get("mix_profile")) or _truthy_payload_value(data.get("mixProfile"))
+
+
+def _vpn_mix_payload_ready_for_publish(payload: Dict[str, Any]) -> bool:
+    data = dict(payload or {})
+    if not _vpn_payload_is_mix_profile(data):
+        return False
+    raw = data.get("raw_xray_config") or data.get("rawXrayConfig")
+    if isinstance(raw, dict) and isinstance(raw.get("outbounds"), list) and raw.get("outbounds"):
+        return True
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict) and isinstance(parsed.get("outbounds"), list) and parsed.get("outbounds"):
+                return True
+        except Exception:
+            pass
+    telegram_code = str(data.get("telegram_location_code") or data.get("telegramLocationCode") or "").strip()
+    default_code = str(data.get("default_location_code") or data.get("defaultLocationCode") or "").strip()
+    return bool(telegram_code and default_code)
+
+
 def _config_is_complete(payload: Dict[str, Any]) -> bool:
+    if _vpn_mix_payload_ready_for_publish(dict(payload or {})):
+        return True
     normalized = _apply_admin_mobile_defaults(_normalize_vpn_payload_keys(payload))
     server = str(normalized.get("server") or "").strip()
     uuid = str(normalized.get("uuid") or "").strip()
