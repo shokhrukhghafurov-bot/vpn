@@ -1950,8 +1950,25 @@ def _vpn_mix_payload_ready_for_publish(payload: Dict[str, Any]) -> bool:
                 return True
         except Exception:
             pass
-    telegram_code = str(data.get("telegram_location_code") or data.get("telegramLocationCode") or "").strip()
-    default_code = str(data.get("default_location_code") or data.get("defaultLocationCode") or "").strip()
+    nested = data.get("mix") if isinstance(data.get("mix"), dict) else {}
+    telegram_code = str(
+        data.get("telegram_location_code")
+        or data.get("telegramLocationCode")
+        or nested.get("telegram_location_code")
+        or nested.get("telegramLocationCode")
+        or "ru-lte-01"
+    ).strip()
+    default_code = str(
+        data.get("default_location_code")
+        or data.get("defaultLocationCode")
+        or nested.get("default_location_code")
+        or nested.get("defaultLocationCode")
+        or nested.get("youtube_location_code")
+        or nested.get("youtubeLocationCode")
+        or nested.get("chatgpt_location_code")
+        or nested.get("chatgptLocationCode")
+        or "ru-lte-1"
+    ).strip()
     return bool(telegram_code and default_code)
 
 
