@@ -3617,6 +3617,33 @@ def build_location_tun_diagnostics(row: Dict[str, Any], *, resolved_payload: Opt
             }
 
     payload = preview_payload if preview_payload else _compose_vpn_payload_for_location(dict(row))
+    if _subscription_row_looks_like_mix(dict(row), payload):
+        mix_payload = _subscription_mix_defaults(dict(row), dict(payload or {}))
+        telegram_code, default_code = _subscription_mix_codes(mix_payload)
+        issue_text = f"MIX template OK: Telegram -> {telegram_code}; default/YouTube -> {default_code}"
+        fix_text = f"Do not delete source locations {telegram_code} and {default_code}; active=off is allowed."
+        platform_items = {}
+        for platform_label in ("Android", "iOS", "Windows", "macOS"):
+            platform_items[platform_label.lower()] = {
+                "status": "ready",
+                "label": f"{platform_label}: MIX template ready",
+                "issues": [issue_text],
+                "fixes": [fix_text],
+            }
+        return {
+            "summary_status": "ready",
+            "summary_text": issue_text,
+            "issues": [issue_text],
+            "fixes": [fix_text],
+            "android": platform_items["android"],
+            "ios": platform_items["ios"],
+            "windows": platform_items["windows"],
+            "macos": platform_items["macos"],
+            "preview_payload": mix_payload,
+            "preview_target_code": code,
+            "preview_target_name": preview_target_name,
+            "preview_is_virtual": False,
+        }
     android = _build_tun_platform_diagnostics(payload, "Android")
     ios = _build_tun_platform_diagnostics(payload, "iOS")
     windows = _build_tun_platform_diagnostics(payload, "Windows")
@@ -4895,6 +4922,65 @@ def _subscription_payload_is_mix_profile(payload: Dict[str, Any]) -> bool:
     return profile_type == "mix" or _subscription_truthy(data.get("mix_profile")) or _subscription_truthy(data.get("mixProfile"))
 
 
+def _subscription_row_looks_like_mix(row: Dict[str, Any], payload: Optional[Dict[str, Any]] = None) -> bool:
+    """Detect the admin MIX location even if the saved JSON is incomplete/old."""
+    data = dict(payload or {})
+    if _subscription_payload_is_mix_profile(data):
+        return True
+    code = str((row or {}).get("code") or data.get("location_code") or data.get("locationCode") or "").strip().lower()
+    return code in {"mix-tg-youtube", "russia-mix", "russia_mix", "mix-tg-yt"}
+
+
+def _subscription_mix_defaults(row: Dict[str, Any], payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Return a runtime-ready MIX payload without trusting a saved raw Xray JSON."""
+    data = dict(payload or {})
+    nested = data.get("mix") if isinstance(data.get("mix"), dict) else {}
+    code = str((row or {}).get("code") or data.get("location_code") or data.get("locationCode") or "mix-tg-youtube").strip() or "mix-tg-youtube"
+    name = str((row or {}).get("name_en") or (row or {}).get("name_ru") or data.get("display_name") or data.get("remark") or "Russia MIX").strip() or "Russia MIX"
+    data.setdefault("engine", "xray")
+    data.setdefault("profile_type", "mix")
+    data.setdefault("mix_profile", True)
+    data.setdefault("publish_as_subscription", True)
+    data.setdefault("publish_mode", "append")
+    data.setdefault("location_code", code)
+    data.setdefault("locationCode", code)
+    data.setdefault("resolved_location_code", code)
+    data.setdefault("country_code", str((row or {}).get("country_code") or data.get("country_code") or "RU").strip().upper() or "RU")
+    data.setdefault("resolved_country_code", data.get("country_code") or "RU")
+    data.setdefault("remark", name)
+    data.setdefault("display_name", name)
+    data.setdefault("connect_mode", "tun")
+    data.setdefault("connectMode", "tun")
+    data.setdefault("full_tunnel", True)
+    data.setdefault("direct_ru", True)
+    data.setdefault("route_mode", "split")
+    data.setdefault("uuid_mode", "per_device")
+    data.setdefault("uuidMode", "per_device")
+    data.setdefault("credential_mode", "per_device")
+    data.setdefault("credentialMode", "per_device")
+    data.setdefault("access_mode", "owned_per_user")
+    data.setdefault("accessMode", "owned_per_user")
+    data.setdefault("managed_by", "manual")
+    data.setdefault("managedBy", "manual")
+    data.setdefault("xui_server_key", "default")
+    data.setdefault("xuiServerKey", "default")
+    telegram_code = str(data.get("telegram_location_code") or data.get("telegramLocationCode") or nested.get("telegram_location_code") or nested.get("telegramLocationCode") or "ru-lte-01").strip() or "ru-lte-01"
+    default_code = str(data.get("default_location_code") or data.get("defaultLocationCode") or nested.get("default_location_code") or nested.get("defaultLocationCode") or nested.get("youtube_location_code") or nested.get("youtubeLocationCode") or nested.get("chatgpt_location_code") or nested.get("chatgptLocationCode") or "ru-lte-1").strip() or "ru-lte-1"
+    data["telegram_location_code"] = telegram_code
+    data["telegramLocationCode"] = telegram_code
+    data["default_location_code"] = default_code
+    data["defaultLocationCode"] = default_code
+    if not isinstance(data.get("mix"), dict):
+        data["mix"] = {
+            "telegram_location_code": telegram_code,
+            "youtube_location_code": default_code,
+            "chatgpt_location_code": default_code,
+            "default_location_code": default_code,
+            "direct_ru": bool(_subscription_truthy(data.get("direct_ru", True))),
+        }
+    return data
+
+
 def _subscription_mix_publish_enabled(payload: Dict[str, Any]) -> bool:
     data = dict(payload or {})
     if not _subscription_payload_is_mix_profile(data):
@@ -4903,7 +4989,7 @@ def _subscription_mix_publish_enabled(payload: Dict[str, Any]) -> bool:
         return _subscription_truthy(data.get("publish_as_subscription"))
     if "publishAsSubscription" in data:
         return _subscription_truthy(data.get("publishAsSubscription"))
-    return False
+    return True
 
 
 def _subscription_mix_replace_enabled(payload: Dict[str, Any]) -> bool:
@@ -4939,8 +5025,25 @@ def _subscription_explicit_mix_request(request: Request) -> bool:
 
 def _subscription_mix_codes(payload: Dict[str, Any]) -> Tuple[str, str]:
     data = dict(payload or {})
-    telegram_code = str(data.get("telegram_location_code") or data.get("telegramLocationCode") or "ru-lte-01").strip()
-    default_code = str(data.get("default_location_code") or data.get("defaultLocationCode") or "ru-lte-1").strip()
+    nested = data.get("mix") if isinstance(data.get("mix"), dict) else {}
+    telegram_code = str(
+        data.get("telegram_location_code")
+        or data.get("telegramLocationCode")
+        or nested.get("telegram_location_code")
+        or nested.get("telegramLocationCode")
+        or "ru-lte-01"
+    ).strip() or "ru-lte-01"
+    default_code = str(
+        data.get("default_location_code")
+        or data.get("defaultLocationCode")
+        or nested.get("default_location_code")
+        or nested.get("defaultLocationCode")
+        or nested.get("youtube_location_code")
+        or nested.get("youtubeLocationCode")
+        or nested.get("chatgpt_location_code")
+        or nested.get("chatgptLocationCode")
+        or "ru-lte-1"
+    ).strip() or "ru-lte-1"
     return telegram_code, default_code
 
 
@@ -4964,8 +5067,11 @@ def _active_mix_subscription_row() -> Optional[Tuple[Dict[str, Any], Dict[str, A
     for row in list_locations(active_only=True):
         if not bool(row.get("is_active")):
             continue
-        payload = _compose_vpn_payload_for_location(dict(row))
-        if not payload or not _subscription_mix_publish_enabled(payload):
+        payload = _compose_vpn_payload_for_location(dict(row)) or dict(row.get("vpn_payload") or {})
+        if not _subscription_row_looks_like_mix(dict(row), payload):
+            continue
+        payload = _subscription_mix_defaults(dict(row), dict(payload or {}))
+        if not _subscription_mix_publish_enabled(payload):
             continue
         candidates.append((dict(row), dict(payload)))
     if not candidates:
