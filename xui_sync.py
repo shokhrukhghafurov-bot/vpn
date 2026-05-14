@@ -61,7 +61,14 @@ class XUIClient:
         self.cfg = cfg
         self.session = requests.Session()
         if cfg.token:
-            self.session.headers.update({"Authorization": f"Bearer {cfg.token}"})
+            # Different 3X-UI builds/proxies accept different token header names.
+            # Keep Authorization for modern deployments and add explicit aliases for
+            # admin diagnostics / reverse-proxy integrations.
+            self.session.headers.update({
+                "Authorization": f"Bearer {cfg.token}",
+                "X-API-Token": str(cfg.token),
+                "X-Token": str(cfg.token),
+            })
         self.session.headers.update({"User-Agent": "inet-vpn-backend/xui-sync"})
 
     def _url(self, path: str) -> str:
@@ -98,9 +105,12 @@ class XUIClient:
             raise
 
     def login(self) -> None:
-        if self.cfg.token:
-            return
+        # Prefer the normal form/json login when username+password are configured.
+        # API tokens are still attached to headers, but some 3X-UI builds do not
+        # accept Bearer auth for /panel/api/* and require the session cookie.
         if not self.cfg.username or not self.cfg.password:
+            if self.cfg.token:
+                return
             raise XUIError(f"3X-UI server {self.cfg.key}: username/password required")
 
         # 3X-UI login is form-based in normal panel builds. Keep a JSON fallback
@@ -125,7 +135,134 @@ class XUIClient:
                     return
             except Exception as exc:  # pragma: no cover - network dependent
                 last_error = str(exc)
+        if self.cfg.token:
+            # Token may still be accepted by the inbounds endpoints even if the
+            # cookie login is blocked by a fork/reverse proxy. Let the caller try
+            # the protected endpoint with token headers and surface that result.
+            return
         raise XUIError(f"3X-UI login failed for {self.cfg.key}: {last_error}")
+
+    def _response_summary(self, resp: requests.Response, *, body_limit: int = 500) -> Dict[str, Any]:
+        text = ""
+        try:
+            text = resp.text or ""
+        except Exception:
+            text = ""
+        body = text[:body_limit]
+        if len(text) > body_limit:
+            body += "…"
+        return {
+            "status_code": int(resp.status_code),
+            "ok": bool(200 <= resp.status_code < 300),
+            "content_type": resp.headers.get("content-type", ""),
+            "location": resp.headers.get("location", ""),
+            "set_cookie": bool(resp.headers.get("set-cookie")),
+            "cookies": sorted([c.name for c in self.session.cookies]),
+            "json": _safe_json(resp),
+            "body_snippet": body,
+        }
+
+    def diagnose(self) -> Dict[str, Any]:
+        """Return a safe, admin-facing connectivity/login diagnostic report.
+
+        The report intentionally does not include passwords or token values. It is
+        used by the admin panel to show why a 3X-UI registry test failed instead
+        of only returning an opaque HTTP 403/502.
+        """
+        result: Dict[str, Any] = {
+            "server_key": self.cfg.key,
+            "base_url": self.cfg.base_url,
+            "verify_ssl": bool(self.cfg.verify_ssl),
+            "timeout_sec": int(self.cfg.timeout_sec or 8),
+            "credentials": {
+                "username_set": bool(str(self.cfg.username or "").strip()),
+                "password_set": bool(str(self.cfg.password or "").strip()),
+                "token_set": bool(str(self.cfg.token or "").strip()),
+            },
+            "checks": [],
+            "login_attempts": [],
+            "inbound_attempts": [],
+            "hints": [],
+        }
+
+        base_text = str(self.cfg.base_url or "").strip()
+        if not base_text:
+            result["hints"].append("base_url пустой: укажи https://IP:2053/WebBasePath")
+            return result
+        if "://" not in base_text:
+            result["hints"].append("base_url должен начинаться с http:// или https://")
+        if "/login" in base_text or "/panel/api" in base_text:
+            result["hints"].append("base_url должен быть только до WebBasePath, без /login и без /panel/api/...")
+        if base_text.startswith("https://") and not self.cfg.verify_ssl:
+            result["hints"].append("verify SSL выключен — это нормально для HTTPS по IP/self-signed, но для домена лучше включать SSL.")
+        if not self.cfg.username or not self.cfg.password:
+            if self.cfg.token:
+                result["hints"].append("username/password пустые: будет проверяться только API token.")
+            else:
+                result["hints"].append("Не заполнен username/password и нет token — 3X-UI не сможет авторизоваться.")
+
+        for label, path in (("base_url", ""), ("login_page", "/login")):
+            try:
+                resp = self._request("GET", path, allow_redirects=False)
+                item = {"name": label, "method": "GET", "path": path or "/", **self._response_summary(resp, body_limit=300)}
+                result["checks"].append(item)
+            except Exception as exc:  # pragma: no cover - network dependent
+                result["checks"].append({"name": label, "method": "GET", "path": path or "/", "error": str(exc)})
+
+        login_success = False
+        if self.cfg.username and self.cfg.password:
+            # Clear cookies collected by GET checks so every login attempt is explicit.
+            try:
+                self.session.cookies.clear()
+            except Exception:
+                pass
+            for mode, payload in (
+                ("form", {"username": self.cfg.username, "password": self.cfg.password}),
+                ("json", {"username": self.cfg.username, "password": self.cfg.password}),
+            ):
+                try:
+                    kwargs = {"data" if mode == "form" else "json": payload}
+                    resp = self._request("POST", "/login", **kwargs)
+                    summary = self._response_summary(resp, body_limit=500)
+                    data = summary.get("json")
+                    success = bool((200 <= resp.status_code < 300 and self.session.cookies) or (isinstance(data, dict) and data.get("success") is True))
+                    result["login_attempts"].append({"mode": mode, "path": "/login", "success": success, **summary})
+                    if success:
+                        login_success = True
+                        break
+                except Exception as exc:  # pragma: no cover - network dependent
+                    result["login_attempts"].append({"mode": mode, "path": "/login", "success": False, "error": str(exc)})
+        else:
+            login_success = bool(self.cfg.token)
+
+        if not login_success and not self.cfg.token:
+            result["hints"].append("Login не прошёл. Если HTTP 403 — чаще всего неверный username/password, неверный WebBasePath или 3X-UI блокирует вход без API token.")
+            result["success"] = False
+            return result
+
+        for path in ("/panel/api/inbounds/list", "/panel/inbound/list"):
+            try:
+                resp = self._request("GET", path)
+                summary = self._response_summary(resp, body_limit=600)
+                obj = summary.get("json")
+                count = None
+                if isinstance(obj, dict):
+                    raw_obj = obj.get("obj") if "obj" in obj else obj
+                    if isinstance(raw_obj, list):
+                        count = len(raw_obj)
+                elif isinstance(obj, list):
+                    count = len(obj)
+                result["inbound_attempts"].append({"path": path, "count": count, **summary})
+                if 200 <= resp.status_code < 300 and count is not None:
+                    result["success"] = True
+                    result["inbounds_count"] = count
+                    return result
+            except Exception as exc:  # pragma: no cover - network dependent
+                result["inbound_attempts"].append({"path": path, "error": str(exc)})
+
+        result["success"] = False
+        result["hints"].append("Login/token прошёл не полностью или inbounds API недоступен. Проверь порт 2053, WebBasePath, API token, и что 3X-UI версия поддерживает /panel/api/inbounds/list.")
+        return result
 
     def get_inbound(self, inbound_id: int) -> Optional[Dict[str, Any]]:
         self.login()
