@@ -186,14 +186,10 @@ def _xui_normalize_server_item(item: Dict[str, Any], *, preserve_password: str =
         return None
     password = str(item.get("password") if item.get("password") is not None else preserve_password or "").strip()
     token = str(item.get("token") if item.get("token") is not None else preserve_token or "").strip()
-    # The admin UI shows placeholder text like "optional"/"оставь пусто...".
-    # If a browser/plugin accidentally submits that placeholder as a real value,
-    # do not store it as a token/password because it makes 3X-UI auth fail in a
-    # confusing way.
-    if token.lower() in {"optional", "null", "none", "-"}:
+    # The frontend placeholder says "optional". If a browser/plugin sends it as a
+    # literal value, do not treat it as an API token.
+    if token.lower() in {"optional", "none", "null", "-", "—"}:
         token = ""
-    if password.lower() in {"optional", "null", "none", "оставь пусто", "оставь пусто, чтобы не менять"}:
-        password = ""
     if not password and preserve_password:
         password = str(preserve_password or "").strip()
     if not token and preserve_token:
@@ -6592,35 +6588,33 @@ def admin_xui_servers_test(server_key: str, admin_name: str = Depends(require_ad
     key = _xui_server_key(server_key)
     cfg = _xui_server_configs().get(key)
     if not cfg:
-        return {
-            "ok": False,
-            "server_key": key,
-            "error": f"3X-UI server config not found: {key}",
-            "hints": [
-                "Сначала нажми Save server и проверь, что key появился в таблице.",
-                "В локации используй ровно этот xui_server_key.",
-            ],
-            "count": 0,
-            "items": [],
-        }
+        raise HTTPException(status_code=404, detail=f"3X-UI server config not found: {key}")
     try:
-        rows = XUIClient(cfg).list_inbounds()
+        api = XUIClient(cfg)
+        if hasattr(api, "list_inbounds_with_diagnostics"):
+            rows, diagnostics = api.list_inbounds_with_diagnostics()
+        else:
+            rows = api.list_inbounds()
+            diagnostics = []
     except Exception as exc:
-        diagnostic: Dict[str, Any]
-        try:
-            diagnostic = XUIClient(cfg).diagnose()
-        except Exception as diag_exc:  # pragma: no cover - network dependent
-            diagnostic = {"success": False, "error": str(diag_exc)}
-        return {
-            "ok": False,
-            "server_key": key,
-            "error": str(exc),
-            "diagnostic": diagnostic,
-            "hints": list(diagnostic.get("hints") or []),
-            "count": 0,
-            "items": [],
-        }
-    return {"ok": True, "server_key": key, "count": len(rows), "items": [{"id": r.get("id"), "remark": r.get("remark"), "port": r.get("port"), "protocol": r.get("protocol"), "enable": r.get("enable")} for r in rows]}
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
+    warning = None
+    if len(rows) == 0:
+        warning = (
+            "Login OK, but 3X-UI returned 0 inbounds. Check whether the panel API endpoint "
+            "matches this 3X-UI build, or set XUI_INBOUND_PROBE_MAX higher if IDs are above the probe range."
+        )
+    return {
+        "ok": True,
+        "server_key": key,
+        "count": len(rows),
+        "warning": warning,
+        "diagnostics": diagnostics[-60:],
+        "items": [
+            {"id": r.get("id"), "remark": r.get("remark"), "port": r.get("port"), "protocol": r.get("protocol"), "enable": r.get("enable")}
+            for r in rows
+        ],
+    }
 
 
 @app.get("/api/infra/admin/vpn/xui/inbounds")
@@ -6631,12 +6625,16 @@ def admin_xui_inbounds(server_key: str = Query(default=""), admin_name: str = De
     cfg = configs.get(selected_key)
     if not cfg:
         return {"ok": True, "server_key": selected_key, "items": [], "warning": f"3X-UI server config not found: {selected_key}"}
+    diagnostics = []
     try:
         api = XUIClient(cfg)
-        rows = api.list_inbounds()
+        if hasattr(api, "list_inbounds_with_diagnostics"):
+            rows, diagnostics = api.list_inbounds_with_diagnostics()
+        else:
+            rows = api.list_inbounds()
     except Exception as exc:
         logger.warning("[xui-admin] list inbounds failed server=%s err=%s", selected_key, exc)
-        return {"ok": True, "server_key": selected_key, "items": [], "warning": str(exc)}
+        return {"ok": True, "server_key": selected_key, "items": [], "warning": str(exc), "diagnostics": diagnostics[-60:]}
     items = []
     for row in rows:
         settings_payload = row.get("settings")
@@ -6655,7 +6653,10 @@ def admin_xui_inbounds(server_key: str = Query(default=""), admin_name: str = De
             "enable": row.get("enable"),
             "client_count": client_count,
         })
-    return {"ok": True, "server_key": selected_key, "items": items}
+    warning = None
+    if not items:
+        warning = "Login OK, but 3X-UI returned 0 inbounds. Diagnostics contain tried endpoints and probe result."
+    return {"ok": True, "server_key": selected_key, "items": items, "warning": warning, "diagnostics": diagnostics[-60:]}
 
 
 @app.post("/api/infra/admin/vpn/users/{telegram_id}/reset-devices")
