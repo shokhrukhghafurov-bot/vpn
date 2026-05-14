@@ -186,6 +186,14 @@ def _xui_normalize_server_item(item: Dict[str, Any], *, preserve_password: str =
         return None
     password = str(item.get("password") if item.get("password") is not None else preserve_password or "").strip()
     token = str(item.get("token") if item.get("token") is not None else preserve_token or "").strip()
+    # The admin UI shows placeholder text like "optional"/"оставь пусто...".
+    # If a browser/plugin accidentally submits that placeholder as a real value,
+    # do not store it as a token/password because it makes 3X-UI auth fail in a
+    # confusing way.
+    if token.lower() in {"optional", "null", "none", "-"}:
+        token = ""
+    if password.lower() in {"optional", "null", "none", "оставь пусто", "оставь пусто, чтобы не менять"}:
+        password = ""
     if not password and preserve_password:
         password = str(preserve_password or "").strip()
     if not token and preserve_token:
@@ -6584,11 +6592,34 @@ def admin_xui_servers_test(server_key: str, admin_name: str = Depends(require_ad
     key = _xui_server_key(server_key)
     cfg = _xui_server_configs().get(key)
     if not cfg:
-        raise HTTPException(status_code=404, detail=f"3X-UI server config not found: {key}")
+        return {
+            "ok": False,
+            "server_key": key,
+            "error": f"3X-UI server config not found: {key}",
+            "hints": [
+                "Сначала нажми Save server и проверь, что key появился в таблице.",
+                "В локации используй ровно этот xui_server_key.",
+            ],
+            "count": 0,
+            "items": [],
+        }
     try:
         rows = XUIClient(cfg).list_inbounds()
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
+        diagnostic: Dict[str, Any]
+        try:
+            diagnostic = XUIClient(cfg).diagnose()
+        except Exception as diag_exc:  # pragma: no cover - network dependent
+            diagnostic = {"success": False, "error": str(diag_exc)}
+        return {
+            "ok": False,
+            "server_key": key,
+            "error": str(exc),
+            "diagnostic": diagnostic,
+            "hints": list(diagnostic.get("hints") or []),
+            "count": 0,
+            "items": [],
+        }
     return {"ok": True, "server_key": key, "count": len(rows), "items": [{"id": r.get("id"), "remark": r.get("remark"), "port": r.get("port"), "protocol": r.get("protocol"), "enable": r.get("enable")} for r in rows]}
 
 
