@@ -186,6 +186,11 @@ class Settings:
     BOT_USERNAME: str = os.getenv("BOT_USERNAME", "inetvpnru_bot")
     BOT_TOKEN: str = os.getenv("BOT_TOKEN", "")
     BACKEND_BASE_URL: str = os.getenv("BACKEND_BASE_URL", os.getenv("APP_BASE_URL", "http://127.0.0.1:3000"))
+    BACKEND_HEALTH_PATH: str = os.getenv("BACKEND_HEALTH_PATH", "/healthz").strip() or "/healthz"
+    BACKEND_REQUEST_TIMEOUT_SEC: int = _env_int("BACKEND_REQUEST_TIMEOUT_SEC", 12)
+    BOT_BACKEND_STARTUP_RETRIES: int = _env_int("BOT_BACKEND_STARTUP_RETRIES", 6)
+    BOT_BACKEND_STARTUP_RETRY_DELAY_SEC: int = _env_int("BOT_BACKEND_STARTUP_RETRY_DELAY_SEC", 5)
+    BOT_SKIP_BACKEND_STARTUP_CHECK: bool = _env_bool("BOT_SKIP_BACKEND_STARTUP_CHECK", False)
     BOT_NOTIFICATION_POLL_SEC: int = _env_int("BOT_NOTIFICATION_POLL_SEC", 45)
     SUBSCRIPTION_WARNING_HOURS: int = _env_int("SUBSCRIPTION_WARNING_HOURS", 12)
     SUBSCRIPTION_TOKEN: str = os.getenv("SUBSCRIPTION_TOKEN", "")
