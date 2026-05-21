@@ -5826,6 +5826,14 @@ def robots_txt() -> Response:
     response.headers["Cache-Control"] = "public, max-age=3600"
     return response
 
+@app.get("/healthz")
+def healthz() -> Dict[str, Any]:
+    # Lightweight liveness endpoint for the bot and platform health checks.
+    # It intentionally avoids database and VPN probe calls so a slow DB/external
+    # network does not make the whole bot process crash during startup.
+    return {"ok": True, "service": settings.APP_NAME}
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     locations = _public_locations_health_snapshot()
