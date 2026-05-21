@@ -318,8 +318,10 @@ async def api_request(
     headers = dict(extra_headers or {})
     if token:
         headers["Authorization"] = f"Bearer {token}"
+    timeout_sec = max(1, int(getattr(settings, "BACKEND_REQUEST_TIMEOUT_SEC", 12) or 12))
+    timeout = httpx.Timeout(timeout_sec, connect=min(5.0, float(timeout_sec)))
     try:
-        async with httpx.AsyncClient(timeout=30) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.request(method, url, json=json_body, headers=headers)
     except httpx.HTTPError as exc:
         logger.exception("Backend request failed: %s %s", method, url)
@@ -1565,8 +1567,37 @@ async def configure_bot() -> None:
 
 
 async def verify_backend() -> None:
-    data = await api_request("GET", "/health")
-    logger.debug("Backend health check succeeded: %s", data)
+    if bool(getattr(settings, "BOT_SKIP_BACKEND_STARTUP_CHECK", False)):
+        logger.warning("Backend startup health check skipped by BOT_SKIP_BACKEND_STARTUP_CHECK")
+        return
+
+    health_path = str(getattr(settings, "BACKEND_HEALTH_PATH", "/healthz") or "/healthz").strip() or "/healthz"
+    attempts = max(1, int(getattr(settings, "BOT_BACKEND_STARTUP_RETRIES", 6) or 6))
+    delay_sec = max(1, int(getattr(settings, "BOT_BACKEND_STARTUP_RETRY_DELAY_SEC", 5) or 5))
+    last_exc: Optional[BaseException] = None
+
+    for attempt in range(1, attempts + 1):
+        try:
+            try:
+                data = await api_request("GET", health_path)
+            except ApiError as exc:
+                if exc.status_code != 404 or health_path == "/health":
+                    raise
+                data = await api_request("GET", "/health")
+            logger.debug("Backend health check succeeded: %s", data)
+            return
+        except Exception as exc:
+            last_exc = exc
+            logger.warning(
+                "Backend health check failed, attempt %s/%s: %s",
+                attempt,
+                attempts,
+                exc,
+            )
+            if attempt < attempts:
+                await asyncio.sleep(delay_sec)
+
+    raise BackendUnavailable(f"Backend is unavailable after {attempts} attempts: {last_exc}") from last_exc
 
 
 async def main() -> None:
@@ -1581,16 +1612,20 @@ async def main() -> None:
     logger.debug("Starting bot for %s", settings.BOT_USERNAME or settings.BOT_NAME)
     logger.debug("Backend base URL: %s", settings.BACKEND_BASE_URL)
 
-    await configure_bot()
-    await verify_backend()
-
-    notifier = asyncio.create_task(notification_loop())
     try:
-        await dp.start_polling(bot)
+        await configure_bot()
+        await verify_backend()
+
+        notifier = asyncio.create_task(notification_loop())
+        try:
+            await dp.start_polling(bot)
+        finally:
+            notifier.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await notifier
     finally:
-        notifier.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await notifier
+        if bot is not None:
+            await bot.session.close()
 
 
 if __name__ == "__main__":
