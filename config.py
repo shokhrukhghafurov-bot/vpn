@@ -166,6 +166,9 @@ class Settings:
     # This flag only keeps our subscription feed cleaner for Happ: no inline
     # subscription comments and no non-standard internal route hints in the URL.
     HAPP_SUBSCRIPTION_MINIMAL: bool = _env_bool("HAPP_SUBSCRIPTION_MINIMAL", False)
+    # Keep v2RayTun subscriptions compatible: only standard VLESS/Reality
+    # parameters are included by default.
+    V2RAYTUN_SUBSCRIPTION_MINIMAL: bool = _env_bool("V2RAYTUN_SUBSCRIPTION_MINIMAL", True)
     V2RAYTUN_ANDROID_APP_URL: str = os.getenv("V2RAYTUN_ANDROID_APP_URL", "https://play.google.com/store/apps/details?id=com.v2raytun.android")
     V2RAYTUN_ANDROID_APP_PACKAGE: str = os.getenv("V2RAYTUN_ANDROID_APP_PACKAGE", "com.v2raytun.android")
     V2RAYTUN_IOS_APP_URL: str = os.getenv("V2RAYTUN_IOS_APP_URL", "https://v2raytun.com/")
