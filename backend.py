@@ -4826,7 +4826,14 @@ def _subscription_client_hint(request: Request) -> str:
 
 def _subscription_minimal_url_for_client(client_hint: Optional[str]) -> bool:
     client = str(client_hint or "").strip().lower()
-    return client == "happ" and bool(getattr(settings, "HAPP_SUBSCRIPTION_MINIMAL", False))
+    if client == "happ":
+        return bool(getattr(settings, "HAPP_SUBSCRIPTION_MINIMAL", False))
+    # v2RayTun imports plain VLESS links more reliably when the URL contains
+    # only standard VLESS/Reality parameters. Internal INET route hints are
+    # intentionally hidden from v2RayTun subscription links.
+    if client == "v2raytun":
+        return bool(getattr(settings, "V2RAYTUN_SUBSCRIPTION_MINIMAL", True))
+    return False
 
 
 def _build_vless_subscription_line(payload: Dict[str, Any], *, fallback_name: str = "VLESS", client_hint: Optional[str] = None) -> str:
@@ -5420,6 +5427,7 @@ def _subscription_response(request: Request, token: str, *, head_only: bool = Fa
         "moved-permanently-to": moved_permanently_to_url or "",
         "x-hiddify-source": "subscription",
         "x-subscription-version": content_version,
+        "x-subscription-lines": str(len(lines)),
         "x-subscription-generated-at": datetime.now(timezone.utc).isoformat(),
     }
     response = Response(status_code=200, headers=headers) if head_only else Response(content=content, media_type="text/plain; charset=utf-8", headers=headers)
@@ -5558,7 +5566,7 @@ def open_app_bridge(
         },
     }[norm_lang]
     display_subscription_url = tracked_subscription_url or subscription_url
-    show_direct_copy = bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)) or client_mode == "happ" or not supports_native_launch
+    show_direct_copy = bool(getattr(settings, "SUBSCRIPTION_SHOW_DIRECT_COPY_IN_BOT", False)) or client_mode in {"happ", "v2raytun"} or not supports_native_launch
     copy_block = ""
     if display_subscription_url and show_direct_copy:
         copy_block = f'<div class="code"><div class="label">{html.escape(page_text["copy_label"])}</div><code id="subscription-link-value">{html.escape(display_subscription_url)}</code></div>'
@@ -5672,7 +5680,7 @@ def open_app_bridge(
           return '';
         }}
         if (clientMode === 'v2raytun') {{
-          return 'v2raytun://import/' + encodeURIComponent(trackedSubscriptionUrl);
+          return 'v2raytun://import/' + trackedSubscriptionUrl;
         }}
         return 'hiddify://import/' + encodeURIComponent(trackedSubscriptionUrl) + '#' + encodeURIComponent(importName || 'Subscription');
       }};
